@@ -75,12 +75,13 @@ function MarketIntelligence() {
   // Fetch comprehensive market overview
   const { data: marketOverview } = useQuery({
     queryKey: ['market-overview-complete'],
-    queryFn: async () => {
+    queryFn: async ({ signal }: any) => {
       try {
-        const response = await fetch('/api/analytics/market-overview');
+        const response = await fetch('/api/analytics/market-overview', { signal });
         if (!response.ok) return null;
         return await response.json();
-      } catch (error) {
+      } catch (error: any) {
+        if (error.name === 'AbortError') return null;
         console.debug('[Market Intelligence] Market overview fetch failed:', error);
         return null;
       }
@@ -92,12 +93,13 @@ function MarketIntelligence() {
   // Fetch trending coins
   const { data: trendingData } = useQuery({
     queryKey: ['trending-coins'],
-    queryFn: async () => {
+    queryFn: async ({ signal }: any) => {
       try {
-        const response = await fetch('/api/coingecko/trending');
+        const response = await fetch('/api/coingecko/trending', { signal });
         if (!response.ok) return null;
         return await response.json();
-      } catch (error) {
+      } catch (error: any) {
+        if (error.name === 'AbortError') return null;
         console.debug('[Market Intelligence] Trending coins fetch failed:', error);
         return null;
       }
@@ -109,12 +111,13 @@ function MarketIntelligence() {
   // Fetch global metrics
   const { data: globalData } = useQuery({
     queryKey: ['global-metrics'],
-    queryFn: async () => {
+    queryFn: async ({ signal }: any) => {
       try {
-        const response = await fetch('/api/coingecko/global');
+        const response = await fetch('/api/coingecko/global', { signal });
         if (!response.ok) return null;
         return await response.json();
-      } catch (error) {
+      } catch (error: any) {
+        if (error.name === 'AbortError') return null;
         console.debug('[Market Intelligence] Global metrics fetch failed:', error);
         return null;
       }
@@ -126,12 +129,13 @@ function MarketIntelligence() {
   // Fetch market regime analysis
   const { data: regimeData } = useQuery({
     queryKey: ['market-regime'],
-    queryFn: async () => {
+    queryFn: async ({ signal }: any) => {
       try {
-        const response = await fetch('/api/coingecko/regime');
+        const response = await fetch('/api/coingecko/regime', { signal });
         if (!response.ok) return null;
         return await response.json();
-      } catch (error) {
+      } catch (error: any) {
+        if (error.name === 'AbortError') return null;
         console.debug('[Market Intelligence] Market regime fetch failed:', error);
         return null;
       }
@@ -143,12 +147,13 @@ function MarketIntelligence() {
   // Fetch official Fear & Greed (Alternative.me)
   const { data: officialFearGreed } = useQuery({
     queryKey: ['fear-greed-official'],
-    queryFn: async () => {
+    queryFn: async ({ signal }: any) => {
       try {
-        const response = await fetch('/api/coingecko/alternative-fear-greed');
+        const response = await fetch('/api/coingecko/alternative-fear-greed', { signal });
         if (!response.ok) return null;
         return await response.json();
-      } catch (error) {
+      } catch (error: any) {
+        if (error.name === 'AbortError') return null;
         console.debug('[Market Intelligence] Official Fear & Greed fetch failed:', error);
         return null;
       }
@@ -160,12 +165,13 @@ function MarketIntelligence() {
   // Fetch custom CoinGecko-derived Fear & Greed (kept for comparison)
   const { data: customFearGreed } = useQuery({
     queryKey: ['fear-greed-custom'],
-    queryFn: async () => {
+    queryFn: async ({ signal }: any) => {
       try {
-        const response = await fetch('/api/coingecko/fear-greed');
+        const response = await fetch('/api/coingecko/fear-greed', { signal });
         if (!response.ok) return null;
         return await response.json();
-      } catch (error) {
+      } catch (error: any) {
+        if (error.name === 'AbortError') return null;
         console.debug('[Market Intelligence] Custom Fear & Greed fetch failed:', error);
         return null;
       }
@@ -177,12 +183,13 @@ function MarketIntelligence() {
   // Fetch scanner signals
   const { data: signals } = useQuery<{ signals: Signal[] }>({
     queryKey: ['scanner-signals'],
-    queryFn: async () => {
+    queryFn: async ({ signal }: any) => {
       try {
-        const response = await fetch('/api/scanner/signals');
+        const response = await fetch('/api/scanner/signals', { signal });
         if (!response.ok) return null;
         return await response.json();
-      } catch (error) {
+      } catch (error: any) {
+        if (error.name === 'AbortError') return null;
         console.debug('[Market Intelligence] Scanner signals fetch failed:', error);
         return null;
       }

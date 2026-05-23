@@ -67,35 +67,53 @@ export default function ScannerAgentAnalysis({ scanResult, onTrade }: ScannerAge
   // Fetch agent analysis when scan result changes
   useEffect(() => {
     if (!scanResult.symbol) return;
+    let mounted = true;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
 
     const fetchAgentAnalysis = async () => {
+      if (!mounted) return;
       setLoading(true);
       setError(null);
-      
+
       try {
         const response = await fetch(`/api/scanner/agent-analysis/${scanResult.symbol}`, {
-          signal: AbortSignal.timeout(5000)
+          signal: controller.signal,
         });
+
+        if (!mounted) return;
 
         if (response.ok) {
           const data = await response.json();
-          setAgents(data.agents || []);
+          if (!controller.signal.aborted) setAgents(data.agents || []);
         } else {
           throw new Error(`API returned ${response.status}`);
         }
-      } catch (err) {
+      } catch (err: any) {
+        if (err?.name === 'AbortError') {
+          // request aborted - do not set error state
+          return;
+        }
         console.error('Failed to fetch agent analysis:', err);
+        if (!mounted) return;
         setError('Failed to load agent analysis');
         // Fallback to provided signals if available
         if (scanResult.agentSignals) {
           setAgents(scanResult.agentSignals);
         }
       } finally {
+        if (!mounted) return;
         setLoading(false);
       }
     };
 
     fetchAgentAnalysis();
+
+    return () => {
+      mounted = false;
+      controller.abort();
+      clearTimeout(timeout);
+    };
   }, [scanResult.symbol, scanResult.agentSignals]);
 
   const consensus = scanResult.consensus;

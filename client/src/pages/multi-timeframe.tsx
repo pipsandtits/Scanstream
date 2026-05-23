@@ -1,10 +1,10 @@
 import React, { useState } from 'react';
-import { useLocation } from 'wouter';
+import { useNavigate } from 'react-router-dom';
 import { ArrowLeft, BarChart3, TrendingUp, TrendingDown, Clock, Target, AlertTriangle } from 'lucide-react';
 import { useQuery } from '@tanstack/react-query';
 
 export default function MultiTimeframePage() {
-  const [, setLocation] = useLocation();
+  const navigate = useNavigate();
   const [selectedSymbol, setSelectedSymbol] = useState('BTC/USDT');
   const [selectedTimeframes, setSelectedTimeframes] = useState(['1h', '4h', '1d']);
 

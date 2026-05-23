@@ -11,12 +11,12 @@
  *   onTradeClose() → right after exit order fills
  */
 
-import { RLPositionAgent } from './rl-position-agent';
+import { getRLAgent } from '../src/agents/rl-agent.singleton';
 import { TradeLifecycleManager, TradeOpenSnapshot } from './rl-feedback-loop';
 
 // ─── Singleton setup (wire into your DI / service layer) ─────────────────────
 
-export const rlAgent   = new RLPositionAgent();
+export const rlAgent   = getRLAgent();
 export const rlFeedback = new TradeLifecycleManager(rlAgent);
 
 // ─── Call site 1: After signal fires, before order placement ─────────────────

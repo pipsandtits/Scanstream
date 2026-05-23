@@ -24,10 +24,20 @@ export interface ExitStrategyConfig {
   breakdown_threshold?: number;
 }
 
+const DEFAULT_CONFIG: Required<ExitStrategyConfig> = {
+  min_profit_pct_for_exit: 0.8,
+  target_profit_pct: 2.5,
+  max_hold_bars: 18,
+  breakdown_threshold: 0.38,
+};
+
 export interface ExitConditions {
   current_profit_pct: number;
   cluster_strength: number;
   trend_formation: boolean;
+  volatility?: number; // 0-1
+  order_flow_score?: number; // 0-1
+  microstructure_health?: number; // 0-1
   bars_held: number;
   directional_ratio: number;
   follow_through: number;
@@ -68,12 +78,7 @@ export class ExitStrategySelector {
   private config: Required<ExitStrategyConfig>;
 
   constructor(config: ExitStrategyConfig = {}) {
-    this.config = {
-      min_profit_pct_for_exit: config.min_profit_pct_for_exit ?? 0.5,
-      target_profit_pct: config.target_profit_pct ?? 2.0,
-      max_hold_bars: config.max_hold_bars ?? 20,
-      breakdown_threshold: config.breakdown_threshold ?? 0.35,
-    };
+    this.config = { ...DEFAULT_CONFIG, ...config };
   }
 
   /**
@@ -219,6 +224,10 @@ export class ExitStrategySelector {
   private _determineStrategy(conditions: ExitConditions, reasoning: string[]): ExitStrategy {
     const { cluster_strength, trend_formation, current_profit_pct, bars_held } = conditions;
 
+    const volatility = conditions.volatility ?? 0.0;
+    const orderFlow = conditions.order_flow_score ?? 0.5;
+    const microHealth = conditions.microstructure_health ?? 0.8;
+
     // Critical condition: cluster breakdown with profit
     if (
       current_profit_pct > 2 &&
@@ -226,6 +235,12 @@ export class ExitStrategySelector {
     ) {
       reasoning.push(`Cluster collapse detected (${cluster_strength.toFixed(2)}) + ${current_profit_pct.toFixed(1)}% profit → Cluster breakdown exit`);
       return 'cluster_breakdown';
+    }
+
+    // Profit-based override: let very large winners run if trend holds
+    if (current_profit_pct > 5.0 && cluster_strength > 0.65) {
+      reasoning.push(`Large winner (${current_profit_pct.toFixed(1)}%) + cluster ${cluster_strength.toFixed(2)} → Trailing stop to let winners run`);
+      return 'trailing_stop';
     }
 
     // Strong trend: let it run
@@ -253,14 +268,21 @@ export class ExitStrategySelector {
 
   private _assessUrgency(conditions: ExitConditions, strategy: ExitStrategy): ExitUrgency {
     const { cluster_strength, current_profit_pct, bars_held } = conditions;
+    const micro = conditions.microstructure_health ?? 1.0;
+    const vol = conditions.volatility ?? 0.0;
 
-    // Critical: about to break down
-    if (cluster_strength < 0.2) {
+    // Critical: about to break down or microstructure failing
+    if (cluster_strength < 0.2 || micro < 0.3) {
       return 'critical';
     }
 
     // High: weak trend + losing money or time running out
     if (cluster_strength < 0.35 || (strategy === 'time_exit' && bars_held > this.config.max_hold_bars * 0.8)) {
+      return 'high';
+    }
+
+    // Volatility adjustment: tighten urgency in high vol
+    if (vol > 0.6 && strategy === 'trailing_stop') {
       return 'high';
     }
 
@@ -297,15 +319,29 @@ export class ExitStrategySelector {
     entry_price: number,
     conditions: ExitConditions
   ): number | undefined {
-    const stop_pct = conditions.cluster_strength < 0.4 ? 2.0 : 1.5;
-    return entry_price * (1 - stop_pct / 100);
+    // Tighter stops in high volatility
+    const vol = conditions.volatility ?? 0;
+    const base_stop = conditions.cluster_strength < 0.4 ? 2.0 : 1.5;
+    const adjusted = vol > 0.6 ? Math.min(base_stop * 1.5, 4.0) : base_stop;
+    return entry_price * (1 - adjusted / 100);
   }
 
   private _calculateTrailingStop(conditions: ExitConditions): number {
     // Trailing stop distance: tighter in strong trends, wider in weak
     const base_distance = 1.0; // 1% trailing stop
-    const adjustment = Math.max(0.5, Math.min(1.5, conditions.cluster_strength * 1.5));
+    const adjustment = Math.max(0.5, Math.min(1.8, conditions.cluster_strength * 1.6));
     return base_distance * adjustment;
+  }
+
+  /**
+   * Partial exit helper: compute how to scale out based on profit and cluster state
+   */
+  computePartialExit(conditions: ExitConditions): { scale_percent: number; remaining_strategy: ExitStrategy } | null {
+    if (conditions.current_profit_pct >= this.config.target_profit_pct && conditions.cluster_strength >= 0.55) {
+      // scale out 50% at target, trail the rest
+      return { scale_percent: 50, remaining_strategy: 'trailing_stop' };
+    }
+    return null;
   }
 
   private _getAlternatives(

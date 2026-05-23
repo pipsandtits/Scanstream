@@ -3,11 +3,18 @@ import { EnhancedPortfolioSimulator, PositionSizeConfig } from './portfolio-simu
 import { db } from './db-storage';
 import type { Signal } from '@shared/schema';
 import { EventEmitter } from 'events';
+import { systemKillSwitch } from './services/system-kill-switch';
+import { portfolioRiskManager } from './services/portfolio-risk-manager';
 import { adaptiveHoldingIntegration } from './services/adaptive-holding-integration';
 import { OrderFlowAnalyzer, orderFlowAnalyzer } from './services/order-flow-analyzer';
 import { microstructureOptimizer } from './services/microstructure-exit-optimizer';
 import { getLearningSystem } from './index';
 import { RLFeedbackCallbacks } from './rl-system-integration';
+import SlippageModel from './services/slippage-model';
+import { PartialFillSimulator } from './services/partial-fill-simulator';
+import MockNetwork from './services/mock-network';
+import VenueRouter from './services/venue-router';
+import OrderRetryPolicy from './services/order-retry-policy';
 
 interface HoldingDecisionMetadata {
   holdingPeriodDays: number;
@@ -61,6 +68,11 @@ interface AutoExecutionConfig {
 
 export class PaperTradingEngine extends EventEmitter {
   private simulator: EnhancedPortfolioSimulator;
+  private slippageModel: SlippageModel;
+  private partialFillSim: PartialFillSimulator;
+  private mockNetwork: MockNetwork;
+  private venueRouter: VenueRouter;
+  private retryPolicy: OrderRetryPolicy;
   private activeTrades: Map<string, PaperTrade> = new Map();
   private tradeHistory: PaperTrade[] = [];
   private config: AutoExecutionConfig;
@@ -76,6 +88,13 @@ export class PaperTradingEngine extends EventEmitter {
       slippageRate: 0.05,
       maxPositionsPerSymbol: 3
     });
+
+    // Initialize simulation/world-model services for more realistic paper executions
+    this.slippageModel = new SlippageModel({ mode: 'percentage', percent: 0.05 });
+    this.partialFillSim = new PartialFillSimulator({ typicalDepth: 1000, aggressiveness: 0.7 });
+    this.mockNetwork = new MockNetwork({ meanLatencyMs: 40, jitterMs: 40, rateLimitPerSec: 500 });
+    this.venueRouter = new VenueRouter();
+    this.retryPolicy = new OrderRetryPolicy({ maxAttempts: 3, baseBackoffMs: 100, maxBackoffMs: 2000 });
 
     this.config = {
       enabled: false,
@@ -96,6 +115,27 @@ export class PaperTradingEngine extends EventEmitter {
     };
 
     this.simulator.setPositionSizing(this.config.positionSizing);
+
+    // Listen for global kill-switch events
+    try {
+      systemKillSwitch.on('kill', async (state) => {
+        console.warn('[Paper Trading] Global kill-switch activated, pausing paper engine', state);
+        this.stop();
+
+        const forceClose = process.env.KILL_FORCE_CLOSE === '1';
+        if (forceClose) {
+          console.warn('[Paper Trading] Force-close enabled: closing all open positions');
+          try {
+            const openPositions = Array.from(this.activeTrades.values());
+            for (const t of openPositions) {
+              try { await this.closeTrade(t.id, this.priceCache.get(t.symbol) || t.entryPrice, 'MANUAL'); } catch (e) { console.warn('Force close failed', e); }
+            }
+          } catch (e) { console.error('Error during force close', e); }
+        }
+      });
+    } catch (e) {
+      // ignore if kill-switch unavailable
+    }
   }
 
   // Helper: simple RSI implementation (period default 14)
@@ -180,6 +220,43 @@ export class PaperTradingEngine extends EventEmitter {
    */
   private async processNewSignals(): Promise<void> {
     try {
+      // Enforce portfolio-level limits before attempting any new executions
+      try {
+        const accountBalance = this.simulator.getCurrentBalance();
+        const limits = portfolioRiskManager.getLimits();
+        const metrics = portfolioRiskManager.getPortfolioMetrics(accountBalance);
+
+        if (metrics.dailyPnlPercent < -limits.maxDailyLoss) {
+          const reason = `dailyLoss:${metrics.dailyPnlPercent.toFixed(2)}%`;
+          console.warn(`[Paper Trading] Skipping execution: daily loss limit reached (${metrics.dailyPnlPercent.toFixed(2)}%)`);
+          this.emit('executionBlocked', {
+            type: 'portfolio_limit',
+            reason,
+            timestamp: Date.now(),
+            accountBalance: accountBalance,
+            limits,
+            metrics
+          });
+          return;
+        }
+
+        if (metrics.currentDrawdown >= limits.maxPortfolioDrawdown) {
+          const reason = `drawdown:${metrics.currentDrawdown.toFixed(2)}%`;
+          console.warn(`[Paper Trading] Skipping execution: portfolio drawdown limit reached (${metrics.currentDrawdown.toFixed(2)}%)`);
+          this.emit('executionBlocked', {
+            type: 'portfolio_limit',
+            reason,
+            timestamp: Date.now(),
+            accountBalance: accountBalance,
+            limits,
+            metrics
+          });
+          return;
+        }
+      } catch (pmErr) {
+        console.warn('[Paper Trading] PortfolioRiskManager check failed, continuing', pmErr);
+      }
+
       const signals = await db.getLatestSignals(20);
       
       for (const signal of signals) {
@@ -187,6 +264,21 @@ export class PaperTradingEngine extends EventEmitter {
 
         const source = this.determineSignalSource(signal);
         if (!this.config.sources.includes(source)) continue;
+
+        // Check TruthEngine tradeability before executing paper trades
+        try {
+          const truth = (global as any).truthEngine as any;
+          if (truth && typeof truth.isTradeable === 'function') {
+            const t = truth.isTradeable(signal.symbol, { minSources: 2, minConfidence: 50 });
+            if (!t.ok) {
+              console.warn(`[Paper Trading] Skipping ${signal.symbol}: TruthEngine says not tradeable (${t.reason})`);
+              this.emit('executionBlocked', { type: 'truth', reason: t.reason, signalId: signal.id, symbol: signal.symbol, timestamp: Date.now() });
+              continue;
+            }
+          }
+        } catch (e) {
+          // non-fatal
+        }
 
         await this.executeSignal(signal, source);
       }
@@ -242,16 +334,38 @@ export class PaperTradingEngine extends EventEmitter {
    */
   private async executeSignal(signal: Signal, source: 'ML' | 'RL' | 'GATEWAY'): Promise<void> {
     try {
-      // Simulate realistic execution slippage (0.05% - 0.15% depending on volatility)
-      const baseSlippage = 0.0005; // 0.05%
-      const volatilitySlippage = Math.random() * 0.001; // Up to 0.1% additional
-      const slippageMultiplier = signal.type === 'BUY' ? (1 + baseSlippage + volatilitySlippage) : (1 - baseSlippage - volatilitySlippage);
-      
-      const executionPrice = signal.price * slippageMultiplier;
+      // Simulate network latency and rate-limits for paper executions
+      try {
+        this.mockNetwork.checkRateLimit();
+      } catch (rlErr) {
+        if (rlErr instanceof Error) {
+          console.warn('[Paper Trading] Rate limit simulated:', rlErr.message);
+        } else {
+          console.warn('[Paper Trading] Rate limit simulated:', rlErr);
+        }
+      }
+      await this.mockNetwork.delay();
+
+      // Estimate position USD and quantity according to position sizing
+      const balance = this.simulator.getCurrentBalance();
+      let positionUsd = 0;
+      if (this.config.positionSizing.type === 'percentage') {
+        positionUsd = balance * ((this.config.positionSizing.value as any) / 100);
+      } else {
+        positionUsd = (this.config.positionSizing.value as number) || (balance * 0.1);
+      }
+      const approxQuantity = positionUsd / signal.price;
+
+      // Apply slippage model to compute execution price
+      const executionPrice = this.slippageModel.applySlippage(signal.price, approxQuantity, undefined, signal.type === 'BUY' ? 'buy' : 'sell');
       const stopLoss = signal.stopLoss || executionPrice * (signal.type === 'BUY' ? 0.98 : 1.02);
       const takeProfit = signal.takeProfit || executionPrice * (signal.type === 'BUY' ? 1.05 : 0.95);
 
       // Open position in simulator with realistic execution price
+      // Simulate partial fills and pass the filled quantity to the simulator
+      const fills = this.partialFillSim.simulateProgressiveFills(Math.ceil(approxQuantity), 5);
+      const filledQty = fills.reduce((s, v) => s + v, 0);
+
       const success = this.simulator.openPosition({
         id: `${signal.symbol}-${Date.now()}`,
         signalId: signal.id ?? null,
@@ -264,7 +378,7 @@ export class PaperTradingEngine extends EventEmitter {
         exitTime: null,
         exitPrice: null,
         pnl: null
-      }, stopLoss);
+      }, stopLoss, filledQty);
 
       if (!success) {
         console.log(`[Paper Trading] Failed to open position for ${signal.symbol}`);
@@ -396,6 +510,41 @@ export class PaperTradingEngine extends EventEmitter {
       this.activeTrades.set(trade.id, trade);
       this.emit('tradeOpened', trade);
 
+      // Register position with PortfolioRiskManager (best-effort)
+      try {
+        portfolioRiskManager.addPosition({
+          symbol: trade.symbol,
+          side: trade.side,
+          size: trade.entryPrice * trade.quantity,
+          entryPrice: trade.entryPrice,
+          currentPrice: trade.entryPrice,
+          pnl: 0,
+          pnlPercent: 0
+        });
+      } catch (pmErr) {
+        console.warn('[Paper Trading] Failed to add position to PortfolioRiskManager', pmErr);
+      }
+
+      // Persist trade provenance (best-effort)
+      try {
+        const prov = {
+          tradeId: trade.id,
+          engine: 'PAPER',
+          symbol: trade.symbol,
+          signalId: signal.id ?? null,
+          correlationId: (signal as any).correlationId ?? null,
+          signal: { id: signal.id, timestamp: signal.timestamp, symbol: signal.symbol, type: signal.type, confidence: signal.confidence, price: signal.price, correlationId: (signal as any).correlationId ?? null },
+          consensus: {},
+          agentDecision: {},
+          execution: { entryPrice: trade.entryPrice, quantity: trade.quantity, commission: 0 },
+          extra: { source: trade.source, slippageBps: Math.abs((executionPrice - signal.price) / signal.price * 10000), partialFills: fills },
+          createdAt: new Date()
+        };
+        await db.createTradeProvenance(prov);
+      } catch (e) {
+        console.warn('[Paper Trading] Failed to persist trade provenance', e);
+      }
+
       // ✅ RL CALLBACK: Register trade with RL system for learning
       try {
         const frames = await db.getMarketFrames(trade.symbol, 20) || [];
@@ -439,6 +588,13 @@ export class PaperTradingEngine extends EventEmitter {
     for (const trade of activeTrades) {
       const currentPrice = this.priceCache.get(trade.symbol);
       if (!currentPrice) continue;
+
+      // Update portfolio risk manager with latest price (best-effort)
+      try {
+        portfolioRiskManager.updatePositionPrice(trade.symbol, currentPrice);
+      } catch (pmErr) {
+        console.warn('[Paper Trading] Failed to update PortfolioRiskManager position price', pmErr);
+      }
 
       // Estimate ATR for holding decision (simplified: ~2% of price)
       const atr = currentPrice * 0.02;
@@ -491,11 +647,14 @@ export class PaperTradingEngine extends EventEmitter {
     try {
       const uniqueSymbols = [...new Set(symbols)];
       
+      // Batch fetch latest market frames for all symbols to avoid N+1
+      const framesMap = (typeof (db as any).getMarketFramesForSymbols === 'function'
+        ? await (db as any).getMarketFramesForSymbols(uniqueSymbols, 1)
+        : await Promise.all(uniqueSymbols.map(async (sym: string) => ({ [sym]: await db.getLatestMarketFrame(sym) ? [await db.getLatestMarketFrame(sym) as any] : [] })))) as Record<string, any[]>;
+
       for (const symbol of uniqueSymbols) {
-        // Try database first (faster)
-        const latestFrame = await db.getLatestMarketFrame(symbol);
+        const latestFrame = (framesMap[symbol] && framesMap[symbol].length > 0) ? framesMap[symbol][0] : null;
         if (latestFrame && Date.now() - new Date((latestFrame as any).timestamp).getTime() < 60000) {
-          // Use DB price if less than 1 minute old
           const dbPrice = (latestFrame as any)?.price?.close;
           if (typeof dbPrice === 'number') {
             this.priceCache.set(symbol, dbPrice);
@@ -503,27 +662,19 @@ export class PaperTradingEngine extends EventEmitter {
           }
         }
 
-        // Fallback branch
-        if (!latestFrame) {
-          // no DB frame, try gateway
-        }
-        else {
-          // Fallback to live price from gateway if available
-          try {
-            const response = await fetch(`http://localhost:5000/api/gateway/ticker/${symbol}`);
-            if (response.ok) {
-              const ticker = await response.json();
-              this.priceCache.set(symbol, ticker.last || ticker.close);
-            } else if (latestFrame) {
-              // Use stale DB price as last resort
-              const stale = (latestFrame as any)?.price?.close;
-              if (typeof stale === 'number') this.priceCache.set(symbol, stale);
-            }
-          } catch (fetchError) {
-            // Network error, use stale DB price if available
+        // Fallback to live price from gateway if available
+        try {
+          const response = await fetch(`http://localhost:5000/api/gateway/ticker/${symbol}`);
+          if (response.ok) {
+            const ticker = await response.json();
+            this.priceCache.set(symbol, ticker.last || ticker.close);
+          } else if (latestFrame) {
             const stale = (latestFrame as any)?.price?.close;
             if (typeof stale === 'number') this.priceCache.set(symbol, stale);
           }
+        } catch (fetchError) {
+          const stale = (latestFrame as any)?.price?.close;
+          if (typeof stale === 'number') this.priceCache.set(symbol, stale);
         }
       }
     } catch (error) {
@@ -759,6 +910,12 @@ export class PaperTradingEngine extends EventEmitter {
     this.tradeHistory.push(trade);
     this.activeTrades.delete(tradeId);
 
+    // Remove from PortfolioRiskManager
+    try {
+      portfolioRiskManager.removePosition(trade.symbol);
+    } catch (pmErr) {
+      console.warn('[Paper Trading] Failed to remove position from PortfolioRiskManager', pmErr);
+    }
     this.emit('tradeClosed', trade);
 
     console.log(`[Paper Trading] Closed ${trade.symbol} ${trade.side} at $${exitPrice.toFixed(2)} (${reason}) - P&L: $${pnl.toFixed(2)} (${pnlPercent.toFixed(2)}%)`);
@@ -861,10 +1018,20 @@ export class PaperTradingEngine extends EventEmitter {
     side: 'BUY' | 'SELL',
     price: number,
     stopLoss?: number,
-    takeProfit?: number
+    takeProfit?: number,
+    quantity?: number
   ): Promise<string | null> {
     const sl = stopLoss || price * (side === 'BUY' ? 0.98 : 1.02);
     const tp = takeProfit || price * (side === 'BUY' ? 1.05 : 0.95);
+
+    // Simulate network and slippage for manual execution as well
+    try { this.mockNetwork.checkRateLimit(); } catch (e) { /* ignore simulated limit */ }
+    await this.mockNetwork.delay();
+
+    const approxQty = quantity || Math.floor((this.simulator.getCurrentBalance() * 0.1) / price);
+    const execPrice = this.slippageModel.applySlippage(price, approxQty, undefined, side === 'BUY' ? 'buy' : 'sell');
+    const fills = this.partialFillSim.simulateProgressiveFills(Math.ceil(approxQty), 5);
+    const filledQty = fills.reduce((s, v) => s + v, 0);
 
     const success = this.simulator.openPosition({
       id: `manual-${symbol}-${Date.now()}`,
@@ -872,13 +1039,13 @@ export class PaperTradingEngine extends EventEmitter {
       symbol,
       side,
       entryTime: new Date(),
-      entryPrice: price,
+      entryPrice: execPrice,
       commission: 0,
       status: 'OPEN',
       exitTime: null,
       exitPrice: null,
       pnl: null
-    }, sl);
+    }, sl, filledQty);
 
     if (!success) return null;
 

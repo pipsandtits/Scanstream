@@ -5,7 +5,7 @@
 
 import { useQuery } from '@tanstack/react-query';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { Line, LineChart, XAxis, YAxis, Tooltip, ResponsiveContainer, ReferenceLine, Area, AreaChart } from 'recharts';
+import AreaChartCore from '../charts/AreaChartCore';
 
 interface SentimentChartProps {
   symbol: string;
@@ -78,31 +78,27 @@ export function SentimentChart({ symbol }: SentimentChartProps) {
           </div>
 
           {/* Gauge Chart */}
-          <ResponsiveContainer width="100%" height={80}>
-            <AreaChart data={gaugeData} margin={{ top: 5, right: 0, left: 0, bottom: 5 }}>
-              <defs>
-                <linearGradient id="sentimentGradient" x1="0" y1="0" x2="1" y2="0">
-                  <stop offset="0%" stopColor="#ef4444" stopOpacity={0.8} />
-                  <stop offset="30%" stopColor="#f59e0b" stopOpacity={0.6} />
-                  <stop offset="50%" stopColor="#84cc16" stopOpacity={0.4} />
-                  <stop offset="70%" stopColor="#22c55e" stopOpacity={0.6} />
-                  <stop offset="100%" stopColor="#10b981" stopOpacity={0.8} />
-                </linearGradient>
-              </defs>
-              <XAxis dataKey="value" hide />
-              <YAxis hide domain={[0, 100]} />
-              <Area
-                type="monotone"
-                dataKey="score"
-                stroke="url(#sentimentGradient)"
-                fill="url(#sentimentGradient)"
-                strokeWidth={2}
-              />
-              <ReferenceLine x={score} stroke="#000" strokeWidth={2} strokeDasharray="3 3" />
-              <ReferenceLine y={30} stroke="#ef4444" strokeDasharray="2 2" opacity={0.3} />
-              <ReferenceLine y={70} stroke="#22c55e" strokeDasharray="2 2" opacity={0.3} />
-            </AreaChart>
-          </ResponsiveContainer>
+          <AreaChartCore
+            data={gaugeData}
+            dataKey="score"
+            height={80}
+            gradientId="sentimentGradient"
+            xDataKey="value"
+            hideXAxis
+            hideYAxis
+            yDomain={[0, 100]}
+            referenceLines={[{ x: score, stroke: '#000', strokeWidth: 2, strokeDasharray: '3 3' }, { y: 30, stroke: '#ef4444', strokeDasharray: '2 2', opacity: 0.3 }, { y: 70, stroke: '#22c55e', strokeDasharray: '2 2', opacity: 0.3 }]}
+          >
+            <defs>
+              <linearGradient id="sentimentGradient" x1="0" y1="0" x2="1" y2="0">
+                <stop offset="0%" stopColor="#ef4444" stopOpacity={0.8} />
+                <stop offset="30%" stopColor="#f59e0b" stopOpacity={0.6} />
+                <stop offset="50%" stopColor="#84cc16" stopOpacity={0.4} />
+                <stop offset="70%" stopColor="#22c55e" stopOpacity={0.6} />
+                <stop offset="100%" stopColor="#10b981" stopOpacity={0.8} />
+              </linearGradient>
+            </defs>
+          </AreaChartCore>
 
           {/* Legend */}
           <div className="flex justify-between text-xs px-2">

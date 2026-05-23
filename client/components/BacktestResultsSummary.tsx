@@ -14,22 +14,10 @@
  * - Performance comparison chart
  */
 
-import React, { useState } from 'react';
-import { useQuery } from '@tanstack/react-query';
-import {
-  AreaChart,
-  Area,
-  XAxis,
-  YAxis,
-  CartesianGrid,
-  Tooltip,
-  Legend,
-  ResponsiveContainer,
-  BarChart,
-  Bar,
-  LineChart,
-  Line,
-} from 'recharts';
+import React, { useState, Suspense } from 'react';
+import AreaChartCore from './charts/AreaChartCore';
+import { useBacktestResults } from '@/lib/hooks';
+const BacktestResultsChartsImpl = React.lazy(() => import('./BacktestResultsChartsImpl'));
 
 interface BacktestStats {
   symbol: string;
@@ -116,22 +104,8 @@ export const BacktestResultsSummary: React.FC<BacktestResultsSummaryProps> = ({
 }) => {
   const [selectedDirection, setSelectedDirection] = useState<'all' | 'long' | 'short'>('all');
 
-  // Fetch backtest results
-  const { data, isLoading, error, refetch } = useQuery({
-    queryKey: ['backtest-results', symbol, timeframe],
-    queryFn: () =>
-      fetch(`/api/ml/mtf/backtest?symbol=${symbol}&timeframe=${timeframe}`)
-        .then(r => {
-          if (!r.ok) throw new Error('No backtest data');
-          return r.json();
-        })
-        .catch(err => {
-          console.error('Backtest fetch error:', err);
-          return null;
-        }),
-    refetchInterval: 300000, // 5 minutes
-    enabled: !!symbol && !!timeframe,
-  });
+  // Fetch backtest results via typed hook
+  const { data, isLoading, error, refetch } = useBacktestResults(symbol, timeframe);
 
   if (isLoading) {
     return (
@@ -259,37 +233,11 @@ export const BacktestResultsSummary: React.FC<BacktestResultsSummaryProps> = ({
         </div>
       </div>
 
-      {/* Trade count visualization */}
+      {/* Trade count + performance charts (lazy-loaded) */}
       <div className="space-y-3">
-        <h4 className="text-sm font-semibold text-gray-700">Trade Distribution</h4>
-        <ResponsiveContainer width="100%" height={200}>
-          <BarChart data={tradeBreakdown}>
-            <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" />
-            <XAxis dataKey="name" />
-            <YAxis />
-            <Tooltip contentStyle={{ backgroundColor: '#fff', border: '1px solid #e5e7eb' }} />
-            <Legend />
-            <Bar dataKey="trades" fill="#3b82f6" name="Total Trades" />
-            <Bar dataKey="wins" fill="#10b981" name="Winning Trades" />
-          </BarChart>
-        </ResponsiveContainer>
-      </div>
-
-      {/* Performance comparison */}
-      <div className="space-y-3">
-        <h4 className="text-sm font-semibold text-gray-700">Performance Metrics</h4>
-        <ResponsiveContainer width="100%" height={200}>
-          <BarChart data={performanceData}>
-            <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" />
-            <XAxis dataKey="name" />
-            <YAxis />
-            <Tooltip contentStyle={{ backgroundColor: '#fff', border: '1px solid #e5e7eb' }} />
-            <Legend />
-            <Bar dataKey="Overall" fill="#3b82f6" name="Overall" />
-            <Bar dataKey="Long" fill="#10b981" name="Long" />
-            <Bar dataKey="Short" fill="#ef4444" name="Short" />
-          </BarChart>
-        </ResponsiveContainer>
+        <Suspense fallback={<div className="h-48 bg-gray-50 rounded" />}>
+          <BacktestResultsChartsImpl performanceData={performanceData} tradeBreakdown={tradeBreakdown} />
+        </Suspense>
       </div>
 
       {/* Summary stats table */}

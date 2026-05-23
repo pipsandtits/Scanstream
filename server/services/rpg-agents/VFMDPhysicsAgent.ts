@@ -1,18 +1,18 @@
-import { TradingAgent, AgentPersonality, AgentSignal } from './TradingAgent.ts';
-import type { MarketTick, PhysicsMetrics } from '../vfmd/types.ts';
-import { EarlyEntryDetector } from '../vfmd/earlyEntryDetector.ts';
-import { PhysicsCalculator } from '../vfmd/physicsCalculator.ts';
-import { FieldConstructor } from '../vfmd/fieldConstructor.ts';
-import { RegimeClassifier, FlowRegime, type RegimeConfig } from '../vfmd/regimeClassifier.ts';
-import { TriggerCalculator } from '../vfmd/triggerCalculator.ts';
-import { ProfitEstimator } from '../vfmd/profitEstimator.ts';
-import { PressureFragilityEngine } from '../vfmd/pressureFragilityEngine.ts';
-import { VFMDDirectionPatch, type HTFBar } from '../vfmd/VFMDDirectionPatch.ts';
-import { VFMDEntryGate, type EntryGateResult, DEFAULT_GATE_CONFIG } from '../vfmd/VFMDEntryGate.ts';
-import { PEGSlopeTracker, DEFAULT_PEG_CONFIG } from '../vfmd/PEGSlopeTracker.ts';
-import { ClusteringCalculator } from '../clustering/ClusteringCalculator.ts';
-import { UnifiedRegimeDetector, UnifiedRegimeType, RegimeDetectionResult } from '../unified-regime-system.ts';
-import { RegimeConsolidationBridge } from '../regime-consolidation-bridge.ts';
+import { TradingAgent, AgentPersonality, AgentSignal } from './TradingAgent';
+import type { MarketTick, PhysicsMetrics } from '../vfmd/types';
+import { EarlyEntryDetector } from '../vfmd/earlyEntryDetector';
+import { PhysicsCalculator } from '../vfmd/physicsCalculator';
+import { FieldConstructor } from '../vfmd/fieldConstructor';
+import { RegimeClassifier, FlowRegime, type RegimeConfig } from '../vfmd/regimeClassifier';
+import { TriggerCalculator } from '../vfmd/triggerCalculator';
+import { ProfitEstimator } from '../vfmd/profitEstimator';
+import { PressureFragilityEngine } from '../vfmd/pressureFragilityEngine';
+import { VFMDDirectionPatch, type HTFBar } from '../vfmd/VFMDDirectionPatch';
+import { VFMDEntryGate, type EntryGateResult, DEFAULT_GATE_CONFIG } from '../vfmd/VFMDEntryGate';
+import { PEGSlopeTracker, DEFAULT_PEG_CONFIG } from '../vfmd/PEGSlopeTracker';
+import { ClusteringCalculator } from '../clustering/ClusteringCalculator';
+import { UnifiedRegimeDetector, UnifiedRegimeType, RegimeDetectionResult } from '../unified-regime-system';
+import { RegimeConsolidationBridge } from '../regime-consolidation-bridge';
 
 /**
  * VFMDPhysicsAgent

@@ -10,7 +10,7 @@
  */
 
 import type { MarketTick } from './types';
-import { RegimeClassifier, FlowRegime } from './regimeClassifier.ts';
+import { RegimeClassifier, FlowRegime } from './regimeClassifier';
 import { HTFTrendIndicator } from './HTFTrendIndicator';
 import { VFMDPhysicsAgent } from './VFMDPhysicsAgent';
 

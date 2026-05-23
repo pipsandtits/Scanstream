@@ -1,6 +1,6 @@
 
 import { useState } from 'react';
-import { useLocation } from 'wouter';
+import { useNavigate } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
 import {
   ArrowLeft,
@@ -53,7 +53,7 @@ interface SynthesizedSignal {
 }
 
 export default function StrategySynthesisPage() {
-  const [, setLocation] = useLocation();
+  const navigate = useNavigate();
   const [symbol, setSymbol] = useState('BTC/USDT');
   const [timeframe, setTimeframe] = useState('1h');
 
@@ -63,11 +63,12 @@ export default function StrategySynthesisPage() {
     weights: StrategyWeight[];
   }>({
     queryKey: ['strategy-synthesis', symbol, timeframe],
-    queryFn: async () => {
+    queryFn: async ({ signal }: any) => {
       const response = await fetch('/api/strategies/synthesize', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ symbol, timeframe })
+        body: JSON.stringify({ symbol, timeframe }),
+        signal,
       });
       if (!response.ok) throw new Error('Failed to synthesize signals');
       return response.json();

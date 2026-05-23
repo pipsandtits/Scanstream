@@ -1,4 +1,5 @@
-import { createContext, useContext, useState, useEffect, ReactNode } from 'react';
+import { createContext, useContext, useEffect, ReactNode } from 'react';
+import { usePreferences } from './PreferencesContext';
 
 export type ThemePreset = 
   | 'dark' 
@@ -140,54 +141,13 @@ interface ThemeContextType {
 const ThemeContext = createContext<ThemeContextType | undefined>(undefined);
 
 export function ThemeProvider({ children }: { children: ReactNode }) {
-  const [preset, setPresetState] = useState<ThemePreset>(() => {
-    const saved = localStorage.getItem('theme-preset');
-    return (saved as ThemePreset) || 'dark';
-  });
+  const { preset, setPreset, fontSize, setFontSize, opacity, setOpacity, highContrast, setHighContrast } = usePreferences();
 
-  const [fontSize, setFontSizeState] = useState<'small' | 'medium' | 'large'>(() => {
-    const saved = localStorage.getItem('font-size');
-    return (saved as 'small' | 'medium' | 'large') || 'medium';
-  });
-
-  const [opacity, setOpacityState] = useState(() => {
-    const saved = localStorage.getItem('opacity');
-    return saved ? parseFloat(saved) : 0.95;
-  });
-
-  const [highContrast, setHighContrastState] = useState(() => {
-    return localStorage.getItem('high-contrast') === 'true';
-  });
-
-  const setPreset = (newPreset: ThemePreset) => {
-    setPresetState(newPreset);
-    localStorage.setItem('theme-preset', newPreset);
-    document.documentElement.setAttribute('data-theme', newPreset);
-  };
-
-  const setFontSize = (size: 'small' | 'medium' | 'large') => {
-    setFontSizeState(size);
-    localStorage.setItem('font-size', size);
-    document.documentElement.setAttribute('data-font-size', size);
-  };
-
-  const setOpacity = (value: number) => {
-    setOpacityState(value);
-    localStorage.setItem('opacity', value.toString());
-  };
-
-  const setHighContrast = (enabled: boolean) => {
-    setHighContrastState(enabled);
-    localStorage.setItem('high-contrast', enabled.toString());
-  };
-
-  // Apply theme colors to CSS variables
+  // Apply theme colors to CSS variables whenever preset changes
   useEffect(() => {
-    console.log(`[Theme] Applying preset: ${preset}`);
     const colors = themePresets[preset];
     const root = document.documentElement;
-    
-    // Apply all CSS variables immediately
+
     root.style.setProperty('--theme-bg', colors.background);
     root.style.setProperty('--theme-surface', colors.surface);
     root.style.setProperty('--theme-card', colors.card);
@@ -201,53 +161,16 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     root.style.setProperty('--theme-error', colors.error);
     root.style.setProperty('--theme-info', colors.info);
 
-    // Update body background color immediately
     document.body.style.backgroundColor = colors.background;
     document.body.style.color = colors.text;
-
-    // Set data attribute for theme-based styling
     root.setAttribute('data-theme', preset);
-    
-    // Also update root class for Tailwind dark mode (use html element)
+
     if (preset === 'dark' || preset === 'oled') {
       root.classList.add('dark');
     } else {
       root.classList.remove('dark');
     }
-
-    console.log(`[Theme] Theme applied successfully. Colors:`, colors);
   }, [preset]);
-  
-  // Initial theme application on mount
-  useEffect(() => {
-    console.log(`[Theme] Initial mount, applying theme: ${preset}`);
-    const colors = themePresets[preset];
-    const root = document.documentElement;
-    
-    root.style.setProperty('--theme-bg', colors.background);
-    root.style.setProperty('--theme-surface', colors.surface);
-    root.style.setProperty('--theme-card', colors.card);
-    root.style.setProperty('--theme-border', colors.border);
-    root.style.setProperty('--theme-text', colors.text);
-    root.style.setProperty('--theme-text-secondary', colors.textSecondary);
-    root.style.setProperty('--theme-accent', colors.accent);
-    root.style.setProperty('--theme-accent-hover', colors.accentHover);
-    root.style.setProperty('--theme-success', colors.success);
-    root.style.setProperty('--theme-warning', colors.warning);
-    root.style.setProperty('--theme-error', colors.error);
-    root.style.setProperty('--theme-info', colors.info);
-    
-    document.body.style.backgroundColor = colors.background;
-    document.body.style.color = colors.text;
-    root.setAttribute('data-theme', preset);
-    // Ensure dark class matches initial preset
-    if (preset === 'dark' || preset === 'oled') {
-      root.classList.add('dark');
-    } else {
-      root.classList.remove('dark');
-    }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []); // Run once on mount
 
   // Apply font size
   useEffect(() => {
@@ -258,17 +181,7 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
 
   return (
     <ThemeContext.Provider
-      value={{
-        preset,
-        colors,
-        setPreset,
-        fontSize,
-        setFontSize,
-        opacity,
-        setOpacity,
-        highContrast,
-        setHighContrast,
-      }}
+      value={{ preset, colors, setPreset, fontSize, setFontSize, opacity, setOpacity, highContrast, setHighContrast }}
     >
       {children}
     </ThemeContext.Provider>

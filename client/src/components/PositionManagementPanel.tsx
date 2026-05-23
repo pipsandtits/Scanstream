@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useMemo, useState, useEffect } from 'react';
 import { 
   TrendingUp, 
   TrendingDown, 
@@ -59,6 +59,8 @@ interface PositionManagementPanelProps {
   trades?: Trade[];
   onClosePosition?: (positionId: string) => void;
   onCancelOrder?: (orderId: string) => void;
+  selectedPosition?: Position | null;
+  selectedOrders?: Order[];
 }
 
 export default function PositionManagementPanel({
@@ -67,9 +69,25 @@ export default function PositionManagementPanel({
   trades = [],
   onClosePosition,
   onCancelOrder,
+  selectedPosition,
+  selectedOrders,
 }: PositionManagementPanelProps) {
   const [activeTab, setActiveTab] = useState<'positions' | 'orders' | 'history'>('positions');
   const [showDetails, setShowDetails] = useState<string | null>(null);
+
+  // If parent provides a selected position or orders, surface them in the panel
+  useEffect(() => {
+    if (selectedPosition) {
+      setActiveTab('positions');
+      setShowDetails(selectedPosition.id);
+    }
+  }, [selectedPosition]);
+
+  useEffect(() => {
+    if (selectedOrders && selectedOrders.length > 0) {
+      setActiveTab('orders');
+    }
+  }, [selectedOrders]);
 
   // Calculate portfolio metrics
   const metrics = useMemo(() => {
@@ -173,14 +191,19 @@ export default function PositionManagementPanel({
         {/* Open Positions */}
         {activeTab === 'positions' && (
           <div className="space-y-2">
-            {positions.filter(p => p.status === 'open').length === 0 ? (
+              {positions.filter(p => p.status === 'open').length === 0 ? (
               <div className="text-center py-6 text-slate-500">
                 <div className="text-sm">No open positions</div>
               </div>
             ) : (
-              positions
-                .filter(p => p.status === 'open')
-                .map((position) => (
+                (() => {
+                  const open = positions.filter(p => p.status === 'open');
+                  // Prefer the selectedPosition if provided
+                  const ordered = selectedPosition ? [
+                    ...open.filter(p => p.id === selectedPosition.id),
+                    ...open.filter(p => p.id !== selectedPosition.id)
+                  ] : open;
+                  return ordered.map((position) => (
                   <div key={position.id} className="bg-slate-900/30 rounded border border-slate-700/30 p-2">
                     <div className="flex items-start justify-between mb-2">
                       <div className="flex-1">
@@ -247,6 +270,7 @@ export default function PositionManagementPanel({
                     </button>
                   </div>
                 ))
+                })()
             )}
           </div>
         )}
@@ -259,9 +283,13 @@ export default function PositionManagementPanel({
                 <div className="text-sm">No active orders</div>
               </div>
             ) : (
-              orders
-                .filter(o => o.status !== 'filled' && o.status !== 'cancelled')
-                .map((order) => (
+              (() => {
+                const active = orders.filter(o => o.status !== 'filled' && o.status !== 'cancelled');
+                const ordered = selectedOrders && selectedOrders.length > 0 ? [
+                  ...active.filter(o => selectedOrders.some(so => so.id === o.id)),
+                  ...active.filter(o => !selectedOrders.some(so => so.id === o.id))
+                ] : active;
+                return ordered.map((order) => (
                   <div key={order.id} className="bg-slate-900/30 rounded border border-slate-700/30 p-2">
                     <div className="flex items-start justify-between mb-2">
                       <div className="flex-1">
@@ -314,6 +342,7 @@ export default function PositionManagementPanel({
                     </button>
                   </div>
                 ))
+                })()
             )}
           </div>
         )}

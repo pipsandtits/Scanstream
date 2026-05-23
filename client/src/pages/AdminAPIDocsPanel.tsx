@@ -52,12 +52,12 @@ const AdminAPIDocsPanel: React.FC = () => {
   const [loading, setLoading] = useState(true);
   const [lastRefresh, setLastRefresh] = useState<string>('');
 
-  const loadDashboard = async () => {
+  const loadDashboard = async (signal?: AbortSignal) => {
     try {
       const [statsRes, healthRes, perfRes] = await Promise.all([
-        fetch('/api/docs/stats').then(r => r.json()),
-        fetch('/api/docs/health').then(r => r.json()),
-        fetch('/api/docs/performance?hours=1').then(r => r.json()),
+        fetch('/api/docs/stats', { signal }).then(r => r.json()),
+        fetch('/api/docs/health', { signal }).then(r => r.json()),
+        fetch('/api/docs/performance?hours=1', { signal }).then(r => r.json()),
       ]);
 
       setStats(statsRes);
@@ -65,16 +65,21 @@ const AdminAPIDocsPanel: React.FC = () => {
       setPerf(perfRes);
       setLoading(false);
       setLastRefresh(new Date().toLocaleTimeString());
-    } catch (error) {
+    } catch (error: any) {
+      if (error && error.name === 'AbortError') return;
       console.error('Failed to load dashboard:', error);
       setLoading(false);
     }
   };
 
   useEffect(() => {
-    loadDashboard();
-    const interval = setInterval(loadDashboard, 30000);
-    return () => clearInterval(interval);
+    const controller = new AbortController();
+    loadDashboard(controller.signal);
+    const interval = setInterval(() => loadDashboard(controller.signal), 30000);
+    return () => {
+      controller.abort();
+      clearInterval(interval);
+    };
   }, []);
 
   if (loading) {

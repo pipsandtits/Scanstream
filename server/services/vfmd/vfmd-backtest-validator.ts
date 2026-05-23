@@ -16,7 +16,7 @@
 import type { MarketTick, PhysicsMetrics } from './types';
 import { FieldConstructor } from './fieldConstructor';
 import { PhysicsCalculator } from './physicsCalculator';
-import { RegimeClassifier, FlowRegime, type RegimeConfig } from './regimeClassifier.ts';
+import { RegimeClassifier, FlowRegime, type RegimeConfig } from './regimeClassifier';
 
 /**
  * Trade outcome after signal is generated

@@ -7,6 +7,7 @@ import { signalArchive } from './signal-archive';
 import { calculateClusterMetrics } from './clustering';
 import { getTickerCache } from './ticker-snapshot-cache';
 import { getTimeAnchorManager } from './market-data/time-anchor';
+import { priceCache } from '../../src/core/PriceCache';
 
 /**
  * Market Data Fetcher Service
@@ -28,6 +29,10 @@ export class MarketDataFetcher {
   // 🔒 BACKFILL TRACKING (critical for LIVE mode)
   // Per (symbol, timeframe): has initial backfill completed?
   private backfillComplete = new Set<string>(); // keys: "symbol:timeframe"
+  // Prevent overlapping fetchAllData calls
+  private fetchLock = false;
+  // Prevent concurrent transition handling
+  private transitioningBackfill = false;
 
   // Configurable symbol universe - can be updated dynamically via setSymbols()
   // Default: Popular trading pairs across major exchanges
@@ -70,6 +75,8 @@ export class MarketDataFetcher {
     this.cacheManager = cacheManager;
     this.rateLimiter = rateLimiter;
     this.signalPipeline = signalPipeline || null;
+    // Whether we've already signalled global backfill completion to ModeDetector
+    (this as any).backfillSignalled = false;
   }
 
   /**
@@ -125,6 +132,20 @@ export class MarketDataFetcher {
       this.lastProcessedCandleTime.clear();
       console.log('[MarketDataFetcher] Cleared candle timestamp cache for fresh start');
 
+      // Seed anchors for all configured symbols/timeframes to avoid runtime discovery during LIVE
+      try {
+        const anchorMgr = getTimeAnchorManager();
+        for (const symbol of this.symbols) {
+          for (const tf of this.timeframes) {
+            const tf_seconds = this.timeframeToSeconds(tf);
+            try { anchorMgr.getOrCreateAnchor(symbol, tf_seconds, true); } catch (e) { /* ignore */ }
+          }
+        }
+        console.log('[MarketDataFetcher] Pre-seeded TimeAnchorManager for configured symbols');
+      } catch (e) {
+        console.warn('[MarketDataFetcher] Could not pre-seed anchors', (e as any)?.message || e);
+      }
+
       // Initial fetch
       await this.fetchAllData();
 
@@ -163,6 +184,11 @@ export class MarketDataFetcher {
    * - LIVE phase: Only accept WS, no more REST
    */
   private async fetchAllData(): Promise<void> {
+    if (this.fetchLock) {
+      console.log('[MarketDataFetcher] fetch already in progress, skipping');
+      return;
+    }
+    this.fetchLock = true;
     const startTime = Date.now();
     let successCount = 0;
     let errorCount = 0;
@@ -184,7 +210,7 @@ export class MarketDataFetcher {
 
       // Check if all timeframes for all symbols are backfilled
       // If so, transition anchors to ARMED and disable REST polling
-      this.checkAndTransitionBackfill();
+      await this.checkAndTransitionBackfill();
 
       const duration = Date.now() - startTime;
       console.log(
@@ -192,6 +218,8 @@ export class MarketDataFetcher {
       );
     } catch (error) {
       console.error('[MarketDataFetcher] Batch fetch error:', error);
+    } finally {
+      this.fetchLock = false;
     }
   }
 
@@ -199,7 +227,9 @@ export class MarketDataFetcher {
    * Check if all (symbol, timeframe) pairs have completed backfill
    * If so, transition to ARMED mode and stop REST polling
    */
-  private checkAndTransitionBackfill(): void {
+  private async checkAndTransitionBackfill(): Promise<void> {
+    if (this.transitioningBackfill) return;
+    this.transitioningBackfill = true;
     const anchorMgr = getTimeAnchorManager();
     let allBackfillComplete = true;
 
@@ -221,6 +251,19 @@ export class MarketDataFetcher {
 
     // Once all anchors have been transitioned to ARMED or beyond, stop REST fetching
     if (allBackfillComplete && this.symbols.length > 0) {
+      // Signal global backfill completion to mode detector (one-time)
+      try {
+        const { getModeDetector } = await import('./market-data/mode-detector');
+        const modeDetector = getModeDetector();
+        // Only signal once
+        if (!(this as any).backfillSignalled && !modeDetector.getMetrics().backfillComplete) {
+          modeDetector.setBackfillComplete(true);
+          (this as any).backfillSignalled = true;
+          console.log('[MarketDataFetcher] Signalled ModeDetector backfill completion');
+        }
+      } catch (e) {
+        console.warn('[MarketDataFetcher] Could not signal ModeDetector backfill completion', (e as any)?.message || e);
+      }
       // Ensure all anchors are transitioned to ARMED before disabling REST
       for (const symbol of this.symbols) {
         for (const timeframe of this.timeframes) {
@@ -235,7 +278,9 @@ export class MarketDataFetcher {
       }
       console.log('[MarketDataFetcher] 🔒 Backfill complete for all symbols → transitioning to WS-only mode');
       this.disableRestFetching();
+      this.transitioningBackfill = false;
     }
+    this.transitioningBackfill = false;
   }
 
   /**
@@ -276,9 +321,15 @@ export class MarketDataFetcher {
 
       // Fetch data for each timeframe in parallel with appropriate candle limits
       const results = await Promise.all(
-        this.timeframes.map(timeframe => 
-          this.fetchOHLCV(symbol, timeframe, this.candleLimits[timeframe] || 100)
-        )
+        this.timeframes.map(async (timeframe) => {
+          const tf_seconds = this.timeframeToSeconds(timeframe);
+          const anchor = anchorMgr.getAnchor(symbol, tf_seconds);
+          // If anchor is already ARMED/LIVE, skip REST fetch for this timeframe
+          if (anchor && (anchor.mode === 'ARMED' || anchor.mode === 'LIVE')) {
+            return [] as any[];
+          }
+          return this.fetchOHLCV(symbol, timeframe, this.candleLimits[timeframe] || 100);
+        })
       );
 
       // Mark backfill complete for each timeframe
@@ -318,11 +369,42 @@ export class MarketDataFetcher {
 
         // Calculate clustering metrics from CLOSED candles only (not the forming candle)
         const clusterMetrics = calculateClusterMetrics(closedCandles);
+        // Compute simple momentum acceleration and volume confirmation from closed candles
+        let momentum_acceleration = 0;
+        let volume_confirmation = 0;
+        try {
+          const closes = closedCandles.map(c => c[4]);
+          if (closes.length >= 3) {
+            const n = closes.length;
+            const r1 = (closes[n - 2] - closes[n - 3]) / (closes[n - 3] || 1);
+            const r2 = (closes[n - 1] - closes[n - 2]) / (closes[n - 2] || 1);
+            momentum_acceleration = r2 - r1; // positive = accelerating in direction
+            // normalize to small bounded value
+            if (!Number.isFinite(momentum_acceleration)) momentum_acceleration = 0;
+            momentum_acceleration = Math.max(-1, Math.min(1, momentum_acceleration));
+          }
+
+          const volumes = closedCandles.map(c => c[5] || 0);
+          const lastVol = volumes[volumes.length - 1] || 0;
+          const avgVol = volumes.slice(-6, -1).length > 0 ? volumes.slice(-6, -1).reduce((a, b) => a + b, 0) / volumes.slice(-6, -1).length : 0;
+          if (avgVol > 0) {
+            volume_confirmation = Math.min(1, lastVol / (avgVol * 1.15));
+          } else {
+            volume_confirmation = 0;
+          }
+        } catch (e) {
+          momentum_acceleration = 0;
+          volume_confirmation = 0;
+        }
+
+        // Attach computed signals to clusterMetrics for downstream consumers
+        (clusterMetrics as any).momentum_acceleration = momentum_acceleration;
+        (clusterMetrics as any).volume_confirmation = volume_confirmation;
         console.log(
           `[MarketDataFetcher] Clustering for ${symbol}: strength=${clusterMetrics.cluster_strength.toFixed(2)}, formation=${clusterMetrics.trend_formation_signal}, total_clusters=${clusterMetrics.total_clusters}`
         );
 
-        // Store clustering metrics in cache for agent access
+        // Store clustering metrics (with momentum & volume) in cache for agent access
         const clusterCacheKey = `clustering:${symbol}:1h`;
         this.cacheManager.set(clusterCacheKey, clusterMetrics, 180000); // 3 minute cache
 
@@ -371,7 +453,9 @@ export class MarketDataFetcher {
                   volume: currentFormingCandle[5], // volume
                   timestamp: Date.now(),
                   exchange: (signal as any).exchange || 'aggregated',
-                  clustering: clusterMetrics // Include clustering metrics
+                  clustering: clusterMetrics, // Include clustering metrics
+                  momentum_acceleration: (clusterMetrics as any).momentum_acceleration || 0,
+                  volume_confirmation: (clusterMetrics as any).volume_confirmation || 0
                 };
                 signalWebSocketService.broadcastSignal(signalData, 'new');
 
@@ -413,6 +497,26 @@ export class MarketDataFetcher {
       // Use rate limiter with actual exchange name (not a composite key)
       // The aggregator will handle which exchange to use internally
       await this.rateLimiter.acquire('binance', 'normal');
+
+      // Step 1: Prefer PriceCache (authoritative source)
+      try {
+        const cached = priceCache.getCandles(symbol, timeframe);
+        if (cached && Array.isArray(cached) && cached.length > 0) {
+          console.log(`[MarketDataFetcher] Using priceCache for ${symbol} ${timeframe} (${cached.length} candles)`);
+          // Return the most recent up-to-`limit` candles in CCXT number[][] format
+          return cached.slice(-limit);
+        }
+        // If cache empty, attempt to refresh the priceCache for this symbol/timeframe
+        await priceCache.refreshCandles(symbol, timeframe, limit);
+        const refreshed = priceCache.getCandles(symbol, timeframe);
+        if (refreshed && Array.isArray(refreshed) && refreshed.length > 0) {
+          console.log(`[MarketDataFetcher] Loaded ${symbol} ${timeframe} into priceCache (${refreshed.length} candles)`);
+          return refreshed.slice(-limit);
+        }
+      } catch (pcErr) {
+        // If price cache fails for any reason, we fall back to aggregator below
+        console.debug('[MarketDataFetcher] priceCache attempt failed:', (pcErr as any)?.message || pcErr);
+      }
 
       // Check ticker cache for symbol availability across exchanges
       // This avoids attempting to fetch non-existent symbols

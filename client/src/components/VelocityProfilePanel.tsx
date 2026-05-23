@@ -9,7 +9,6 @@
 
 import React, { useState } from 'react';
 import { TrendingUp, CheckCircle, AlertCircle, Zap, Settings, Download, Play, Activity } from 'lucide-react';
-import { BarChart, Bar, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, ScatterChart, Scatter } from 'recharts';
 
 interface VelocityMetrics {
   priceVelocity: number;

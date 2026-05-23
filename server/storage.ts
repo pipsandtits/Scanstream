@@ -1,9 +1,12 @@
-import { type MarketFrame, type Signal, type Trade, type Strategy, type BacktestResult, type InsertMarketFrame, type InsertSignal, type InsertTrade, type InsertStrategy, type InsertBacktestResult, type MarketSentiment, type PortfolioSummary, type ModelMetric, type InsertModelMetric, type InsertAuditLog } from "@shared/schema";
+import type { MarketFrame, Signal, Trade, Strategy, BacktestResult, InsertMarketFrame, InsertSignal, InsertTrade, InsertStrategy, InsertBacktestResult, MarketSentiment, PortfolioSummary, ModelMetric, InsertModelMetric, InsertAuditLog } from "@shared/schema";
 import { randomUUID } from "crypto";
+import { DbStorage } from './db-storage';
 
 export interface IStorage {
   // Market data
   getMarketFrames(symbol: string, limit?: number): Promise<MarketFrame[]>;
+  // Batch fetch market frames for multiple symbols in a single query to avoid N+1
+  getMarketFramesForSymbols?(symbols: string[], limit?: number): Promise<Record<string, MarketFrame[]>>;
   createMarketFrame(frame: InsertMarketFrame): Promise<MarketFrame>;
   getLatestMarketFrame(symbol: string): Promise<MarketFrame | undefined>;
   
@@ -41,6 +44,17 @@ export interface IStorage {
   // Audit logs
   createAuditLog(log: InsertAuditLog): Promise<void>;
   getAuditLogs(entityType?: string, entityId?: string, limit?: number): Promise<InsertAuditLog[]>;
+  // Trade provenance
+  createTradeProvenance(record: any): Promise<void>;
+  // Decision events: per-decision records for causality tracing
+  createDecisionEvent(record: any): Promise<void>;
+  // Decision snapshots (rich ML/agent snapshots)
+  createDecisionSnapshot(record: any): Promise<void>;
+  // Order audit records for execution provenance
+  createOrderAudit(record: any): Promise<any>;
+  updateOrderAudit(orderIdOrId: string, updates: any): Promise<void>;
+  // Retrieve a trace chain by trace id
+  getTraceChain(traceId: string): Promise<any>;
 }
 
 export class MemStorage implements IStorage {
@@ -51,12 +65,31 @@ export class MemStorage implements IStorage {
   private backtestResults: Map<string, BacktestResult> = new Map();
   private modelMetrics: Map<string, ModelMetric> = new Map();
   private auditLogs: Map<string, InsertAuditLog> = new Map();
+  private provenances: Map<string, any> = new Map();
+  private decisionEvents: Map<string, any> = new Map();
+  private decisionSnapshots: Map<string, any> = new Map();
+  private orderAudits: Map<string, any> = new Map();
+  
+
+  // Runtime limits and cleanup config
+  private readonly STORAGE_CONFIG = {
+    maxMarketFrames: 50000,
+    maxSignals: 10000,
+    maxTrades: 5000,
+    maxBacktests: 2000,
+    cleanupIntervalMs: 1000 * 60 * 60, // hourly
+  } as const;
 
   async getMarketFrames(symbol: string, limit = 200): Promise<MarketFrame[]> {
-    return Array.from(this.marketFrames.values())
-      .filter(frame => frame.symbol === symbol)
-      .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
-      .slice(0, limit);
+    return this.query(this.marketFrames, (f: MarketFrame) => f.symbol === symbol, limit, (a, b) => new Date((b as any).timestamp).getTime() - new Date((a as any).timestamp).getTime());
+  }
+
+  async getMarketFramesForSymbols(symbols: string[], limit = 200): Promise<Record<string, MarketFrame[]>> {
+    const out: Record<string, MarketFrame[]> = {};
+    for (const s of symbols) {
+      out[s] = await this.getMarketFrames(s, limit);
+    }
+    return out;
   }
 
   async createMarketFrame(frameData: InsertMarketFrame): Promise<MarketFrame> {
@@ -67,7 +100,16 @@ export class MemStorage implements IStorage {
       timestamp: new Date(),
     };
     this.marketFrames.set(id, frame);
+    this.enforceSizeLimit(this.marketFrames, this.STORAGE_CONFIG.maxMarketFrames, (v: MarketFrame) => new Date((v as any).timestamp).getTime());
     return frame;
+  }
+
+  async createManyMarketFrames(frames: InsertMarketFrame[]): Promise<MarketFrame[]> {
+    const res: MarketFrame[] = [];
+    for (const f of frames) {
+      res.push(await this.createMarketFrame(f));
+    }
+    return res;
   }
 
   async getLatestMarketFrame(symbol: string): Promise<MarketFrame | undefined> {
@@ -76,47 +118,37 @@ export class MemStorage implements IStorage {
   }
 
   async getSignals(symbol?: string, limit = 50): Promise<Signal[]> {
-    let signals = Array.from(this.signals.values());
-    if (symbol) {
-      signals = signals.filter(signal => signal.symbol === symbol);
-    }
-    return signals
-      .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
-      .slice(0, limit);
+    return this.query(this.signals, (s: Signal) => (symbol ? s.symbol === symbol : true), limit, (a, b) => new Date((b as any).timestamp).getTime() - new Date((a as any).timestamp).getTime());
   }
 
   async createSignal(signalData: InsertSignal): Promise<Signal> {
     const id = randomUUID();
-    const signal: Signal = {
+    const signal = {
       ...signalData,
       id,
       timestamp: new Date(),
-      momentumLabel: signalData.momentumLabel !== undefined ? signalData.momentumLabel : null,
-      regimeState: signalData.regimeState !== undefined ? signalData.regimeState : null,
-      legacyLabel: signalData.legacyLabel !== undefined ? signalData.legacyLabel : null,
-      signalStrengthScore: signalData.signalStrengthScore !== undefined ? signalData.signalStrengthScore : null,
+      momentumLabel: signalData.momentumLabel ?? null,
+      regimeState: signalData.regimeState ?? null,
+      legacyLabel: signalData.legacyLabel ?? null,
+      signalStrengthScore: signalData.signalStrengthScore ?? null,
       classifications: signalData.classifications ?? [],
       patternDetails: signalData.patternDetails ?? [],
       timeframeAlignment: signalData.timeframeAlignment ?? 0,
       agreementScore: signalData.agreementScore ?? 50,
       positionSize: signalData.positionSize ?? null,
-    };
+      correlationId: (signalData as any).correlationId ?? randomUUID(),
+    } as any as Signal;
     this.signals.set(id, signal);
+    this.enforceSizeLimit(this.signals, this.STORAGE_CONFIG.maxSignals, (v: Signal) => new Date((v as any).timestamp).getTime());
     return signal;
   }
 
   async getLatestSignals(limit = 10): Promise<Signal[]> {
-    return Array.from(this.signals.values())
-      .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
-      .slice(0, limit);
+    return this.query(this.signals, undefined, limit, (a, b) => new Date((b as any).timestamp).getTime() - new Date((a as any).timestamp).getTime());
   }
 
   async getTrades(status?: string): Promise<Trade[]> {
-    let trades = Array.from(this.trades.values());
-    if (status) {
-      trades = trades.filter(trade => trade.status === status);
-    }
-    return trades.sort((a, b) => new Date(b.entryTime).getTime() - new Date(a.entryTime).getTime());
+    return this.query(this.trades, (t: Trade) => (status ? t.status === status : true), undefined, (a, b) => new Date((b as any).entryTime).getTime() - new Date((a as any).entryTime).getTime());
   }
 
   async createTrade(tradeData: InsertTrade): Promise<Trade> {
@@ -132,7 +164,12 @@ export class MemStorage implements IStorage {
       signalId: tradeData.signalId ?? null,
     };
     this.trades.set(id, trade);
+    this.enforceSizeLimit(this.trades, this.STORAGE_CONFIG.maxTrades, (v: Trade) => new Date((v as any).entryTime).getTime());
     return trade;
+  }
+
+  async getTradesBySignalId(signalId: string): Promise<Trade[]> {
+    return this.query(this.trades, (t: Trade) => t.signalId === signalId, undefined, (a, b) => new Date((b as any).entryTime).getTime() - new Date((a as any).entryTime).getTime());
   }
 
   async updateTrade(id: string, updates: Partial<Trade>): Promise<Trade> {
@@ -196,6 +233,7 @@ export class MemStorage implements IStorage {
       
     };
     this.backtestResults.set(id, result);
+    this.enforceSizeLimit(this.backtestResults, this.STORAGE_CONFIG.maxBacktests, (v: BacktestResult) => new Date((v as any).createdAt).getTime());
     return result;
   }
 
@@ -257,6 +295,7 @@ export class MemStorage implements IStorage {
       timestamp: ts,
     };
     this.auditLogs.set(id, record);
+    // No strict size limit for logs by default; keep in-memory but could be pruned by deleteOldMarketFrames or similar
   }
 
   async getAuditLogs(entityType?: string, entityId?: string, limit = 100): Promise<InsertAuditLog[]> {
@@ -266,6 +305,66 @@ export class MemStorage implements IStorage {
     items = items.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()).slice(0, limit);
     return items as InsertAuditLog[];
   }
+
+  // Trade provenance for MemStorage
+  async createTradeProvenance(record: any): Promise<void> {
+    const id = randomUUID();
+    const rec = { id, ...record, createdAt: record.createdAt ? new Date(record.createdAt) : new Date() };
+    this.provenances.set(id, rec);
+  }
+
+  // Decision event persistence for MemStorage
+  async createDecisionEvent(record: any): Promise<void> {
+    const id = randomUUID();
+    const rec = { id, ...record, timestamp: record.timestamp ? new Date(record.timestamp) : new Date() };
+    this.decisionEvents.set(id, rec);
+  }
+
+  async createDecisionSnapshot(record: any): Promise<void> {
+    const id = randomUUID();
+    const rec = { id, ...record, timestamp: record.timestamp ? new Date(record.timestamp) : new Date() };
+    this.decisionSnapshots.set(id, rec);
+  }
+
+  async createOrderAudit(record: any): Promise<any> {
+    const id = randomUUID();
+    const rec = { id, ...record, createdAt: record.createdAt ? new Date(record.createdAt) : new Date(), updatedAt: record.updatedAt ? new Date(record.updatedAt) : new Date() };
+    this.orderAudits.set(id, rec);
+    return rec;
+  }
+
+  async updateOrderAudit(orderIdOrId: string, updates: any): Promise<void> {
+    // find by id or orderId
+    let foundKey: string | null = null;
+    for (const [k, v] of this.orderAudits.entries()) {
+      if (k === orderIdOrId || v.orderId === orderIdOrId) {
+        foundKey = k;
+        break;
+      }
+    }
+    if (!foundKey) throw new Error(`OrderAudit not found for ${orderIdOrId}`);
+    const existing = this.orderAudits.get(foundKey) || {};
+    const updated = { ...existing, ...updates, updatedAt: new Date() };
+    this.orderAudits.set(foundKey, updated);
+  }
+
+  async getTraceChain(traceId: string): Promise<any> {
+    const signals = Array.from(this.signals.values()).filter((s: any) => (s.correlationId === traceId || s.traceId === traceId));
+    const decisionEvents = Array.from(this.decisionEvents.values()).filter((d: any) => (d.correlationId === traceId || d.traceId === traceId));
+    const decisionSnapshots = Array.from(this.decisionSnapshots.values()).filter((d: any) => (d.traceId === traceId || d.correlationId === traceId));
+    const orderAudits = Array.from(this.orderAudits.values()).filter((o: any) => (o.traceId === traceId || o.orderId === traceId));
+    const provenances = Array.from(this.provenances.values()).filter((p: any) => (p.correlationId === traceId || p.traceId === traceId));
+
+    // collect referenced marketFrameIds from snapshots/events
+    const frameIds = new Set<string>();
+    for (const d of [...decisionEvents, ...decisionSnapshots]) {
+      if (d.marketFrameId) frameIds.add(d.marketFrameId);
+    }
+    const marketFrames = Array.from(this.marketFrames.values()).filter((f: any) => frameIds.has(f.id));
+
+    return { traceId, signals, decisionEvents, decisionSnapshots, orderAudits, provenances, marketFrames };
+  }
+
 
   // Model metric implementations for MemStorage
   async createModelMetric(metric: InsertModelMetric): Promise<void> {
@@ -282,6 +381,7 @@ export class MemStorage implements IStorage {
       isStale: metric.isStale ?? false,
     } as any;
     this.modelMetrics.set(id, record);
+    // optional trimming not enforced for model metrics
   }
 
   async getLatestModelMetrics(modelName: string, limit = 10): Promise<ModelMetric[]> {
@@ -293,20 +393,49 @@ export class MemStorage implements IStorage {
   async getStaleModelMetrics(): Promise<ModelMetric[]> {
     return Array.from(this.modelMetrics.values()).filter(m => m.isStale === true).sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
   }
+
+  // --- Helper utilities ---
+  private enforceSizeLimit<T>(map: Map<string, T>, maxSize: number, timeExtractor?: (v: T) => number) {
+    if (map.size <= maxSize) return;
+    // Remove oldest 1k entries or until under limit
+    const removeCount = Math.max(1000, Math.floor(maxSize * 0.02));
+    const entries = Array.from(map.entries());
+    if (timeExtractor) {
+      entries.sort((a, b) => (timeExtractor(a[1]) - timeExtractor(b[1])));
+    }
+    for (let i = 0; i < Math.min(removeCount, entries.length); i++) {
+      map.delete(entries[i][0]);
+    }
+  }
+
+  private query<T>(map: Map<string, T>, filterFn?: (item: T) => boolean, limit: number | undefined = 50, sortFn?: (a: T, b: T) => number): T[] {
+    let items = Array.from(map.values()) as T[];
+    if (filterFn) items = items.filter(filterFn);
+    if (sortFn) items = items.sort(sortFn);
+    return limit ? items.slice(0, limit) : items;
+  }
+
+  // Delete old market frames by age (days)
+  async deleteOldMarketFrames(days: number): Promise<void> {
+    const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+    for (const [id, f] of this.marketFrames.entries()) {
+      const ts = new Date((f as any).timestamp).getTime();
+      if (ts < cutoff) this.marketFrames.delete(id);
+    }
+  }
+
 }
 
-import { DbStorage } from './db-storage';
-
-// Initialize with fallback support
-// The DbStorage class now has built-in fallback to MemStorage when database is unavailable
-let storageInstance: IStorage;
-
-try {
-  storageInstance = new DbStorage();
-  console.log('[Storage] Initialized with database backend');
-} catch (error: any) {
-  console.warn('[Storage] Database initialization failed, using in-memory storage:', (error as any).message);
-  storageInstance = new MemStorage();
+// Factory with configurable fallback
+export function createStorage(): IStorage {
+  try {
+    const db = new DbStorage();
+    console.log('[Storage] Initialized with database backend');
+    return db;
+  } catch (error: any) {
+    console.warn('[Storage] Database initialization failed, using in-memory storage:', (error as any).message);
+    return new MemStorage();
+  }
 }
 
-export const storage = storageInstance;
+export const storage = createStorage();

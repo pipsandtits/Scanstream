@@ -1,5 +1,5 @@
 import React, { useState, useMemo } from 'react';
-import { useLocation } from 'wouter';
+import { useNavigate } from 'react-router-dom';
 import {
   ArrowLeft, Zap, Activity, Filter, Trash2, Calendar,
   TrendingUp, Trophy, AlertCircle, Users, Clock
@@ -10,7 +10,7 @@ import { cn } from '@/lib/utils';
 type EventTypeFilter = 'all' | 'xp_gain' | 'level_up' | 'mood_change' | 'trade_result' | 'combo_activation' | 'achievement_unlocked';
 
 const RealtimeUpdatesPage: React.FC = () => {
-  const [, navigate] = useLocation();
+  const navigate = useNavigate();
   const { events, isConnected, clearEvent, clearAll } = useRealtime();
   const [filterType, setFilterType] = useState<EventTypeFilter>('all');
   const [filterAgent, setFilterAgent] = useState('');

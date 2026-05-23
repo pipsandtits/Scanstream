@@ -43,6 +43,8 @@ export interface OHLCV {
  * 4. Calculate follow-through (momentum continuation)
  * 5. Combine into final cluster strength metric
  */
+import { ClusterValidator } from './cluster-validator';
+
 export class ClusteringCalculator {
   /**
    * Calculate all clustering metrics from OHLCV candle history
@@ -50,37 +52,62 @@ export class ClusteringCalculator {
    * @param candles Array of OHLCV data points (minimum 10 required)
    * @returns ClusterMetrics with all clustering indicators
    */
-  static calculateMetrics(candles: OHLCV[]): ClusterMetrics {
+  static calculateMetrics(
+    candles: OHLCV[],
+    options?: { maxDrawdownRisk?: number; barsSinceSignal?: number; minClusterSize?: number }
+  ): ClusterMetrics {
     if (!candles || candles.length < 10) {
       return this.getDefaultMetrics(); // Insufficient data
     }
 
-    // Analyze candle directions
-    const directions = this.analyzeCandles(candles);
+    // Convert to minimal Candle shape expected by ClusterValidator helper
+    const minimalCandles = candles.map(c => ({
+      ts: c.timestamp,
+      open: c.open,
+      high: c.high,
+      low: c.low,
+      close: c.close,
+      volume: c.volume,
+      isFinal: true
+    } as any));
 
-    // Count clusters (groups of same direction)
-    const clusterInfo = this.countClusters(directions);
+    const minClusterSize = options?.minClusterSize ?? 2;
 
-    // Calculate directional ratio (% in dominant direction)
-    const directional_ratio = this.calculateDirectionalRatio(directions);
+    // Use improved cluster metrics helper (adds avg/max sizes, volatility, neutral ratio)
+    const baseMetrics = ClusterValidator.computeClusterMetricsFromCandles(minimalCandles, minClusterSize);
 
-    // Calculate follow-through (momentum continuation)
+    // compute follow-through using existing method (more specific to OHLCV structure)
     const follow_through = this.calculateFollowThrough(candles);
 
-    // Combined cluster strength
-    const cluster_strength = directional_ratio * follow_through;
+    // Start from base cluster strength but combine with follow-through
+    let cluster_strength = (baseMetrics.cluster_strength + follow_through) / 2;
 
-    // Detect trend formation
-    const trend_formation_signal = this.isTrendForming(clusterInfo, directional_ratio, follow_through);
+    // Apply volatility damping (reduce strength when volatility high)
+    const vol = baseMetrics.volatility ?? 0;
+    cluster_strength = cluster_strength * (1 - Math.min(1, vol) * 0.5);
+
+    // Apply decay based on how many bars since the original signal and drawdown risk
+    const barsSince = options?.barsSinceSignal ?? 0;
+    const barsDecay = Math.max(0.2, Math.exp(-barsSince / 50));
+    const drawdownRisk = options?.maxDrawdownRisk ?? 0; // 0-1
+    const drawdownFactor = 1 - Math.min(0.9, drawdownRisk * 0.6);
+
+    cluster_strength = Math.max(0, Math.min(1, cluster_strength * barsDecay * drawdownFactor));
+
+    // Directional ratio - prefer base metric's directional measurement
+    const directional_ratio = Math.min(Math.max(baseMetrics.directional_ratio, 0), 1);
+
+    // Trend formation: reuse base helper and follow-through criteria
+    const trend_formation_signal = baseMetrics.trend_formation_signal && follow_through >= 0.25;
 
     return {
       trend_formation_signal,
-      cluster_strength: Math.min(Math.max(cluster_strength, 0), 1), // Clamp 0-1
-      directional_ratio: Math.min(Math.max(directional_ratio, 0), 1),
+      cluster_strength: Math.min(Math.max(cluster_strength, 0), 1),
+      directional_ratio,
       follow_through: Math.min(Math.max(follow_through, 0), 1),
-      total_clusters: clusterInfo.total,
-      bullish_clusters: clusterInfo.bullish,
-      bearish_clusters: clusterInfo.bearish
+      total_clusters: baseMetrics.total_clusters,
+      bullish_clusters: baseMetrics.bullish_clusters,
+      bearish_clusters: baseMetrics.bearish_clusters
     };
   }
 
@@ -291,7 +318,7 @@ export function createClusteringCalculator(): typeof ClusteringCalculator {
 /**
  * Quick helper: Calculate metrics without instantiation
  */
-export function calculateClusterMetrics(ccxtCandles: number[][]): ClusterMetrics {
+export function calculateClusterMetrics(ccxtCandles: number[][], options?: { maxDrawdownRisk?: number; barsSinceSignal?: number; minClusterSize?: number }): ClusterMetrics {
   if (!ccxtCandles || ccxtCandles.length < 10) {
     return {
       trend_formation_signal: false,
@@ -305,5 +332,5 @@ export function calculateClusterMetrics(ccxtCandles: number[][]): ClusterMetrics
   }
 
   const ohlcvCandles = ClusteringCalculator.convertFromCCXTFormat(ccxtCandles);
-  return ClusteringCalculator.calculateMetrics(ohlcvCandles);
+  return ClusteringCalculator.calculateMetrics(ohlcvCandles, options);
 }

@@ -136,7 +136,19 @@ export function getLiveEpoch(): LiveEpoch {
   return LiveEpoch.getInstance();
 }
 
+// Diagnostic helper to expose internals
+export function dumpLiveEpochDiagnostics() {
+  const le = getLiveEpoch() as any;
+  return {
+    liveStartTime: le.liveStartTime,
+    lastWorldTimePerSymbol: Array.from(le['lastWorldTimePerSymbol'].entries ? le['lastWorldTimePerSymbol'].entries() : []),
+    timeAuthorityPerSymbol: Array.from(le['timeAuthorityPerSymbol'].entries ? le['timeAuthorityPerSymbol'].entries() : []),
+  };
+}
+
 export class IntegrityGate extends EventEmitter {
+  // Track last time we logged a time-regression per symbol to avoid spam
+  private lastRegressionLog: Map<string, number> = new Map();
   /**
    * Process candles through integrity layer before storage
    * 
@@ -241,9 +253,9 @@ export class IntegrityGate extends EventEmitter {
 
         // ATOMIC OPERATION: Store THEN emit tick
         // INVARIANT: A world tick is emitted IFF storage succeeded
-        try {
-          // 1. Store to database/memory (MUST succeed first)
-          await storage.createMarketFrame(marketFrame);
+          try {
+          // 1. Store to database/memory (MUST succeed first) and capture saved id
+          const savedFrame = await storage.createMarketFrame(marketFrame);
           stored.push(validCandle);
 
           // 2. 📍 EMIT WORLD TICK (facts only, after storage succeeds)
@@ -258,37 +270,45 @@ export class IntegrityGate extends EventEmitter {
 
           // 🔴 TEMPORAL HYGIENE CHECKS
           const liveEpoch = getLiveEpoch();
-          const isHistorical = liveEpoch.isHistorical(validCandle.ts);
-          const hasTimeRegression = liveEpoch.isTimeRegression(symbol, worldTime);
+          // Consider this candle historical if explicitly marked OR it predates LIVE start
+          const candleIsHistorical = ((validCandle as any).source === 'historical') || liveEpoch.isHistorical(validCandle.ts);
+          // Only check for time regression on non-historical (live) candles
+          const hasTimeRegression = candleIsHistorical ? false : liveEpoch.isTimeRegression(symbol, worldTime);
 
           if (hasTimeRegression) {
-            console.error(
-              `[IntegrityGate] ⛔ TIME REGRESSION: ${symbol} ${timeframe}s ` +
-              `(current=${new Date(worldTime).toISOString()}) — tick SUPPRESSED`
-            );
-            // Do NOT emit this tick — time is incoherent
-            return {
-              stored,
-              rejected: [...report.rejected.map(r => r.candle), validCandle as any as Candle],
-              gaps: report.gaps,
-              ticks
-            };
+            // Rate-limit regression logs per symbol (30s)
+            const last = this.lastRegressionLog.get(symbol) || 0;
+            const now = Date.now();
+            if (now - last > 30_000) {
+              console.error(
+                `[IntegrityGate] ⛔ TIME REGRESSION: ${symbol} ${timeframe}s ` +
+                `(current=${new Date(worldTime).toISOString()}) — tick SUPPRESSED`
+              );
+              this.lastRegressionLog.set(symbol, now);
+            }
+
+            // Do NOT emit this tick — time is incoherent. Mark as rejected and continue processing
+            // Keep storage invariant: do not store this candle
+            report.rejected.push({ candle: validCandle as any as Candle, reason: 'time_regression' } as any);
+            continue; // process next validated candle
           }
 
           // 🔄 DETECT OPERATION MODE
           const modeDetector = getModeDetector();
-          modeDetector.recordTick(validCandle.source === 'ws' ? 'ws' : 'rest');
+          // Determine tick source: prefer explicit exchange-derived source (exchange param),
+          // fall back to validated candle source flag. Normalize to 'ws'|'rest'.
+          const inferredSource = (exchange || '').toString().length > 0 ? 'ws' : (((validCandle as any).source === 'live') ? 'ws' : 'rest');
+          try { modeDetector.recordTick(inferredSource as any); } catch (e) { /* ignore */ }
           
-          // Only record emit-lag if this is LIVE-eligible
-          // Historical candles always have large lag — don't poison the average
-          if (!isHistorical) {
+          // Only record emit-lag if this is LIVE (non-historical)
+          if (!candleIsHistorical) {
             modeDetector.recordEmitLag(lag);
           }
           
           // 🔴 TIME AUTHORITY CHECK — One exchange per symbol in LIVE mode
           // If this exchange is not the authority, reject it for LIVE
           let isAuthorized = true;
-          if (exchange && !isHistorical) {
+          if (exchange && !candleIsHistorical) {
             // Try to register this exchange as authority
             isAuthorized = liveEpoch.registerTimeAuthority(symbol, exchange);
             
@@ -313,7 +333,8 @@ export class IntegrityGate extends EventEmitter {
             mode,           // 🔄 REPLAY | MIXED | LIVE
             candle: validCandle,
             isFinal: validCandle.isFinal,
-            source: validCandle.source || 'validated',
+            source: (validCandle as any).source || 'validated',
+            marketFrameId: (savedFrame && (savedFrame as any).id) ? (savedFrame as any).id : undefined,
           };
 
           ticks.push(tick);

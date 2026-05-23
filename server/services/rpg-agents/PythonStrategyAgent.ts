@@ -12,6 +12,7 @@
 
 import { TradingAgent } from './TradingAgent';
 import { spawn } from 'child_process';
+import { formatError } from '../../utils/logger';
 
 export interface PythonStrategyTrait {
   strategy_name: string;
@@ -61,7 +62,8 @@ export class PythonStrategyAgent extends TradingAgent {
         python_metadata: pythonResult
       };
     } catch (error) {
-      console.error(`[${this.name}] Python strategy error:`, error);
+      const fe = formatError(error);
+      console.error(`[${this.name}] Python strategy error: ${fe.message}`, { stack: fe.stack });
       return null;
     }
   }

@@ -32,6 +32,8 @@ try {
   console.warn('[LSTM Trainer] CCXT scanner not available');
 }
 
+import { priceCache } from '../../src/core/PriceCache';
+
 try {
   yfinance = require('yfinance');
 } catch (e) {
@@ -693,7 +695,25 @@ export class EnhancedLSTMTrainer {
       const exchange = DEFAULT_CONFIG.exchange || 'binance';
       console.log(`[LSTM Trainer] CCXT: Fetching from ${exchange}...`);
       
-      // Call CCXT scanner to fetch data
+      // Prefer priceCache first to avoid extra CCXT loads
+      try {
+        const cached = priceCache.getCandles(symbol, '1h');
+        if (cached && cached.length > 0) {
+          console.log(`[LSTM Trainer] Using priceCache for ${symbol} (1h) - ${cached.length} frames`);
+          return cached.slice(-lookbackDays * 24);
+        }
+        // Attempt to refresh cache then read again
+        await priceCache.refreshCandles(symbol, '1h', lookbackDays * 24);
+        const refreshed = priceCache.getCandles(symbol, '1h');
+        if (refreshed && refreshed.length > 0) {
+          console.log(`[LSTM Trainer] Refreshed priceCache for ${symbol} (1h) - ${refreshed.length} frames`);
+          return refreshed.slice(-lookbackDays * 24);
+        }
+      } catch (pcErr) {
+        console.debug('[LSTM Trainer] priceCache attempt failed:', (pcErr as any)?.message || pcErr);
+      }
+
+      // Fallback to CCXT scanner
       const frames = await ccxtScanner.fetchOHLCV(symbol, '1h', lookbackDays * 24, { exchange });
       if (!frames || frames.length === 0) {
         throw new Error(`No CCXT data for ${symbol} on ${exchange}`);

@@ -29,6 +29,10 @@ export interface HoldingPeriodData {
   volatilityLabel: 'LOW' | 'MEDIUM' | 'HIGH';
   trendDirection: 'BULLISH' | 'BEARISH' | 'SIDEWAYS';
   recentMicrostructureSignals?: string[];
+  // Optional clustering inputs
+  clusterStrength?: number; // 0-1, higher means stronger clustered moves
+  trendFormation?: boolean; // whether a trend-forming cluster was detected
+  avgClusterSize?: number;
 }
 
 export interface HoldingDecision {
@@ -131,6 +135,22 @@ export class AdaptiveHoldingPeriod {
         action = 'EXIT';
       }
     }
+
+    // PHASE 3.5: Cluster-aware adjustments
+    // If clustering indicates strong trend formation, extend holding (unless volatility is high)
+    try {
+      const cs = (currentData as any).clusterStrength;
+      const tf = (currentData as any).trendFormation;
+      if (typeof cs === 'number') {
+        if (cs >= 0.7 && tf && currentData.volatilityLabel !== 'HIGH') {
+          holdingPeriodDays = Math.ceil(holdingPeriodDays * 1.25);
+          reasonsToHold.push(`Cluster strength high (${Math.round(cs * 100)}%) - extending hold`);
+        } else if (cs < 0.3) {
+          holdingPeriodDays = Math.max(1, Math.ceil(holdingPeriodDays * 0.7));
+          reasonsToExit.push(`Weak cluster strength (${Math.round(cs * 100)}%) - consider tighter exit`);
+        }
+      }
+    } catch (e) {}
 
     // PHASE 4: Check momentum quality
     const momentumAnalysis = this.analyzeMomentumQuality(

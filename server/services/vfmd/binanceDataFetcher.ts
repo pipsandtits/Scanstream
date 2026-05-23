@@ -13,7 +13,7 @@
  */
 
 import axios from 'axios';
-import { MarketTick } from './types.ts';
+import { MarketTick } from './types';
 import * as fs from 'fs';
 import * as path from 'path';
 

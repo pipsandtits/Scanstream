@@ -1,6 +1,6 @@
 import type { MarketFrame } from './continuous-scanner';
 import * as indicators from './indicators';
-import { vwap, volumeProfile, fibLevels } from './indicators';
+import TechnicalIndicators from './technical-indicators';
 import SignalClassifier from './signal-classifier';
 import { SignalClassifier as LibSignalClassifier } from '../../lib/signal-classifier';
 import RiskManagement from './risk-management';
@@ -8,6 +8,29 @@ import MarketRegimeDetector from './market-regime-detector';
 import { getRegimeService } from '../regime-service';
 import type { RegimeContext as ArmRegimeContext } from '../../arm-evaluator';
 import { QualityGating } from './quality-gating';
+
+export interface MomentumScoreIndicators {
+  macdHistLast: number;
+  macdHistPrev: number;
+  macdMomentum: number;
+  rsiLast: number;
+  slope: number;
+  momentum1d: number;
+  momentum7d: number;
+  momentum30d: number;
+  volRatio: number;
+  meanPrice: number;
+  vwapLast: number;
+  vwapGap: number;
+  bbPosition: number;
+  bbUpper: number;
+  bbLower: number;
+  trendStrength: number;
+  volatility: number;
+  atrPct?: number;
+  compositeScore: number;
+  fib?: any;
+}
 
 export interface MomentumScoreResult {
   score: number; // -1 .. +1
@@ -17,7 +40,7 @@ export interface MomentumScoreResult {
   reason?: string;
   regime?: string;
   regimeConfidence?: number;
-  indicators?: Record<string, any>;
+  indicators?: MomentumScoreIndicators;
   
   // === QUALITY GATING ===
   passesQualityGate?: boolean; // true if signal meets quality threshold
@@ -37,74 +60,44 @@ export interface MomentumScoreResult {
 export class MomentumScanner {
   static computeScore(frames: MarketFrame[]): MomentumScoreResult {
     if (!frames || frames.length < 5) {
-      return {
-        score: 0,
-        signal: 'Neutral',
-        signalStrength: 0,
-        confidence: 0,
-        reason: 'INSUFFICIENT_DATA',
-        indicators: {}
-      };
+      return this.getDefaultScoreResult('INSUFFICIENT_DATA');
     }
 
-    const closes = frames.map(f => f.price.close);
-    const volumes = frames.map(f => f.volume ?? 0);
-    const highs = frames.map(f => f.price.high);
-    const lows = frames.map(f => f.price.low);
-
-    // === INDICATOR CALCULATION ===
-
-    // --- MACD ---
-    const { macd: macdLine, signal: signalLine, histogram } = indicators.macd(closes);
+    const { closes, highs, lows, volumes } = TechnicalIndicators.frameArrays(frames);
     const lastIdx = closes.length - 1;
+
+    // === INDICATOR CALCULATION via TechnicalIndicators ===
+    const { histogram } = TechnicalIndicators.macd(closes);
     const macdHistLast = Number.isNaN(histogram[lastIdx]) ? 0 : histogram[lastIdx];
     const macdHistPrev = lastIdx - 1 >= 0 && !Number.isNaN(histogram[lastIdx - 1]) ? histogram[lastIdx - 1] : 0;
     const macdMomentum = macdHistLast - macdHistPrev;
 
-    // --- RSI ---
-    const rsiArr = indicators.rsi(closes);
+    const rsiArr = TechnicalIndicators.rsi(closes);
     const rsiLast = Number.isNaN(rsiArr[lastIdx]) ? 50 : rsiArr[lastIdx];
 
-    // --- Slope ---
-    const slopeVal = indicators.slope(closes, Math.min(10, closes.length));
+    const slopeVal = TechnicalIndicators.slope(closes, Math.min(10, closes.length));
 
-    // --- Volume Metrics ---
     const meanPrice = closes.reduce((a, b) => a + b, 0) / closes.length;
-    const avgVol = volumes.slice(-20).reduce((s, v) => s + v, 0) / Math.min(20, volumes.length || 1);
-    const volLast = volumes[volumes.length - 1] ?? 0;
     const volRatio = RiskManagement.calculateVolumeRatio(volumes, 20);
 
-    // --- Momentum Periods ---
     const momentum1d = closes.length >= 1 ? (closes[lastIdx] - closes[Math.max(0, lastIdx - 1)]) / closes[Math.max(0, lastIdx - 1)] : 0;
-    const momentum7d = closes.length >= 7
-      ? (closes[lastIdx] - closes[Math.max(0, lastIdx - 7)]) / closes[Math.max(0, lastIdx - 7)]
-      : momentum1d;
-    const momentum30d = closes.length >= 30
-      ? (closes[lastIdx] - closes[Math.max(0, lastIdx - 30)]) / closes[Math.max(0, lastIdx - 30)]
-      : momentum7d;
+    const momentum7d = closes.length >= 7 ? (closes[lastIdx] - closes[Math.max(0, lastIdx - 7)]) / closes[Math.max(0, lastIdx - 7)] : momentum1d;
+    const momentum30d = closes.length >= 30 ? (closes[lastIdx] - closes[Math.max(0, lastIdx - 30)]) / closes[Math.max(0, lastIdx - 30)] : momentum7d;
 
-    // --- Bollinger Bands Position ---
-    const bbResult = indicators.bollingerBands(closes, 20, 2);
+    const bbResult = TechnicalIndicators.bollingerBands(closes, 20, 2);
     const bbUpper = bbResult?.upper?.[lastIdx] ?? meanPrice * 1.02;
     const bbLower = bbResult?.lower?.[lastIdx] ?? meanPrice * 0.98;
     const bbPosition = RiskManagement.calculateBBPosition(closes[lastIdx], bbUpper, bbLower);
 
-    // --- VWAP & Volume Profile ---
-    const vwapArr = vwap(closes, volumes, 20);
+    const vwapArr = TechnicalIndicators.vwap(closes, volumes, 20);
     const vwapLast = Number.isNaN(vwapArr[lastIdx]) ? meanPrice : vwapArr[lastIdx];
     const vwapGap = (closes[lastIdx] - vwapLast) / vwapLast;
 
-    // --- Fibonacci Levels ---
-    const fib = fibLevels(highs, lows, closes, Math.min(55, closes.length));
+    const fib = TechnicalIndicators.fibLevels(highs, lows, closes, Math.min(55, closes.length));
 
-    // === MARKET REGIME DETECTION ===
     const regimeResult = MarketRegimeDetector.detectRegime(closes, highs, lows, volumes);
 
-    // === SIGNAL CLASSIFICATION ===
-    // Best-effort: request central RegimeService and pass external regime to classifier
-    let armRegime: ArmRegimeContext | undefined;
-    // Note: Regime service is async and can't be used in sync context - skipped for now
-    
+    // Signal classification (sync) — allow external regime availability in future
     const signalResult = SignalClassifier.classifyMomentumSignal(
       momentum1d,
       momentum7d,
@@ -119,7 +112,6 @@ export class MomentumScanner {
       { ichimokuBullish: true }
     );
 
-    // === STATE CLASSIFICATION ===
     const stateResult = SignalClassifier.classifyState(
       momentum1d,
       momentum7d,
@@ -130,7 +122,6 @@ export class MomentumScanner {
       volRatio
     );
 
-    // === SIGNAL STRENGTH & CONFIDENCE ===
     const signalStrength = SignalClassifier.calculateSignalStrength(
       momentum1d,
       momentum7d,
@@ -148,7 +139,6 @@ export class MomentumScanner {
       volRatio
     );
 
-    // === COMPOSITE SCORE ===
     const compositeScore = SignalClassifier.calculateCompositeScore(
       momentum1d,
       momentum7d,
@@ -156,12 +146,11 @@ export class MomentumScanner {
       macdHistLast,
       regimeResult.trendStrength,
       volRatio,
-      true, // ichimokuBullish
-      0 // fibConfluence
+      true,
+      0
     );
 
-    // === CONVERT TO -1..1 SCORE ===
-    const score = (compositeScore / 100 - 0.5) * 2; // Convert 0-100 to -1..1
+    const score = (compositeScore / 100 - 0.5) * 2;
 
     const reasonParts: string[] = [];
     reasonParts.push(`signal:${signalResult.signal}`);
@@ -171,8 +160,18 @@ export class MomentumScanner {
     reasonParts.push(`rsi:${rsiLast.toFixed(1)}`);
     reasonParts.push(`volRatio:${volRatio.toFixed(2)}`);
 
-    // === QUALITY GATING ===
     const gateResult = QualityGating.passesQualityGate(confidence, signalStrength, (frames[0] as any)?.symbol || 'DEFAULT');
+
+    // Normalize regime volatility to numeric for indicators
+    const volNumeric = (() => {
+      const v: any = regimeResult.volatility;
+      if (typeof v === 'number') return v;
+      if (v === 'extreme') return 4;
+      if (v === 'high') return 3;
+      if (v === 'medium') return 2;
+      if (v === 'low') return 1;
+      return 0;
+    })();
 
     return {
       score,
@@ -201,7 +200,7 @@ export class MomentumScanner {
         bbUpper,
         bbLower,
         trendStrength: regimeResult.trendStrength,
-        volatility: regimeResult.volatility,
+        volatility: volNumeric,
         atrPct: regimeResult.atrPct,
         compositeScore,
         fib: {
@@ -209,8 +208,41 @@ export class MomentumScanner {
           retracements: (fib?.retracements?.length ?? 0) > 0 ? fib!.retracements![Math.floor(fib!.retracements!.length / 2)].price : meanPrice,
           extensions: (fib?.extensions?.length ?? 0) > 0 ? fib!.extensions![0].price : meanPrice * 1.618
         }
-      }
+      } as MomentumScoreIndicators
     };
+  }
+
+  static getDefaultScoreResult(reason = 'INSUFFICIENT_DATA'): MomentumScoreResult {
+    return {
+      score: 0,
+      signal: 'Neutral',
+      signalStrength: 0,
+      confidence: 0,
+      reason,
+      indicators: {} as any
+    } as unknown as MomentumScoreResult;
+  }
+
+  /**
+   * Async variant that may consult an external RegimeService for enriched regime context.
+   */
+  static async computeScoreAsync(frames: MarketFrame[], symbol?: string): Promise<MomentumScoreResult> {
+    if (!frames || frames.length < 5) return this.getDefaultScoreResult('INSUFFICIENT_DATA');
+    // Try to fetch regime context (best-effort)
+    try {
+      const regimeSvc = getRegimeService();
+      if (regimeSvc && typeof regimeSvc.computeRegime === 'function') {
+        const tfMinutes = 60; // default; callers can extend to pass timeframe
+        const svcCtx = await regimeSvc.computeRegime(symbol || (frames[0] as any)?.symbol || 'UNKNOWN', tfMinutes as any);
+        if (svcCtx) {
+          // currently we do not deeply merge svcCtx into SignalClassifier calls, but availability is useful
+        }
+      }
+    } catch (e) {
+      // non-fatal
+    }
+    // Fall back to sync computeScore for core logic
+    return this.computeScore(frames);
   }
 
   /**

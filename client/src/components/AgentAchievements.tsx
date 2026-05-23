@@ -30,17 +30,21 @@ export default function AgentAchievements({ agentName }: AgentAchievementsProps)
   const [progress, setProgress] = useState(0);
 
   useEffect(() => {
-    fetchAchievements();
+    const controller = new AbortController();
+    _fetchAchievements(controller.signal);
+    return () => controller.abort();
   }, [agentName]);
 
-  const fetchAchievements = async () => {
+  const _fetchAchievements = async (signal?: AbortSignal) => {
     try {
-      const res = await fetch(`/api/rpg-agents/${agentName}/achievements`);
+      const res = await fetch(`/api/rpg-agents/${agentName}/achievements`, { signal });
+      if (!res.ok) throw new Error('Failed to fetch achievements');
       const data = await res.json();
       setUnlocked(data.unlocked || []);
       setLocked(data.locked || []);
       setProgress(data.progress || 0);
-    } catch (error) {
+    } catch (error: any) {
+      if (error && error.name === 'AbortError') return;
       console.error('Failed to fetch achievements:', error);
     }
   };

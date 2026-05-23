@@ -2,8 +2,9 @@ import { useState } from 'react';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, AreaChart, Area } from 'recharts';
+import AreaChartCore from './charts/AreaChartCore';
 import { Play, Download, Settings, TrendingUp, BarChart3, Zap, ArrowUpRight, ArrowDownLeft } from 'lucide-react';
+// Removed unused Recharts imports
 
 interface BacktestResult {
   symbol: string;
@@ -273,34 +274,16 @@ export default function BacktestIntegration({
             </CardHeader>
             <CardContent>
               {latestResult.equityCurve.length > 0 ? (
-                <ResponsiveContainer width="100%" height={400}>
-                  <AreaChart data={latestResult.equityCurve}>
-                    <defs>
-                      <linearGradient id="colorEquity" x1="0" y1="0" x2="0" y2="1">
-                        <stop offset="5%" stopColor="#3b82f6" stopOpacity={0.8} />
-                        <stop offset="95%" stopColor="#3b82f6" stopOpacity={0} />
-                      </linearGradient>
-                    </defs>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-                    <XAxis
-                      dataKey="time"
-                      stroke="#94a3b8"
-                      tickFormatter={(time) => new Date(time).toLocaleDateString()}
-                    />
-                    <YAxis stroke="#94a3b8" />
-                    <Tooltip
-                      contentStyle={{ backgroundColor: '#1e293b', border: '1px solid #475569' }}
-                      formatter={(value: any) => `$${typeof value === 'number' ? value.toFixed(2) : value}`}
-                    />
-                    <Area
-                      type="monotone"
-                      dataKey="equity"
-                      stroke="#3b82f6"
-                      fillOpacity={1}
-                      fill="url(#colorEquity)"
-                    />
-                  </AreaChart>
-                </ResponsiveContainer>
+                <AreaChartCore
+                  data={latestResult.equityCurve}
+                  dataKey="equity"
+                  height={400}
+                  gradientId="colorEquity"
+                  stroke="#3b82f6"
+                  fill="#3b82f6"
+                  xFormatter={(time: any) => new Date(time).toLocaleDateString()}
+                  yFormatter={(v: any) => `$${v.toFixed(2)}`}
+                />
               ) : (
                 <div className="h-64 flex items-center justify-center text-slate-400">
                   Loading equity curve...

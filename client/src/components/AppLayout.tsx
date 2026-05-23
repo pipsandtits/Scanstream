@@ -1,5 +1,5 @@
 import { useState, useMemo, useEffect } from 'react';
-import { Link, useLocation } from 'wouter';
+import { Link, useLocation } from 'react-router-dom';
 import { useTheme } from '../contexts/ThemeContext';
 import ThemeSelector from './ThemeSelector';
 import {
@@ -36,7 +36,7 @@ interface AppLayoutProps {
 }
 
 export default function AppLayout({ children }: AppLayoutProps) {
-  const [location] = useLocation();
+  const location = useLocation();
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const { preset, setPreset, colors } = useTheme();
   const { user } = useAuth();
@@ -165,9 +165,9 @@ export default function AppLayout({ children }: AppLayoutProps) {
               <div className="space-y-1">
                 {mainItems.map((item) => {
                   const Icon = item.icon;
-                  const isActive = location === item.path;
+                  const isActive = location.pathname === item.path;
                   return (
-                    <Link key={item.path} href={item.path}>
+                    <Link key={item.path} to={item.path}>
                       <span
                         className={`flex items-center space-x-3 rounded-lg px-3 py-2.5 transition-all cursor-pointer ${!isSidebarOpen && 'justify-center'}`}
                         style={{
@@ -213,9 +213,9 @@ export default function AppLayout({ children }: AppLayoutProps) {
               <div className="space-y-1">
                 {tradingItems.map((item) => {
                   const Icon = item.icon;
-                  const isActive = location === item.path;
+                  const isActive = location.pathname === item.path;
                   return (
-                    <Link key={item.path} href={item.path}>
+                    <Link key={item.path} to={item.path}>
                       <span
                         className={`flex items-center space-x-3 rounded-lg px-3 py-2.5 transition-all cursor-pointer ${!isSidebarOpen && 'justify-center'}`}
                         style={{
@@ -243,9 +243,9 @@ export default function AppLayout({ children }: AppLayoutProps) {
               <div className="space-y-1">
                 {advancedItems.map((item) => {
                   const Icon = item.icon;
-                  const isActive = location === item.path;
+                  const isActive = location.pathname === item.path;
                   return (
-                    <Link key={item.path} href={item.path}>
+                    <Link key={item.path} to={item.path}>
                       <span
                         className={`flex items-center space-x-3 rounded-lg px-3 py-2.5 transition-all cursor-pointer ${!isSidebarOpen && 'justify-center'}`}
                         style={{
@@ -267,12 +267,12 @@ export default function AppLayout({ children }: AppLayoutProps) {
                   </h3>
                 )}
                 <div className="space-y-1">
-                  <Link href="/flow-engine">
+                  <Link to="/flow-engine">
                     <span
                       className={`flex items-center space-x-3 rounded-lg px-3 py-2.5 transition-all cursor-pointer ${!isSidebarOpen && 'justify-center'}`}
                       style={{
-                        backgroundColor: location === '/flow-engine' ? colors.accent : 'transparent',
-                        color: location === '/flow-engine' ? colors.background : colors.textSecondary,
+                        backgroundColor: location.pathname === '/flow-engine' ? colors.accent : 'transparent',
+                        color: location.pathname === '/flow-engine' ? colors.background : colors.textSecondary,
                       }}
                       title={!isSidebarOpen ? 'Flow Engine' : undefined}
                     >
@@ -295,9 +295,9 @@ export default function AppLayout({ children }: AppLayoutProps) {
                 <div className="space-y-1">
                   {analysisItems.map((item) => {
                     const Icon = item.icon;
-                    const isActive = location === item.path;
+                    const isActive = location.pathname === item.path;
                     return (
-                      <Link key={item.path} href={item.path}>
+                      <Link key={item.path} to={item.path}>
                         <span
                           className={`flex items-center space-x-3 rounded-lg px-3 py-2.5 transition-all cursor-pointer ${!isSidebarOpen && 'justify-center'}`}
                           style={{
@@ -327,9 +327,9 @@ export default function AppLayout({ children }: AppLayoutProps) {
                 <div className="space-y-1">
                   {portfolioItems.map((item) => {
                     const Icon = item.icon;
-                    const isActive = location === item.path;
+                    const isActive = location.pathname === item.path;
                     return (
-                      <Link key={item.path} href={item.path}>
+                      <Link key={item.path} to={item.path}>
                         <span
                           className={`flex items-center space-x-3 rounded-lg px-3 py-2.5 transition-all cursor-pointer ${!isSidebarOpen && 'justify-center'}`}
                           style={{
@@ -359,9 +359,9 @@ export default function AppLayout({ children }: AppLayoutProps) {
                 <div className="space-y-1">
                   {toolsItems.map((item) => {
                     const Icon = item.icon;
-                    const isActive = location === item.path;
+                    const isActive = location.pathname === item.path;
                     return (
-                      <Link key={item.path} href={item.path}>
+                      <Link key={item.path} to={item.path}>
                         <span
                           className={`flex items-center space-x-3 rounded-lg px-3 py-2.5 transition-all cursor-pointer ${!isSidebarOpen && 'justify-center'}`}
                           style={{
@@ -391,9 +391,9 @@ export default function AppLayout({ children }: AppLayoutProps) {
                 <div className="space-y-1">
                   {agentsItems.map((item) => {
                     const Icon = item.icon;
-                    const isActive = location === item.path;
+                    const isActive = location.pathname === item.path;
                     return (
-                      <Link key={item.path} href={item.path}>
+                      <Link key={item.path} to={item.path}>
                         <span
                           className={`flex items-center space-x-3 rounded-lg px-3 py-2.5 transition-all cursor-pointer ${!isSidebarOpen && 'justify-center'}`}
                           style={{
@@ -423,9 +423,9 @@ export default function AppLayout({ children }: AppLayoutProps) {
                 <div className="space-y-1">
                   {docsItems.map((item) => {
                     const Icon = item.icon;
-                    const isActive = location === item.path;
+                    const isActive = location.pathname === item.path;
                     return (
-                      <Link key={item.path} href={item.path}>
+                      <Link key={item.path} to={item.path}>
                         <span
                           className={`flex items-center space-x-3 rounded-lg px-3 py-2.5 transition-all cursor-pointer ${!isSidebarOpen && 'justify-center'}`}
                           style={{
@@ -454,9 +454,9 @@ export default function AppLayout({ children }: AppLayoutProps) {
               <div className="space-y-1">
                 {devItems.map((item) => {
                   const Icon = item.icon;
-                  const isActive = location === item.path;
+                  const isActive = location.pathname === item.path;
                   return (
-                    <Link key={item.path} href={item.path}>
+                    <Link key={item.path} to={item.path}>
                       <span
                         className={`flex items-center space-x-3 rounded-lg px-3 py-2.5 transition-all cursor-pointer ${!isSidebarOpen && 'justify-center'}`}
                         style={{
@@ -486,9 +486,9 @@ export default function AppLayout({ children }: AppLayoutProps) {
                 <div className="space-y-1">
                   {adminItems.map((item) => {
                     const Icon = item.icon;
-                    const isActive = location === item.path;
+                    const isActive = location.pathname === item.path;
                     return (
-                      <Link key={item.path} href={item.path}>
+                      <Link key={item.path} to={item.path}>
                         <span
                           className={`flex items-center space-x-3 rounded-lg px-3 py-2.5 transition-all cursor-pointer ${!isSidebarOpen && 'justify-center'}`}
                           style={{
@@ -536,9 +536,9 @@ export default function AppLayout({ children }: AppLayoutProps) {
                 if (!i.featureFlag) return true
                 try { const f = JSON.parse(localStorage.getItem('features')||'{}'); return !!f[i.featureFlag]; } catch (e) { return false }
               }).map((m) => {
-                const isActive = location === m.path
+                const isActive = location.pathname === m.path
                 return (
-                  <Link key={m.path} href={m.path}>
+                  <Link key={m.path} to={m.path}>
                     <span className={`flex items-center space-x-3 rounded-lg px-3 py-2.5 transition-all cursor-pointer ${!isSidebarOpen && 'justify-center'}`} style={{ backgroundColor: isActive ? colors.accent : 'transparent', color: isActive ? colors.background : colors.textSecondary }} title={!isSidebarOpen ? m.name : undefined}>
                       {m.icon ? <m.icon className="h-5 w-5 flex-shrink-0" /> : <Settings className="h-5 w-5" />}
                       {isSidebarOpen && <span className="font-medium">{m.name}</span>}

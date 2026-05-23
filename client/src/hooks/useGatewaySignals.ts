@@ -25,16 +25,25 @@ const SYMBOLS = [
 export function useGatewaySignals() {
   return useQuery({
     queryKey: ['gateway-signals'],
-    queryFn: async () => {
+    queryFn: async ({ signal }: any) => {
       // Fetch all symbols in PARALLEL instead of sequential loop
       // This dramatically reduces total load time
       const promises = SYMBOLS.map(async (symbol) => {
+        // prepare abort controller and timeout so finally block can clean up
+        let timeoutId: any = null;
+        const controller = new AbortController();
+        const onParentAbort = () => {
+          try { if (timeoutId) clearTimeout(timeoutId); } catch {}
+          try { controller.abort(); } catch {}
+        };
         try {
           const encodedSymbol = symbol.replace('/', '%2F');
-          const response = await fetch(
-            `/api/gateway/dataframe/${encodedSymbol}?timeframe=1h&limit=100`,
-            { signal: AbortSignal.timeout(5000) } // 5 second timeout per request
-          );
+          const url = `/api/gateway/dataframe/${encodedSymbol}?timeframe=1h&limit=100`;
+
+          timeoutId = setTimeout(() => controller.abort(), 5000);
+          signal?.addEventListener?.('abort', onParentAbort);
+
+          const response = await fetch(url, { signal: controller.signal });
           
           if (response.ok) {
             const json = await response.json();
@@ -65,6 +74,10 @@ export function useGatewaySignals() {
             console.debug(`Failed to fetch ${symbol}:`, err);
           }
           return null;
+        } finally {
+          // ensure we cleanup timeout and listeners
+          try { clearTimeout(timeoutId); } catch {}
+          try { signal?.removeEventListener?.('abort', onParentAbort); } catch {}
         }
       });
 

@@ -37,6 +37,7 @@ export interface TimeAnchor {
 export class TimeAnchorManager {
   private static instance: TimeAnchorManager;
   private anchors = new Map<string, TimeAnchor>(); // key: symbol:timeframe
+  private probationThreshold = 3; // configurable number of consecutive WS candles required
 
   private constructor() {}
 
@@ -48,22 +49,31 @@ export class TimeAnchorManager {
   }
 
   /**
+   * Configure probation threshold (number of consecutive good WS candles required to promote to LIVE)
+   */
+  setProbationThreshold(n: number): void {
+    this.probationThreshold = Math.max(1, Math.floor(n));
+    console.log(`[TimeAnchor] probationThreshold set to ${this.probationThreshold}`);
+  }
+
+  /**
    * Create or get anchor for symbol+timeframe
    * 🔒 CRITICAL: Once system is in LIVE mode, NEW anchors cannot be created
    * This prevents runtime discovery from resetting symbols back to BACKFILL
    */
-  getOrCreateAnchor(symbol: string, timeframe: number, allowNewCreation = true): TimeAnchor {
+  // By default, do NOT allow runtime discovery once any anchor is LIVE.
+  getOrCreateAnchor(symbol: string, timeframe: number, allowNewCreation = false): TimeAnchor {
     const key = `${symbol}:${timeframe}`;
     
     if (!this.anchors.has(key)) {
       // Check if any anchor is in LIVE mode (system is active)
       const anyLive = Array.from(this.anchors.values()).some(a => a.mode === 'LIVE');
-      
-      // If system is LIVE and we don't have this anchor, reject new creation
+
+      // If system is LIVE and we don't allow new creation, reject
       if (anyLive && !allowNewCreation) {
         throw new Error(
           `[TimeAnchor] ⛔ ${symbol}:${timeframe} cannot be created during LIVE mode ` +
-          `(runtime discovery disabled). Use pre-configured symbols only.`
+            `(runtime discovery disabled). Use pre-configured symbols only.`
         );
       }
 
@@ -109,7 +119,7 @@ export class TimeAnchorManager {
     
     console.log(
       `[TimeAnchor] ${symbol}:${timeframe} transitioned to ARMED ` +
-      `(waiting for 3-5 WS candles with emit-lag < 2s)`
+      `(probation: require ${this.probationThreshold} consecutive WS candles with emit-lag < 2s)`
     );
   }
 
@@ -143,8 +153,8 @@ export class TimeAnchorManager {
     anchor.lastWsEmitLag = emitLag;
     anchor.lastWsTime = worldTime;
 
-    // Promote to LIVE after 3 good candles
-    if (anchor.consecutiveWsCandles >= 3) {
+    // Promote to LIVE after configured probation threshold
+    if (anchor.consecutiveWsCandles >= this.probationThreshold) {
       this.transitionToLive(symbol, timeframe);
     }
   }
@@ -162,13 +172,33 @@ export class TimeAnchorManager {
 
     anchor.mode = 'LIVE';
     anchor.modeChangedAt = Date.now();
-    anchor.liveAnchorTs = anchor.lastWsTime; // Freeze anchor
+    anchor.liveAnchorTs = anchor.lastWsTime || Date.now(); // Freeze anchor (fallback to now)
     
     console.log(
       `[TimeAnchor] ✅ ${symbol}:${timeframe} → LIVE ` +
       `(anchor=${new Date(anchor.liveAnchorTs).toISOString()}, ` +
       `emit-lag=${anchor.lastWsEmitLag}ms)`
     );
+  }
+
+  /**
+   * Force an anchor into LIVE state (manual override - useful for testing)
+   * Use with caution; this bypasses probation checks.
+   */
+  forceLive(symbol: string, timeframe: number, reason?: string): void {
+    const key = `${symbol}:${timeframe}`;
+    let anchor = this.anchors.get(key);
+    if (!anchor) {
+      // Create a permissive anchor for testing convenience
+      anchor = this.getOrCreateAnchor(symbol, timeframe, true);
+      console.log(`[TimeAnchor] Created anchor ${key} as part of forceLive`);
+    }
+
+    anchor.mode = 'LIVE';
+    anchor.modeChangedAt = Date.now();
+    anchor.liveAnchorTs = anchor.lastWsTime || Date.now();
+
+    console.log(`[TimeAnchor] 🔒 FORCE LIVE ${key} (reason=${reason || 'manual'})`);
   }
 
   /**

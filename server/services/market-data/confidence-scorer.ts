@@ -38,17 +38,47 @@ export class ModeAwareConfidenceScorer {
   /**
    * Confidence thresholds by mode
    */
-  private readonly thresholds = {
-    [OperationMode.REPLAY]: 0, // Historical data = no trading
-    [OperationMode.MIXED]: 0.5, // Cap at 50% during backfill
-    [OperationMode.LIVE]: 1.0, // Unlimited in LIVE
+  private thresholds: Record<OperationMode, number>;
+
+  /**
+   * Configuration knobs (runtime adjustable)
+   */
+  private config = {
+    liveMinimumFloor: 0.25, // minimum allowed confidence in LIVE
+    mixedStalenessWindowMs: 60_000, // time delta that fully penalizes in MIXED
+    momentumHistorySize: 5, // number of recent ticks to use for momentum
+    momentumWeight: 0.25, // how strongly momentum affects adjusted confidence
+    sourceWeights: {
+      RL: 1.1,
+      scanner: 1.0,
+      ml: 1.05,
+      default: 1.0,
+    } as Record<string, number>,
   };
 
-  private constructor() {}
+  // per-symbol recent raw confidence history for momentum calculations
+  private recentConfidence: Map<string, number[]> = new Map();
 
-  static getInstance(): ModeAwareConfidenceScorer {
+  // last emit time per symbol for staleness calculations
+  private lastEmitTime: Map<string, number> = new Map();
+
+  constructor(initialThresholds?: Partial<Record<OperationMode, number>>) {
+    // default thresholds
+    this.thresholds = {
+      [OperationMode.REPLAY]: 0,
+      [OperationMode.MIXED]: 0.55,
+      [OperationMode.LIVE]: 1.0,
+    };
+
+    if (initialThresholds) {
+      this.thresholds = { ...this.thresholds, ...initialThresholds } as Record<OperationMode, number>;
+    }
+  }
+
+
+  static getInstance(initialThresholds?: Partial<Record<OperationMode, number>>): ModeAwareConfidenceScorer {
     if (!ModeAwareConfidenceScorer.instance) {
-      ModeAwareConfidenceScorer.instance = new ModeAwareConfidenceScorer();
+      ModeAwareConfidenceScorer.instance = new ModeAwareConfidenceScorer(initialThresholds);
     }
     return ModeAwareConfidenceScorer.instance;
   }
@@ -67,15 +97,69 @@ export class ModeAwareConfidenceScorer {
     signal?: { name?: string; source?: string }
   ): ConfidenceScoreResult {
     const mode = tick.mode;
-    const threshold = this.thresholds[mode];
-    const capped = Math.min(rawConfidence, threshold);
-    const canTrade = capped > 0.3; // Minimum to trade
 
-    const reason = this.getReason(mode, rawConfidence, capped);
+    // update per-symbol history and lastEmitTime
+    try {
+      const key = tick.symbol || 'unknown';
+      const hist = this.recentConfidence.get(key) || [];
+      hist.push(rawConfidence);
+      if (hist.length > this.config.momentumHistorySize) hist.shift();
+      this.recentConfidence.set(key, hist);
+      this.lastEmitTime.set(key, tick.emitTime || Date.now());
+    } catch (e) {
+      // non-fatal
+    }
+
+    // apply source weighting
+    const source = (signal && signal.source) || tick.source || 'default';
+    const sourceWeight = this.config.sourceWeights[source] ?? this.config.sourceWeights.default ?? 1.0;
+    let adjustedRaw = rawConfidence * sourceWeight;
+
+    // Calculate momentum: difference between last value and previous average
+    let momentum = 0;
+    try {
+      const hist = this.recentConfidence.get(tick.symbol) || [];
+      if (hist.length >= 2) {
+        const last = hist[hist.length - 1];
+        const prev = hist.slice(0, -1);
+        const avgPrev = prev.reduce((a, b) => a + b, 0) / Math.max(1, prev.length);
+        momentum = last - avgPrev; // raw difference in [ -1 .. 1 ]
+      }
+    } catch (e) {
+      momentum = 0;
+    }
+
+    // MIXED mode: apply time-since-last-tick penalty
+    if (mode === OperationMode.MIXED) {
+      const last = this.lastEmitTime.get(tick.symbol) || tick.emitTime || Date.now();
+      const delta = Math.max(0, (Date.now() - last));
+      const w = Math.max(0, 1 - Math.min(1, delta / this.config.mixedStalenessWindowMs));
+      adjustedRaw = adjustedRaw * w;
+    }
+
+    // LIVE mode: enforce minimum floor
+    if (mode === OperationMode.LIVE) {
+      adjustedRaw = Math.max(adjustedRaw, this.config.liveMinimumFloor);
+    }
+
+    // Apply momentum effect (small boost/penalty)
+    if (momentum !== 0) {
+      adjustedRaw = adjustedRaw * (1 + this.config.momentumWeight * momentum);
+    }
+
+    // Finally apply threshold caps for non-LIVE modes
+    const threshold = this.thresholds[mode];
+    const capped = mode === OperationMode.LIVE ? adjustedRaw : Math.min(adjustedRaw, threshold);
+
+    // Ensure adjusted is within [0,1]
+    const finalAdjusted = Math.max(0, Math.min(1, capped));
+
+    const canTrade = this.isTradeworthy(finalAdjusted, mode);
+    const reason = this.getDetailedReason(mode, rawConfidence, source, sourceWeight, momentum, finalAdjusted);
 
     return {
       raw: rawConfidence,
-      adjusted: capped,
+      adjusted: finalAdjusted,
       reason,
       mode,
       canTrade,
@@ -88,19 +172,19 @@ export class ModeAwareConfidenceScorer {
   scoreWithCurrentMode(rawConfidence: number, signalName?: string): ConfidenceScoreResult {
     const detector = getModeDetector();
     const mode = detector.detectMode();
-    const threshold = this.thresholds[mode];
-    const capped = Math.min(rawConfidence, threshold);
-    const canTrade = capped > 0.3;
-
-    const reason = this.getReason(mode, rawConfidence, capped);
-
-    return {
-      raw: rawConfidence,
-      adjusted: capped,
-      reason,
+    // Delegate to primary scoring function with a minimal fake tick
+    const fakeTick: WorldTick = {
+      symbol: 'unknown',
+      timeframe: 60,
+      worldTime: Date.now(),
+      emitTime: Date.now(),
       mode,
-      canTrade,
-    };
+      candle: { t: Date.now(), o: 0, h: 0, l: 0, c: 0, v: 0 },
+      isFinal: true,
+      source: 'default'
+    } as any;
+
+    return this.score(rawConfidence, fakeTick, { name: signalName, source: 'default' });
   }
 
   /**
@@ -123,6 +207,17 @@ export class ModeAwareConfidenceScorer {
     }
 
     return 'Unknown mode';
+  }
+
+  /**
+   * More detailed reason including source and momentum
+   */
+  private getDetailedReason(mode: OperationMode, raw: number, source: string, sourceWeight: number, momentum: number, adjusted: number): string {
+    const base = this.getReason(mode, raw, adjusted);
+    const pieces = [base];
+    pieces.push(`source=${source} weight=${sourceWeight.toFixed(2)}`);
+    if (Math.abs(momentum) > 0.0001) pieces.push(`momentum=${momentum.toFixed(3)}`);
+    return pieces.join(' | ');
   }
 
   /**

@@ -1,4 +1,5 @@
 import { useMemo } from 'react';
+import { useCorrelationData } from '@/lib/hooks';
 import { TrendingUp, TrendingDown, Activity } from 'lucide-react';
 
 interface CorrelationData {
@@ -25,6 +26,8 @@ export default function CorrelationHeatmap({
   sectorData = [],
   onSymbolSelect,
 }: CorrelationHeatmapProps) {
+  const corrQ = useCorrelationData();
+  const fetched = corrQ.data?.data;
   // Generate demo correlation data if not provided
   const defaultCorrelationData = useMemo<CorrelationData>(() => ({
     symbols: ['BTC', 'ETH', 'SOL', 'ADA', 'XRP', 'DOGE'],
@@ -46,7 +49,7 @@ export default function CorrelationHeatmap({
     { name: 'Stablecoins', performance: 0.1, symbols: 6, topAsset: 'USDC', topChange: 0.0 },
   ], []);
 
-  const correlations = correlationData || defaultCorrelationData;
+  const correlations = correlationData || fetched || defaultCorrelationData;
   const sectors = sectorData.length > 0 ? sectorData : defaultSectorData;
 
   // Get color for correlation value (0 to 1)
@@ -77,6 +80,8 @@ export default function CorrelationHeatmap({
 
   return (
     <div className="space-y-4">
+      {corrQ.isLoading && <div className="text-sm text-muted-foreground">Loading correlations...</div>}
+      {corrQ.isError && <div className="text-sm text-destructive">Failed to load correlations: {String((corrQ.error as Error)?.message)}</div>}
       {/* Sector Performance Grid */}
       <div className="bg-gradient-to-br from-slate-800/60 to-slate-800/40 rounded-lg border border-slate-700/50 p-4 space-y-3">
         <h3 className="text-sm font-bold text-white flex items-center space-x-2">

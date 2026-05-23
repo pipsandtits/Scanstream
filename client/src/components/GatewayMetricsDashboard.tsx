@@ -1,10 +1,10 @@
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, Suspense, lazy, useMemo } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { Activity, AlertTriangle, TrendingUp, Database, Zap } from 'lucide-react';
 import { Card } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
+const GatewayMetricsCharts = lazy(() => import('@/components/GatewayMetricsCharts'));
 
 interface MetricsData {
   cache: {
@@ -54,14 +54,14 @@ export default function GatewayMetricsDashboard() {
     await fetch(`/api/gateway/alerts/${id}/acknowledge`, { method: 'POST' });
   };
 
-  const getSeverityColor = (severity: string) => {
-    switch (severity) {
-      case 'critical': return 'bg-red-500/10 text-red-400 border-red-500/30';
-      case 'high': return 'bg-orange-500/10 text-orange-400 border-orange-500/30';
-      case 'medium': return 'bg-yellow-500/10 text-yellow-400 border-yellow-500/30';
-      default: return 'bg-blue-500/10 text-blue-400 border-blue-500/30';
-    }
-  };
+function getSeverityColor(severity: string) {
+  switch (severity) {
+    case 'critical': return 'bg-red-500/10 text-red-400 border-red-500/30';
+    case 'high': return 'bg-orange-500/10 text-orange-400 border-orange-500/30';
+    case 'medium': return 'bg-yellow-500/10 text-yellow-400 border-yellow-500/30';
+    default: return 'bg-blue-500/10 text-blue-400 border-blue-500/30';
+  }
+}
 
   return (
     <div className="space-y-6 p-6">
@@ -141,53 +141,11 @@ export default function GatewayMetricsDashboard() {
       </div>
 
       {/* Exchange Latency Chart */}
-      {(latencyHistory as any)?.success && (
-        <Card className="p-6">
-          <h3 className="text-lg font-semibold mb-4">Exchange Latency Trends</h3>
-          <ResponsiveContainer width="100%" height={300}>
-            <LineChart data={(latencyHistory as any)?.data || []}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
-              <XAxis 
-                dataKey="timestamp" 
-                stroke="#9ca3af"
-                tickFormatter={(val) => new Date(val).toLocaleTimeString()}
-              />
-              <YAxis stroke="#9ca3af" label={{ value: 'Latency (ms)', angle: -90 }} />
-              <Tooltip 
-                contentStyle={{ backgroundColor: '#1f2937', border: '1px solid #374151' }}
-              />
-              <Legend />
-              <Line type="monotone" dataKey="exchanges.binance" stroke="#3b82f6" name="Binance" />
-              <Line type="monotone" dataKey="exchanges.coinbase" stroke="#10b981" name="Coinbase" />
-              <Line type="monotone" dataKey="exchanges.kraken" stroke="#8b5cf6" name="Kraken" />
-            </LineChart>
-          </ResponsiveContainer>
-        </Card>
-      )}
-
-      {/* Rate Limit Usage Chart */}
-      {(usageHistory as any)?.success && (
-        <Card className="p-6">
-          <h3 className="text-lg font-semibold mb-4">Rate Limit Usage</h3>
-          <ResponsiveContainer width="100%" height={300}>
-            <LineChart data={(usageHistory as any)?.data || []}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
-              <XAxis 
-                dataKey="timestamp" 
-                stroke="#9ca3af"
-                tickFormatter={(val) => new Date(val).toLocaleTimeString()}
-              />
-              <YAxis stroke="#9ca3af" label={{ value: 'Usage %', angle: -90 }} />
-              <Tooltip 
-                contentStyle={{ backgroundColor: '#1f2937', border: '1px solid #374151' }}
-              />
-              <Legend />
-              <Line type="monotone" dataKey="exchanges.binance" stroke="#3b82f6" name="Binance" />
-              <Line type="monotone" dataKey="exchanges.coinbase" stroke="#10b981" name="Coinbase" />
-            </LineChart>
-          </ResponsiveContainer>
-        </Card>
-      )}
+      <Card className="p-6">
+        <Suspense fallback={<div className="h-72 flex items-center justify-center">Loading charts…</div>}>
+          <GatewayMetricsCharts latencyData={latencyHistory} usageData={usageHistory} />
+        </Suspense>
+      </Card>
     </div>
   );
 }

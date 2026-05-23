@@ -126,7 +126,7 @@ export class APIRegistry {
   /**
    * Register a new API endpoint
    */
-  registerEndpoint(endpoint: Omit<APIEndpoint, 'metrics' | 'registeredAt' | 'lastModified'>) {
+  registerEndpoint(endpoint: Omit<APIEndpoint, 'metrics' | 'registeredAt' | 'lastModified' | 'id'>) {
     const id = `${endpoint.method.toUpperCase()}:${endpoint.path}`;
     
     const fullEndpoint: APIEndpoint = {
@@ -153,7 +153,7 @@ export class APIRegistry {
   /**
    * Register multiple endpoints at once
    */
-  registerEndpoints(endpoints: Omit<APIEndpoint, 'metrics' | 'registeredAt' | 'lastModified'>[]) {
+  registerEndpoints(endpoints: Omit<APIEndpoint, 'metrics' | 'registeredAt' | 'lastModified' | 'id'>[]) {
     endpoints.forEach(ep => this.registerEndpoint(ep));
   }
 

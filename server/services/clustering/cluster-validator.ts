@@ -15,7 +15,9 @@
  */
 
 import { getAdaptiveClusterThreshold, validateClusterGate } from '../../rl-system-integration';
+import { getConfidenceScorer } from '../market-data/confidence-scorer';
 import { MarketFrame } from '@shared/schema';
+import type { Candle } from '../../types/market-data';
 
 export interface ClusterMetrics {
   trend_formation_signal: boolean;
@@ -25,6 +27,11 @@ export interface ClusterMetrics {
   total_clusters: number;
   bullish_clusters: number;
   bearish_clusters: number;
+  // Optional extended metrics
+  avg_cluster_size?: number;
+  max_cluster_size?: number;
+  neutral_ratio?: number; // proportion of candles considered neutral/choppy
+  volatility?: number; // 0-1 normalized volatility estimate
 }
 
 export interface ClusterEnhancedEntry {
@@ -47,11 +54,15 @@ export interface ClusterValidationConfig {
   cluster_strength_weight: number; // 0.3
   candle_consistency_weight: number; // 0.2
   follow_through_weight: number; // 0.1
+  // How much volatility should dampen cluster strength (0-1)
+  volatility_weight?: number;
+  // Minimum cluster size to count (ignore 1-candle clusters)
+  min_cluster_size?: number;
   
   // Quality thresholds
-  minimum_quality_for_entry: number; // 0.50 (50%)
-  high_quality_threshold: number; // 0.70 (70%)
-  very_high_quality_threshold: number; // 0.85 (85%)
+  minimum_quality_for_entry: number; // 0.52 (52%)
+  high_quality_threshold: number; // 0.72 (72%)
+  very_high_quality_threshold: number; // 0.87 (87%)
   
   // Confidence level thresholds
   low_quality_ceiling: number; // < 0.50
@@ -61,13 +72,15 @@ export interface ClusterValidationConfig {
 }
 
 const DEFAULT_CONFIG: ClusterValidationConfig = {
-  trend_formation_weight: 0.4,
-  cluster_strength_weight: 0.3,
-  candle_consistency_weight: 0.2,
-  follow_through_weight: 0.1,
-  minimum_quality_for_entry: 0.50,
-  high_quality_threshold: 0.70,
-  very_high_quality_threshold: 0.85,
+  trend_formation_weight: 0.40,
+  cluster_strength_weight: 0.30,
+  candle_consistency_weight: 0.20,
+  follow_through_weight: 0.10,
+  volatility_weight: 0.10,
+  min_cluster_size: 2,
+  minimum_quality_for_entry: 0.52,
+  high_quality_threshold: 0.72,
+  very_high_quality_threshold: 0.87,
   low_quality_ceiling: 0.50,
   moderate_quality_ceiling: 0.70,
   high_quality_ceiling: 0.85,
@@ -78,9 +91,32 @@ export class ClusterValidator {
   private config: ClusterValidationConfig;
   private frames: MarketFrame[] = [];
   private rlThreshold: any = null;
+  private minClusterSize: number;
+  private volatilityWeight: number;
 
   constructor(config?: Partial<ClusterValidationConfig>) {
     this.config = { ...DEFAULT_CONFIG, ...config };
+    this.minClusterSize = this.config.min_cluster_size || 2;
+    this.volatilityWeight = this.config.volatility_weight ?? 0.1;
+  }
+
+  /**
+   * Return a safe default ClusterMetrics object
+   */
+  static getDefaultMetrics(): ClusterMetrics {
+    return {
+      trend_formation_signal: false,
+      cluster_strength: 0,
+      directional_ratio: 0,
+      follow_through: 0,
+      total_clusters: 0,
+      bullish_clusters: 0,
+      bearish_clusters: 0,
+      avg_cluster_size: 0,
+      max_cluster_size: 0,
+      neutral_ratio: 0,
+      volatility: 0
+    };
   }
 
   /**
@@ -105,6 +141,101 @@ export class ClusterValidator {
   }
 
   /**
+   * Compute cluster metrics from a candle array.
+   * This helper implements a minimum-cluster-size policy and returns
+   * extra diagnostics (avg/max cluster size, neutralRatio, volatility).
+   */
+  static computeClusterMetricsFromCandles(candles: Candle[], minClusterSize = 2): ClusterMetrics {
+    // Direction per candle: 1 = up, -1 = down, 0 = neutral
+    const dirs: number[] = [];
+    for (let i = 1; i < candles.length; i++) {
+      const prev = candles[i - 1].close;
+      const cur = candles[i].close;
+      const diff = cur - prev;
+      if (Math.abs(diff) < Number.EPSILON) dirs.push(0);
+      else dirs.push(diff > 0 ? 1 : -1);
+    }
+
+    let currentDirection: number | null = null;
+    let currentClusterLength = 0;
+    let total = 0;
+    let bullish = 0;
+    let bearish = 0;
+    const clusterSizes: number[] = [];
+    let neutralCount = 0;
+
+    for (const d of dirs) {
+      const dir = d === 0 ? 0 : d;
+      if (dir === 0) {
+        neutralCount++;
+        // treat neutral as cluster boundary
+        if (currentDirection !== null) {
+          if (currentClusterLength >= minClusterSize) {
+            total++;
+            if (currentDirection === 1) bullish++; else bearish++;
+            clusterSizes.push(currentClusterLength);
+          }
+          currentClusterLength = 0;
+          currentDirection = null;
+        }
+        continue;
+      }
+
+      if (dir !== currentDirection && currentDirection !== null) {
+        if (currentClusterLength >= minClusterSize) {
+          total++;
+          if (currentDirection === 1) bullish++; else bearish++;
+          clusterSizes.push(currentClusterLength);
+        }
+        currentClusterLength = 1;
+        currentDirection = dir;
+      } else {
+        currentClusterLength++;
+        if (currentDirection === null) currentDirection = dir;
+      }
+    }
+
+    // finalize last cluster
+    if (currentDirection !== null && currentClusterLength >= minClusterSize) {
+      total++;
+      if (currentDirection === 1) bullish++; else bearish++;
+      clusterSizes.push(currentClusterLength);
+    }
+
+    const avgClusterSize = clusterSizes.length > 0 ? clusterSizes.reduce((a, b) => a + b, 0) / clusterSizes.length : 0;
+    const maxClusterSize = clusterSizes.length > 0 ? Math.max(...clusterSizes) : 0;
+    const neutralRatio = dirs.length > 0 ? neutralCount / dirs.length : 0;
+
+    // Simple volatility estimate: stddev of returns normalized
+    const returns: number[] = [];
+    for (let i = 1; i < candles.length; i++) {
+      const r = (candles[i].close - candles[i - 1].close) / (candles[i - 1].close || 1);
+      returns.push(r);
+    }
+    const mean = returns.length > 0 ? returns.reduce((a, b) => a + b, 0) / returns.length : 0;
+    const variance = returns.length > 0 ? returns.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / returns.length : 0;
+    const volatility = Math.min(1, Math.sqrt(variance));
+
+    // Build a cluster_strength proxy: proportion of non-neutral clusters weighted by size
+    const nonNeutralProportion = dirs.length > 0 ? (dirs.length - neutralCount) / dirs.length : 0;
+    const cluster_strength = total > 0 ? Math.min(1, (clusterSizes.reduce((a, b) => a + b, 0) / (dirs.length || 1)) ) : nonNeutralProportion;
+
+    return {
+      trend_formation_signal: avgClusterSize >= minClusterSize,
+      cluster_strength,
+      directional_ratio: dirs.length > 0 ? Math.max(bullish, bearish) / (bullish + bearish || 1) : 0,
+      follow_through: 0, // caller should compute follow-through separately
+      total_clusters: total,
+      bullish_clusters: bullish,
+      bearish_clusters: bearish,
+      avg_cluster_size: avgClusterSize,
+      max_cluster_size: maxClusterSize,
+      neutral_ratio: neutralRatio,
+      volatility
+    };
+  }
+
+  /**
    * Validate entry signal with cluster metrics
    * Returns quality score and recommendation
    */
@@ -114,6 +245,14 @@ export class ClusterValidator {
   ): ClusterEnhancedEntry {
     // Validate inputs
     baseSignalQuality = Math.max(0, Math.min(1, baseSignalQuality));
+
+    try {
+      const scorer = getConfidenceScorer();
+      const scored = scorer.scoreWithCurrentMode(baseSignalQuality, 'cluster');
+      baseSignalQuality = scored.adjusted;
+    } catch (e) {
+      // ignore scorer failures
+    }
 
     // ─────────────────────────────────────────────────────────────────────
     // NEW: Check RL-adaptive cluster gate if thresholds are available
@@ -152,6 +291,10 @@ export class ClusterValidator {
         };
         return rejectedEntry;
       }
+      // RL gate passed — optionally boost quality slightly (conservative)
+      // This is a small trust boost from the RL controller
+      // Mark that RL gate passed so we can apply boost after base quality calculation
+      (clusterMetrics as any)._rlGatePassed = true;
     }
 
     // Build cluster validation scores
@@ -160,22 +303,34 @@ export class ClusterValidator {
     const candle_consistency = clusterMetrics.directional_ratio;
     const momentum_follow_through = clusterMetrics.follow_through;
 
+    // Adjust cluster strength based on volatility (high volatility should dampen cluster strength)
+    let adjusted_cluster_strength = cluster_strength;
+    const vol = clusterMetrics.volatility ?? 0;
+    if (this.volatilityWeight > 0) {
+      adjusted_cluster_strength = cluster_strength * (1 - this.volatilityWeight) + (1 - vol) * this.volatilityWeight;
+      adjusted_cluster_strength = Math.max(0, Math.min(1, adjusted_cluster_strength));
+    }
+
     // Calculate combined cluster quality score
     const cluster_quality_score =
       this.config.trend_formation_weight * trend_strength +
-      this.config.cluster_strength_weight * cluster_strength +
+      this.config.cluster_strength_weight * adjusted_cluster_strength +
       this.config.candle_consistency_weight * candle_consistency +
       this.config.follow_through_weight * momentum_follow_through;
 
     // Final quality = base signal × cluster validation
     const final_entry_quality = baseSignalQuality * cluster_quality_score;
 
+    // If RL gate passed earlier, apply a small conservative boost (cap at 1.0)
+    const rlPassed = (clusterMetrics as any)._rlGatePassed === true;
+    const boosted_final_quality = rlPassed ? Math.min(1.0, final_entry_quality * 1.10) : final_entry_quality;
+
     // Determine confidence level
-    const confidence_level = this.getConfidenceLevel(final_entry_quality);
+    const confidence_level = this.getConfidenceLevel(boosted_final_quality);
 
     // Get recommendation and multiplier
     const { recommendation, multiplier } = this.getRecommendation(
-      final_entry_quality,
+      boosted_final_quality,
       clusterMetrics.trend_formation_signal
     );
 
@@ -183,9 +338,44 @@ export class ClusterValidator {
     const reasoning = this.buildReasoning(
       baseSignalQuality,
       clusterMetrics,
-      final_entry_quality,
+      boosted_final_quality,
       confidence_level
     );
+
+    // If clusterMetrics contains a symbol hint, consult TruthEngine consensus to further adjust quality
+    try {
+      const symbol = (clusterMetrics as any)._symbol as string | undefined;
+      const truth = (global as any).truthEngine as any;
+      if (symbol && truth && typeof truth.getConsensus === 'function') {
+        const cons = truth.getConsensus(symbol);
+        if (cons && typeof cons.confidence === 'number') {
+          const consConf = Math.max(0, Math.min(1, cons.confidence / 100));
+          // Blend final quality conservatively with consensus confidence
+          const blendFactor = 0.5; // how much to trust RL/cluster vs canonical consensus
+          const adjustedFinal = Math.min(1, boosted_final_quality * (1 - blendFactor) + (boosted_final_quality * consConf) * blendFactor);
+          // add reasoning note
+          reasoning.push(`[Consensus] blended with canonical confidence ${(cons.confidence || 0).toFixed(0)}% -> quality ${(adjustedFinal * 100).toFixed(0)}%`);
+          // Apply adjusted final quality
+          const finalResult: ClusterEnhancedEntry = {
+            base_signal_quality: baseSignalQuality,
+            cluster_validation: {
+              trend_forming: clusterMetrics.trend_formation_signal,
+              formation_strength: trend_strength,
+              candle_consistency,
+              momentum_follow_through
+            },
+            final_entry_quality: adjustedFinal,
+            confidence_level: this.getConfidenceLevel(adjustedFinal),
+            entry_recommendation: this.getRecommendation(adjustedFinal, clusterMetrics.trend_formation_signal).recommendation,
+            size_multiplier: this.getRecommendation(adjustedFinal, clusterMetrics.trend_formation_signal).multiplier,
+            reasoning
+          };
+          return finalResult;
+        }
+      }
+    } catch (e) {
+      // ignore consensus integration failures
+    }
 
     return {
       base_signal_quality: baseSignalQuality,
@@ -195,7 +385,7 @@ export class ClusterValidator {
         candle_consistency,
         momentum_follow_through
       },
-      final_entry_quality,
+      final_entry_quality: boosted_final_quality,
       confidence_level,
       entry_recommendation: recommendation,
       size_multiplier: multiplier,
@@ -267,6 +457,18 @@ export class ClusterValidator {
       `(consistency: ${(metrics.directional_ratio * 100).toFixed(0)}%, ` +
       `follow-through: ${(metrics.follow_through * 100).toFixed(0)}%)`
     );
+
+    if (typeof metrics.avg_cluster_size === 'number') {
+      reasons.push(`Avg cluster size: ${metrics.avg_cluster_size.toFixed(2)} bars (max ${metrics.max_cluster_size || 0})`);
+    }
+
+    if (typeof metrics.neutral_ratio === 'number' && metrics.neutral_ratio > 0.15) {
+      reasons.push(`Market shows choppiness (neutral ratio ${(metrics.neutral_ratio * 100).toFixed(0)}%)`);
+    }
+
+    if (typeof metrics.volatility === 'number') {
+      reasons.push(`Volatility: ${(metrics.volatility * 100).toFixed(1)}% (used weight=${this.volatilityWeight})`);
+    }
 
     reasons.push(
       `Final quality: ${(finalQuality * 100).toFixed(0)}% (${confidence} confidence)`

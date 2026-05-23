@@ -105,33 +105,49 @@ export function setupConsoleLogging() {
   const originalLog = console.log;
   const originalError = console.error;
   const originalWarn = console.warn;
+  const serializeArg = (a: any) => {
+    if (a instanceof Error) {
+      return `${a.message}\n${a.stack}`;
+    }
+    if (typeof a === 'object') {
+      try { return JSON.stringify(a); } catch { return String(a); }
+    }
+    return String(a);
+  };
 
   console.log = (...args: any[]) => {
-    const message = args.map(a => 
-      typeof a === 'object' ? JSON.stringify(a) : String(a)
-    ).join(' ');
-    
+    const message = args.map(serializeArg).join(' ');
     logToFile('INFO', message);
     originalLog(...args);
   };
 
   console.error = (...args: any[]) => {
-    const message = args.map(a => 
-      typeof a === 'object' ? JSON.stringify(a) : String(a)
-    ).join(' ');
-    
+    const message = args.map(serializeArg).join(' ');
     logToFile('ERROR', message);
     originalError(...args);
   };
 
   console.warn = (...args: any[]) => {
-    const message = args.map(a => 
-      typeof a === 'object' ? JSON.stringify(a) : String(a)
-    ).join(' ');
-    
+    const message = args.map(serializeArg).join(' ');
     logToFile('WARN', message);
     originalWarn(...args);
   };
+}
+
+/**
+ * Normalize unknown errors into a serializable object with message and optional stack
+ */
+export function formatError(e: unknown) {
+  const message = e instanceof Error
+    ? e.message
+    : typeof e === 'string'
+      ? e
+      : (() => { try { return JSON.stringify(e); } catch { return String(e); } })() || 'unknown error';
+
+  return {
+    message,
+    stack: e instanceof Error ? e.stack : undefined
+  } as { message: string; stack?: string };
 }
 
 /**
@@ -214,24 +230,28 @@ export class ModuleLogger {
   constructor(private moduleName: string) {}
   
   info(message: string, data?: any) {
-    console.log(`[${this.moduleName}] ${message}`, data);
-    logToFile('INFO', `[${this.moduleName}] ${message}`, data);
+    const payload = data instanceof Error ? { message: data.message, stack: data.stack } : data;
+    console.log(`[${this.moduleName}] ${message}`, payload);
+    logToFile('INFO', `[${this.moduleName}] ${message}`, payload);
   }
   
   error(message: string, data?: any) {
-    console.error(`[${this.moduleName}] ❌ ${message}`, data);
-    logToFile('ERROR', `[${this.moduleName}] ${message}`, data);
+    const payload = data instanceof Error ? { message: data.message, stack: data.stack } : data;
+    console.error(`[${this.moduleName}] ❌ ${message}`, payload);
+    logToFile('ERROR', `[${this.moduleName}] ${message}`, payload);
   }
   
   warn(message: string, data?: any) {
-    console.warn(`[${this.moduleName}] ⚠️ ${message}`, data);
-    logToFile('WARN', `[${this.moduleName}] ${message}`, data);
+    const payload = data instanceof Error ? { message: data.message, stack: data.stack } : data;
+    console.warn(`[${this.moduleName}] ⚠️ ${message}`, payload);
+    logToFile('WARN', `[${this.moduleName}] ${message}`, payload);
   }
   
   debug(message: string, data?: any) {
     if (process.env.DEBUG) {
-      console.log(`[${this.moduleName}] 🔍 ${message}`, data);
-      logToFile('DEBUG', `[${this.moduleName}] ${message}`, data);
+      const payload = data instanceof Error ? { message: data.message, stack: data.stack } : data;
+      console.log(`[${this.moduleName}] 🔍 ${message}`, payload);
+      logToFile('DEBUG', `[${this.moduleName}] ${message}`, payload);
     }
   }
 }

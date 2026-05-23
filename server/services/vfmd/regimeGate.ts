@@ -10,7 +10,7 @@
  * Both fail equally in whipsaw zones.
  */
 
-import type { MarketTick } from './types.ts';
+import type { MarketTick } from './types';
 
 export type MarketDirection = 'BUY' | 'SELL';
 

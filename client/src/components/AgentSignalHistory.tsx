@@ -2,7 +2,8 @@ import { useState } from 'react';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, ComposedChart, Bar, Area } from 'recharts';
+// Recharts usage is wrapped by BarChartCore; avoid direct Recharts imports here to reduce bundle size
+import BarChartCore from './charts/BarChartCore';
 import { Filter, TrendingUp, TrendingDown } from 'lucide-react';
 import { formatConfidence, formatPct } from '@/utils/formatting';
 
@@ -159,25 +160,13 @@ export default function AgentSignalHistory({
         </CardHeader>
         <CardContent>
           {chartData.length > 0 ? (
-            <ResponsiveContainer width="100%" height={300}>
-              <ComposedChart data={chartData}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-                <XAxis
-                  dataKey="time"
-                  stroke="#94a3b8"
-                  tickFormatter={(time) => new Date(time).toLocaleDateString()}
-                />
-                <YAxis stroke="#94a3b8" />
-                <Tooltip
-                  contentStyle={{ backgroundColor: '#1e293b', border: '1px solid #475569' }}
-                  formatter={(value) => value}
-                />
-                <Legend />
+            <div style={{ width: '100%', height: 300 }}>
+              <BarChartCore data={chartData} dataKey="BUY" height={300}>
                 <Bar dataKey="BUY" stackId="a" fill="#10b981" radius={[8, 8, 0, 0]} />
                 <Bar dataKey="HOLD" stackId="a" fill="#f59e0b" radius={[8, 8, 0, 0]} />
                 <Bar dataKey="SELL" stackId="a" fill="#ef4444" radius={[8, 8, 0, 0]} />
-              </ComposedChart>
-            </ResponsiveContainer>
+              </BarChartCore>
+            </div>
           ) : (
             <div className="h-64 flex items-center justify-center text-slate-400">
               No signals in this time range

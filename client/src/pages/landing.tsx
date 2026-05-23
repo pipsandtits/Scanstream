@@ -1,424 +1,212 @@
-
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { 
-  BarChart3, 
-  TrendingUp, 
-  Zap, 
+  Brain, 
   Shield, 
-  LineChart, 
-  Clock,
-  ArrowRight,
-  Activity,
-  Globe,
-  CheckCircle2,
+  Zap, 
+  Globe, 
+  TrendingUp, 
+  Activity, 
+  ArrowRight, 
+  CheckCircle2, 
   Star,
-  Brain,
   Target,
-  Sparkles,
-  ChevronRight,
+  BarChart3,
+  LineChart,
   Users,
   Award,
   Code,
-  Rocket
+  Rocket,
+  Eye
 } from "lucide-react";
 
-export default function LandingPage() {
-  const features = [
-    {
-      icon: Zap,
-      title: "Real-Time Signals",
-      description: "Get instant trading signals powered by advanced technical analysis and machine learning algorithms.",
-      color: "text-yellow-500"
-    },
-    {
-      icon: LineChart,
-      title: "Multi-Timeframe Analysis",
-      description: "Analyze markets across multiple timeframes simultaneously for comprehensive trading decisions.",
-      color: "text-blue-500"
-    },
-    {
-      icon: Globe,
-      title: "CoinGecko Integration",
-      description: "Access real-time market data, sentiment analysis, and comprehensive crypto metrics.",
-      color: "text-green-500"
-    },
-    {
-      icon: BarChart3,
-      title: "Advanced Analytics",
-      description: "Volume profile, flow field analysis, and composite scoring for deep market insights.",
-      color: "text-purple-500"
-    },
-    {
-      icon: Shield,
-      title: "Risk Management",
-      description: "Built-in stop-loss, take-profit calculations and position sizing recommendations.",
-      color: "text-red-500"
-    },
-    {
-      icon: Clock,
-      title: "Paper Trading",
-      description: "Test your strategies risk-free with our realistic paper trading simulation.",
-      color: "text-orange-500"
-    }
-  ];
-
-  const stats = [
-    { value: "50+", label: "Trading Pairs", icon: Target },
-    { value: "6", label: "Exchanges", icon: Globe },
-    { value: "< 1s", label: "Signal Latency", icon: Zap },
-    { value: "24/7", label: "Market Coverage", icon: Clock }
-  ];
-
-  const benefits = [
-    "AI-powered signal generation",
-    "Real-time market scanning",
-    "Advanced risk management",
-    "Multi-exchange support",
-    "Backtesting engine",
-    "Portfolio analytics"
-  ];
-
-  const testimonials = [
-    {
-      name: "Alex Chen",
-      role: "Day Trader",
-      content: "Scanstream has transformed my trading. The real-time signals are incredibly accurate.",
-      rating: 5
-    },
-    {
-      name: "Sarah Johnson",
-      role: "Crypto Investor",
-      content: "Best trading terminal I've used. The analytics are professional-grade.",
-      rating: 5
-    },
-    {
-      name: "Mike Rodriguez",
-      role: "Algorithmic Trader",
-      content: "The backtesting and ML features are exactly what I needed. Highly recommend!",
-      rating: 5
-    }
-  ];
-
+export default function ScanstreamLanding() {
   return (
-    <div className="min-h-screen bg-gradient-to-b from-background via-background to-muted/20">
-      {/* Header */}
-      <header className="border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60 sticky top-0 z-50">
-        <div className="container mx-auto px-4 h-16 flex items-center justify-between gap-4">
-          <div className="flex items-center gap-2">
-            <Activity className="h-6 w-6 text-blue-500" />
-            <span className="font-bold text-xl bg-gradient-to-r from-blue-500 to-purple-500 bg-clip-text text-transparent">
-              Scanstream
-            </span>
+    <div className="min-h-screen bg-zinc-950 text-white overflow-hidden">
+      {/* Navigation */}
+      <nav className="border-b border-white/10 bg-zinc-950/80 backdrop-blur-lg sticky top-0 z-50">
+        <div className="max-w-7xl mx-auto px-6 h-16 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div className="w-8 h-8 rounded-xl bg-gradient-to-br from-cyan-400 to-purple-600 flex items-center justify-center">
+              <Activity className="w-5 h-5" />
+            </div>
+            <span className="font-semibold text-2xl tracking-tighter">Scanstream</span>
           </div>
-          <nav className="hidden md:flex items-center gap-6">
-            <a href="#features" className="text-sm text-muted-foreground hover:text-foreground transition-colors" data-testid="link-features">
-              Features
-            </a>
-            <a href="#benefits" className="text-sm text-muted-foreground hover:text-foreground transition-colors">
-              Benefits
-            </a>
-            <a href="#testimonials" className="text-sm text-muted-foreground hover:text-foreground transition-colors">
-              Testimonials
-            </a>
-            <a href="#pricing" className="text-sm text-muted-foreground hover:text-foreground transition-colors" data-testid="link-pricing">
-              Pricing
-            </a>
-          </nav>
-          <div className="flex items-center gap-2">
-            <Button variant="ghost" asChild data-testid="button-login">
-              <a href="/api/login">Log In</a>
+
+          <div className="hidden md:flex items-center gap-8 text-sm">
+            <a href="#architecture" className="hover:text-cyan-400 transition-colors">Architecture</a>
+            <a href="#features" className="hover:text-cyan-400 transition-colors">Features</a>
+            <a href="#technology" className="hover:text-cyan-400 transition-colors">Technology</a>
+            <a href="#why" className="hover:text-cyan-400 transition-colors">Why Scanstream</a>
+          </div>
+
+          <Button asChild className="bg-white text-black hover:bg-white/90">
+            <a href="/dashboard">Launch Terminal</a>
+          </Button>
+        </div>
+      </nav>
+
+      {/* HERO */}
+      <section className="pt-32 pb-20 relative">
+        <div className="absolute inset-0 bg-[radial-gradient(#27272a_0.8px,transparent_1px)] [background-size:40px_40px] opacity-40" />
+        
+        <div className="max-w-5xl mx-auto px-6 text-center relative z-10">
+          <Badge variant="outline" className="mb-6 border-cyan-400/30 text-cyan-400 px-4 py-1">
+            Institutional-Grade Autonomous Trading
+          </Badge>
+
+          <h1 className="text-6xl md:text-7xl font-bold tracking-tighter mb-6 leading-none">
+            The Trading System<br />
+            <span className="bg-gradient-to-r from-cyan-400 via-purple-400 to-pink-400 bg-clip-text text-transparent">
+              That Thinks
+            </span>
+          </h1>
+
+          <p className="text-xl md:text-2xl text-zinc-400 max-w-3xl mx-auto mb-10">
+            Multi-agent council • Reinforcement learning • Real-time integrity • 
+            Cross-exchange truth engine • Regime-aware execution.
+          </p>
+
+          <div className="flex flex-col sm:flex-row gap-4 justify-center items-center">
+            <Button size="lg" asChild className="text-lg px-10 h-14 bg-white text-black hover:bg-white/90">
+              <a href="/dashboard">Enter the Terminal</a>
             </Button>
-            <Button asChild data-testid="button-signup" className="bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-700 hover:to-purple-700">
-              <a href="/api/login">Get Started</a>
+            
+            <Button size="lg" variant="outline" className="text-lg px-8 h-14 border-white/30 hover:bg-white/5">
+              Watch System Overview
             </Button>
+          </div>
+
+          <div className="mt-16 flex justify-center gap-8 text-sm text-zinc-500">
+            <div className="flex items-center gap-2">
+              <div className="w-2 h-2 bg-emerald-500 rounded-full animate-pulse" />
+              LIVE Multi-Exchange
+            </div>
+            <div>13-Agent Council</div>
+            <div>Closed-Loop RL</div>
+            <div>Mode-Aware Safety</div>
           </div>
         </div>
-      </header>
+      </section>
 
-      <main>
-        {/* Hero Section */}
-        <section className="py-20 md:py-32 relative overflow-hidden">
-          <div className="absolute inset-0 bg-gradient-to-r from-blue-500/10 via-purple-500/10 to-pink-500/10 animate-pulse" />
-          <div className="container mx-auto px-4 text-center relative z-10">
-            <Badge variant="secondary" className="mb-4 animate-bounce" data-testid="badge-hero">
-              <Sparkles className="h-3 w-3 mr-1" />
-              Professional Trading Terminal
-            </Badge>
-            <h1 className="text-4xl md:text-7xl font-bold tracking-tight mb-6" data-testid="text-hero-title">
-              Trade Smarter with
-              <span className="bg-gradient-to-r from-blue-500 via-purple-500 to-pink-500 bg-clip-text text-transparent"> AI-Powered</span> Signals
-            </h1>
-            <p className="text-xl md:text-2xl text-muted-foreground max-w-3xl mx-auto mb-8 leading-relaxed" data-testid="text-hero-description">
-              Scanstream is a professional-grade trading terminal that combines real-time market data, 
-              advanced technical analysis, and machine learning to help you make better trading decisions.
+      {/* ARCHITECTURE */}
+      <section id="architecture" className="py-20 border-t border-white/10 bg-zinc-900/50">
+        <div className="max-w-6xl mx-auto px-6">
+          <div className="text-center mb-12">
+            <h2 className="text-4xl font-bold mb-3">A Complete Autonomous System</h2>
+            <p className="text-zinc-400 max-w-md mx-auto">
+              Every layer was built with purpose — from raw data to intelligent execution.
             </p>
-            <div className="flex flex-wrap items-center justify-center gap-4 mb-12">
-              <Button size="lg" asChild data-testid="button-start-trading" className="bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-700 hover:to-purple-700 text-lg px-8 py-6">
-                <a href="/api/login">
-                  Start Trading Free
-                  <ArrowRight className="ml-2 h-5 w-5" />
-                </a>
-              </Button>
-              <Button size="lg" variant="outline" asChild data-testid="button-view-demo" className="text-lg px-8 py-6 border-2">
-                <a href="#features">
-                  View Features
-                  <ChevronRight className="ml-2 h-5 w-5" />
-                </a>
-              </Button>
-            </div>
-
-            {/* Stats Grid */}
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-8 mt-16 max-w-4xl mx-auto">
-              {stats.map((stat, index) => (
-                <div key={index} className="relative group" data-testid={`stat-${index}`}>
-                  <div className="absolute inset-0 bg-gradient-to-r from-blue-500 to-purple-500 rounded-lg opacity-0 group-hover:opacity-20 transition-opacity blur" />
-                  <Card className="relative border-2 hover:border-blue-500/50 transition-all duration-300 hover:shadow-lg hover:scale-105">
-                    <CardContent className="pt-6 text-center">
-                      <stat.icon className="h-8 w-8 mx-auto mb-2 text-blue-500" />
-                      <div className="text-3xl md:text-4xl font-bold bg-gradient-to-r from-blue-500 to-purple-500 bg-clip-text text-transparent">{stat.value}</div>
-                      <div className="text-sm text-muted-foreground mt-1">{stat.label}</div>
-                    </CardContent>
-                  </Card>
-                </div>
-              ))}
-            </div>
           </div>
-        </section>
 
-        {/* Features Section */}
-        <section id="features" className="py-20 bg-muted/50">
-          <div className="container mx-auto px-4">
-            <div className="text-center mb-12">
-              <Badge variant="outline" className="mb-4">
-                <Rocket className="h-3 w-3 mr-1" />
-                Powerful Features
-              </Badge>
-              <h2 className="text-4xl md:text-5xl font-bold mb-4" data-testid="text-features-title">
-                Everything You Need to Trade
-              </h2>
-              <p className="text-lg text-muted-foreground max-w-2xl mx-auto" data-testid="text-features-description">
-                Comprehensive tools and features designed for both beginners and professional traders.
-              </p>
-            </div>
-
-            <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-6">
-              {features.map((feature, index) => (
-                <Card key={index} className="bg-card hover:shadow-xl transition-all duration-300 hover:scale-105 border-2 hover:border-blue-500/50 group" data-testid={`card-feature-${index}`}>
-                  <CardHeader>
-                    <div className="relative">
-                      <div className={`absolute inset-0 bg-gradient-to-r from-blue-500 to-purple-500 rounded-full opacity-0 group-hover:opacity-20 transition-opacity blur-xl`} />
-                      <feature.icon className={`h-12 w-12 mb-4 ${feature.color} relative z-10`} />
-                    </div>
-                    <CardTitle className="text-xl">{feature.title}</CardTitle>
-                    <CardDescription className="text-base">{feature.description}</CardDescription>
-                  </CardHeader>
-                </Card>
-              ))}
-            </div>
-          </div>
-        </section>
-
-        {/* Benefits Section */}
-        <section id="benefits" className="py-20">
-          <div className="container mx-auto px-4">
-            <div className="grid lg:grid-cols-2 gap-12 items-center">
-              <div>
-                <Badge variant="outline" className="mb-4">
-                  <Star className="h-3 w-3 mr-1" />
-                  Why Choose Us
-                </Badge>
-                <h2 className="text-4xl font-bold mb-6">
-                  Professional Trading Made Simple
-                </h2>
-                <p className="text-lg text-muted-foreground mb-8">
-                  Access institutional-grade tools without the complexity. Our platform combines cutting-edge 
-                  technology with an intuitive interface.
-                </p>
-                <div className="grid gap-4">
-                  {benefits.map((benefit, index) => (
-                    <div key={index} className="flex items-center gap-3 group">
-                      <div className="flex-shrink-0 w-8 h-8 rounded-full bg-green-500/20 flex items-center justify-center group-hover:bg-green-500/30 transition-colors">
-                        <CheckCircle2 className="h-5 w-5 text-green-500" />
-                      </div>
-                      <span className="text-lg">{benefit}</span>
-                    </div>
+          <div className="grid md:grid-cols-3 gap-6">
+            {[
+              { 
+                title: "Data Foundation", 
+                items: ["Candle Integrity Layer", "Cross-Exchange Aggregator", "Truth Engine", "Symbol Manager"],
+                color: "from-cyan-400 to-blue-500"
+              },
+              { 
+                title: "Intelligence Layer", 
+                items: ["Multi-Agent Council", "Momentum + Clustering", "ML + LSTM Signals", "Reversal Detection"],
+                color: "from-purple-400 to-pink-500"
+              },
+              { 
+                title: "Execution & Learning", 
+                items: ["Mode-Aware Confidence", "Dynamic Exit Strategies", "RL Feedback Loop", "Risk & Position Manager"],
+                color: "from-emerald-400 to-teal-500"
+              }
+            ].map((section, i) => (
+              <Card key={i} className="bg-zinc-900 border-white/10 p-8 hover:border-white/20 transition-all">
+                <div className={`w-12 h-1.5 rounded bg-gradient-to-r ${section.color} mb-6`} />
+                <h3 className="text-2xl font-semibold mb-6">{section.title}</h3>
+                <ul className="space-y-3">
+                  {section.items.map((item, idx) => (
+                    <li key={idx} className="flex items-center gap-3 text-zinc-300">
+                      <CheckCircle2 className="h-4 w-4 text-emerald-500 flex-shrink-0" />
+                      {item}
+                    </li>
                   ))}
-                </div>
-              </div>
-              <div className="relative">
-                <div className="absolute inset-0 bg-gradient-to-r from-blue-500 to-purple-500 rounded-3xl opacity-20 blur-3xl" />
-                <Card className="relative border-2 p-8">
-                  <div className="space-y-6">
-                    <div className="flex items-center gap-4">
-                      <div className="w-12 h-12 rounded-lg bg-blue-500/20 flex items-center justify-center">
-                        <Brain className="h-6 w-6 text-blue-500" />
-                      </div>
-                      <div>
-                        <h3 className="font-semibold">AI-Powered Intelligence</h3>
-                        <p className="text-sm text-muted-foreground">Machine learning models analyze market patterns</p>
-                      </div>
-                    </div>
-                    <div className="flex items-center gap-4">
-                      <div className="w-12 h-12 rounded-lg bg-purple-500/20 flex items-center justify-center">
-                        <Code className="h-6 w-6 text-purple-500" />
-                      </div>
-                      <div>
-                        <h3 className="font-semibold">Advanced Algorithms</h3>
-                        <p className="text-sm text-muted-foreground">Sophisticated technical indicators and strategies</p>
-                      </div>
-                    </div>
-                    <div className="flex items-center gap-4">
-                      <div className="w-12 h-12 rounded-lg bg-green-500/20 flex items-center justify-center">
-                        <Award className="h-6 w-6 text-green-500" />
-                      </div>
-                      <div>
-                        <h3 className="font-semibold">Proven Results</h3>
-                        <p className="text-sm text-muted-foreground">Trusted by thousands of active traders</p>
-                      </div>
-                    </div>
-                  </div>
-                </Card>
-              </div>
-            </div>
+                </ul>
+              </Card>
+            ))}
           </div>
-        </section>
+        </div>
+      </section>
 
-        {/* Testimonials Section */}
-        <section id="testimonials" className="py-20 bg-muted/50">
-          <div className="container mx-auto px-4">
-            <div className="text-center mb-12">
-              <Badge variant="outline" className="mb-4">
-                <Users className="h-3 w-3 mr-1" />
-                Testimonials
-              </Badge>
-              <h2 className="text-4xl font-bold mb-4">
-                Loved by Traders Worldwide
-              </h2>
-              <p className="text-lg text-muted-foreground max-w-2xl mx-auto">
-                Join thousands of successful traders who trust Scanstream
-              </p>
-            </div>
-
-            <div className="grid md:grid-cols-3 gap-6">
-              {testimonials.map((testimonial, index) => (
-                <Card key={index} className="hover:shadow-xl transition-all duration-300 hover:scale-105">
-                  <CardHeader>
-                    <div className="flex items-center gap-1 mb-2">
-                      {[...Array(testimonial.rating)].map((_, i) => (
-                        <Star key={i} className="h-4 w-4 fill-yellow-500 text-yellow-500" />
-                      ))}
-                    </div>
-                    <CardDescription className="text-base italic">"{testimonial.content}"</CardDescription>
-                  </CardHeader>
-                  <CardContent>
-                    <div className="font-semibold">{testimonial.name}</div>
-                    <div className="text-sm text-muted-foreground">{testimonial.role}</div>
-                  </CardContent>
-                </Card>
-              ))}
-            </div>
+      {/* FEATURES */}
+      <section id="features" className="py-20">
+        <div className="max-w-6xl mx-auto px-6">
+          <div className="text-center mb-16">
+            <h2 className="text-4xl font-bold mb-4">Core Capabilities</h2>
+            <p className="text-zinc-400">Everything you need for consistent edge</p>
           </div>
-        </section>
 
-        {/* Exchanges Section */}
-        <section className="py-20">
-          <div className="container mx-auto px-4">
-            <div className="text-center mb-12">
-              <h2 className="text-3xl font-bold mb-4" data-testid="text-exchanges-title">
-                Supported Exchanges
-              </h2>
-              <p className="text-muted-foreground" data-testid="text-exchanges-description">
-                Connect to major cryptocurrency exchanges for real-time data and trading.
-              </p>
-            </div>
-
-            <div className="flex flex-wrap items-center justify-center gap-8">
-              {["Binance", "Coinbase", "Kraken", "KuCoin", "OKX", "Bybit"].map((exchange, index) => (
-                <div key={index} className="group" data-testid={`exchange-${exchange.toLowerCase()}`}>
-                  <div className="text-xl font-semibold text-muted-foreground group-hover:text-foreground transition-colors group-hover:scale-110 transform duration-200">
-                    {exchange}
-                  </div>
-                </div>
-              ))}
-            </div>
+          <div className="grid md:grid-cols-2 gap-8">
+            {[
+              {
+                icon: Brain,
+                title: "Multi-Agent Council",
+                desc: "RPG pattern agents + Physics validation + ML + RL vote in real-time with regime-aware weighting."
+              },
+              {
+                icon: Shield,
+                title: "Data Integrity Engine",
+                desc: "Candle validation, gap detection, cross-batch continuity, and freshness awareness."
+              },
+              {
+                icon: Globe,
+                title: "Cross-Exchange Truth",
+                desc: "Aggregates multiple venues into a canonical price with confidence scoring."
+              },
+              {
+                icon: Zap,
+                title: "Mode-Aware Safety",
+                desc: "REPLAY / MIXED / LIVE awareness prevents false confidence during backfill."
+              },
+              {
+                icon: TrendingUp,
+                title: "Adaptive Execution",
+                desc: "Dynamic entry timing, cluster validation, regime-aware exits, and adaptive holding."
+              },
+              {
+                icon: LineChart,
+                title: "Closed-Loop Learning",
+                desc: "Reinforcement learning with domain-specific rewards across 5 decision areas."
+              }
+            ].map((feature, i) => (
+              <Card key={i} className="bg-zinc-900 border-white/10 p-8 hover:border-white/30 transition-all group">
+                <feature.icon className="h-10 w-10 mb-6 text-cyan-400 group-hover:scale-110 transition-transform" />
+                <h3 className="text-2xl font-semibold mb-3">{feature.title}</h3>
+                <p className="text-zinc-400 leading-relaxed">{feature.desc}</p>
+              </Card>
+            ))}
           </div>
-        </section>
+        </div>
+      </section>
 
-        {/* CTA Section */}
-        <section id="pricing" className="py-20 bg-gradient-to-r from-blue-600 to-purple-600 text-white">
-          <div className="container mx-auto px-4">
-            <div className="text-center mb-12 max-w-3xl mx-auto">
-              <h2 className="text-4xl md:text-5xl font-bold mb-4" data-testid="text-cta-title">
-                Ready to Start Trading?
-              </h2>
-              <p className="text-lg md:text-xl text-white/90 mb-8" data-testid="text-cta-description">
-                Join thousands of traders who are already using Scanstream to make smarter trading decisions.
-                Start your free trial today, no credit card required.
-              </p>
-              <Button size="lg" asChild data-testid="button-cta-signup" variant="secondary" className="text-lg px-8 py-6">
-                <a href="/api/login">
-                  Create Free Account
-                  <ArrowRight className="ml-2 h-5 w-5" />
-                </a>
-              </Button>
-              <p className="text-sm text-white/70 mt-4">Free forever. No credit card required.</p>
-            </div>
-          </div>
-        </section>
-      </main>
+      {/* CTA */}
+      <section className="py-24 bg-gradient-to-b from-transparent via-zinc-900 to-black border-t border-white/10">
+        <div className="max-w-3xl mx-auto text-center px-6">
+          <h2 className="text-5xl font-bold mb-6">Ready to run a real system?</h2>
+          <p className="text-xl text-zinc-400 mb-10">
+            Scanstream is not another signal service.<br />
+            It's a complete autonomous trading platform.
+          </p>
+          
+          <Button size="lg" asChild className="text-lg h-14 px-12 bg-white text-black hover:bg-white/90">
+            <a href="/dashboard">Launch Scanstream Terminal</a>
+          </Button>
+          
+          <p className="text-sm text-zinc-500 mt-6">Built with integrity. Designed for edge.</p>
+        </div>
+      </section>
 
       {/* Footer */}
-      <footer className="border-t py-12 bg-muted/50">
-        <div className="container mx-auto px-4">
-          <div className="grid md:grid-cols-4 gap-8 mb-8">
-            <div>
-              <div className="flex items-center gap-2 mb-4">
-                <Activity className="h-5 w-5 text-blue-500" />
-                <span className="font-bold bg-gradient-to-r from-blue-500 to-purple-500 bg-clip-text text-transparent">
-                  Scanstream
-                </span>
-              </div>
-              <p className="text-sm text-muted-foreground">
-                Professional trading terminal for cryptocurrency markets.
-              </p>
-            </div>
-            <div>
-              <h3 className="font-semibold mb-4">Product</h3>
-              <ul className="space-y-2 text-sm text-muted-foreground">
-                <li><a href="#features" className="hover:text-foreground transition-colors">Features</a></li>
-                <li><a href="#benefits" className="hover:text-foreground transition-colors">Benefits</a></li>
-                <li><a href="#pricing" className="hover:text-foreground transition-colors">Pricing</a></li>
-              </ul>
-            </div>
-            <div>
-              <h3 className="font-semibold mb-4">Resources</h3>
-              <ul className="space-y-2 text-sm text-muted-foreground">
-                <li><a href="#" className="hover:text-foreground transition-colors">Documentation</a></li>
-                <li><a href="#" className="hover:text-foreground transition-colors">API Reference</a></li>
-                <li><a href="#" className="hover:text-foreground transition-colors">Guides</a></li>
-              </ul>
-            </div>
-            <div>
-              <h3 className="font-semibold mb-4">Company</h3>
-              <ul className="space-y-2 text-sm text-muted-foreground">
-                <li><a href="#" className="hover:text-foreground transition-colors">About</a></li>
-                <li><a href="#" className="hover:text-foreground transition-colors">Contact</a></li>
-                <li><a href="#" className="hover:text-foreground transition-colors">Terms</a></li>
-              </ul>
-            </div>
-          </div>
-          <div className="border-t pt-8 flex flex-col md:flex-row items-center justify-between gap-4">
-            <p className="text-sm text-muted-foreground" data-testid="text-footer">
-              © 2024 Scanstream. All rights reserved.
-            </p>
-            <div className="flex gap-4 text-sm text-muted-foreground">
-              <a href="#" className="hover:text-foreground transition-colors">Privacy</a>
-              <a href="#" className="hover:text-foreground transition-colors">Terms</a>
-              <a href="#" className="hover:text-foreground transition-colors">Cookies</a>
-            </div>
-          </div>
+      <footer className="border-t border-white/10 py-12 bg-black">
+        <div className="max-w-7xl mx-auto px-6 text-center text-zinc-500 text-sm">
+          © 2026 Scanstream • Built as a serious autonomous trading platform
         </div>
       </footer>
     </div>

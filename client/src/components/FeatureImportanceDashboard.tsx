@@ -1,13 +1,15 @@
 import { useState, useEffect } from 'react';
-import { useQuery, useMutation } from '@tanstack/react-query';
+import { useMutation } from '@tanstack/react-query';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Progress } from '@/components/ui/progress';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
-import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell } from 'recharts';
+// moved Recharts primitives into BarChartCoreImpl; avoid importing recharts here to keep bundle small
+import BarChartCore from './charts/BarChartCore';
 import { Trash2, Plus, FlaskConical, TrendingUp, Activity, Zap } from 'lucide-react';
 import { queryClient, apiRequest } from '@/lib/queryClient';
+import { useFeatureImportance, useFeatureSets } from '@/lib/hooks';
 
 interface FeatureImportance {
   featureName: string;
@@ -31,13 +33,8 @@ interface FeatureSet {
 export function FeatureImportanceDashboard() {
   const [selectedTab, setSelectedTab] = useState('importance');
 
-  const { data: importanceData, isLoading: loadingImportance } = useQuery<{ data: FeatureImportance[] }>({
-    queryKey: ['/api/feature-engineering/importance']
-  });
-
-  const { data: featureSetsData, isLoading: loadingSets } = useQuery<{ data: FeatureSet[] }>({
-    queryKey: ['/api/feature-engineering/feature-sets']
-  });
+  const importanceQ = useFeatureImportance();
+  const featureSetsQ = useFeatureSets();
 
   const pruneMutation = useMutation({
     mutationFn: () => apiRequest('POST', '/api/feature-engineering/prune'),
@@ -54,8 +51,8 @@ export function FeatureImportanceDashboard() {
     }
   });
 
-  const features = importanceData?.data || [];
-  const featureSets = featureSetsData?.data || [];
+  const features = importanceQ.data?.data || [];
+  const featureSets = featureSetsQ.data?.data || [];
 
   const topFeatures = features.slice(0, 15);
   const lowFeatures = features.slice(-10).reverse();
@@ -167,8 +164,10 @@ export function FeatureImportanceDashboard() {
               <CardTitle>Top Performing Features</CardTitle>
             </CardHeader>
             <CardContent>
-              {loadingImportance ? (
+              {importanceQ.isLoading ? (
                 <div className="flex justify-center py-8">Loading...</div>
+              ) : importanceQ.isError ? (
+                <div className="text-sm text-destructive">Failed to load importance: {String((importanceQ.error as Error)?.message)}</div>
               ) : (
                 <div className="space-y-3">
                   {topFeatures.map((feature, idx) => (
@@ -203,20 +202,18 @@ export function FeatureImportanceDashboard() {
               <CardTitle>Feature Importance Chart</CardTitle>
             </CardHeader>
             <CardContent>
-              <div className="h-[400px]">
-                <ResponsiveContainer width="100%" height="100%">
-                  <BarChart data={chartData} layout="vertical" margin={{ left: 100 }}>
-                    <CartesianGrid strokeDasharray="3 3" opacity={0.3} />
-                    <XAxis type="number" domain={[0, 100]} />
-                    <YAxis type="category" dataKey="name" tick={{ fontSize: 12 }} />
-                    <Tooltip />
-                    <Bar dataKey="importance" name="Importance %" radius={[0, 4, 4, 0]}>
-                      {chartData.map((entry, index) => (
-                        <Cell key={`cell-${index}`} fill={getImportanceColor(entry.importance / 100)} />
-                      ))}
-                    </Bar>
-                  </BarChart>
-                </ResponsiveContainer>
+                <div className="h-[400px]">
+                <BarChartCore
+                  data={chartData}
+                  dataKey="importance"
+                  layout="vertical"
+                  height={400}
+                  cellColors={chartData.map((entry) => getImportanceColor(entry.importance / 100))}
+                  barProps={{ radius: [0, 4, 4, 0] }}
+                  xAxisProps={{ type: 'number', domain: [0, 100] }}
+                  yAxisProps={{ type: 'category', dataKey: 'name', tick: { fontSize: 12 } }}
+                  gridProps={{ strokeDasharray: '3 3', opacity: 0.3 }}
+                />
               </div>
             </CardContent>
           </Card>

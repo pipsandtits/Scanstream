@@ -1,5 +1,6 @@
 import { Router, Request, Response } from 'express';
-import { PrismaClient } from '@prisma/client';
+import pkg from '@prisma/client';
+const { PrismaClient } = pkg as any;
 
 const router = Router();
 const prisma = new PrismaClient();
@@ -26,7 +27,7 @@ router.get('/', isAuthenticated, async (req: any, res: Response) => {
     });
 
     // Group by symbol for compatibility
-    const grouped = watchlistEntries.reduce((acc: any, entry) => {
+    const grouped = watchlistEntries.reduce((acc: any, entry: any) => {
       if (!acc[entry.symbol]) {
         acc[entry.symbol] = [];
       }

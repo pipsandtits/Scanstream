@@ -7,6 +7,7 @@
 
 import { EventEmitter } from 'events';
 import { BaseAgent } from './base-agent';
+import { storage } from '../storage';
 import type { WorldTick } from '../types/market-data';
 import type { CrossExchangeAggregator } from '../services/aggregator/cross-exchange-aggregator';
 import type HealingService from '../services/aggregator/healing-service';
@@ -15,6 +16,9 @@ export class PortfolioAgent extends BaseAgent {
   private positions: Map<string, Record<string, number>> = new Map(); // symbol -> exchange -> size
   private balances: Map<string, Record<string, number>> = new Map(); // exchange -> asset -> amount
   private pausedSymbols: Set<string> = new Set();
+  // Per-symbol healing throttle (milliseconds)
+  private lastHealingTime: Map<string, number> = new Map();
+  private healingCooldownMs = 30_000; // configurable cooldown (30s)
 
   constructor(gate: EventEmitter, private aggregator: CrossExchangeAggregator, private healing?: any) {
     super(gate, 'PortfolioAgent');
@@ -28,12 +32,19 @@ export class PortfolioAgent extends BaseAgent {
         if (g && g.symbol) {
           // When a gap is detected, consult HealingService if available
           if (this.healing) {
-            const synthetic = this.healing.forwardFill(g.symbol, this.aggregator as any);
-            if (synthetic && synthetic.confidence >= 50) {
-              console.log(`[PortfolioAgent] Healing available for ${g.symbol} confidence=${synthetic.confidence} — allowing limited trading`);
+            const now = Date.now();
+            const last = this.lastHealingTime.get(g.symbol) || 0;
+            if (now - last < this.healingCooldownMs) {
+              console.log(`[PortfolioAgent] Skipping healing for ${g.symbol} (cooldown)`);
             } else {
-              this.pausedSymbols.add(g.symbol);
-              console.warn(`[PortfolioAgent] Pausing trading for ${g.symbol} due to gap detected (severity=${g.severity || 'unknown'})`);
+              const synthetic = this.healing.forwardFill(g.symbol, this.aggregator as any);
+              this.lastHealingTime.set(g.symbol, now);
+              if (synthetic && synthetic.confidence >= 50) {
+                console.log(`[PortfolioAgent] Healing available for ${g.symbol} confidence=${synthetic.confidence} — allowing limited trading`);
+              } else {
+                this.pausedSymbols.add(g.symbol);
+                console.warn(`[PortfolioAgent] Pausing trading for ${g.symbol} due to gap detected (severity=${g.severity || 'unknown'})`);
+              }
             }
           } else {
             this.pausedSymbols.add(g.symbol);
@@ -140,6 +151,24 @@ export class PortfolioAgent extends BaseAgent {
     }
 
     console.log(`[PortfolioAgent] Applied fill on ${exchange} ${symbol} ${fill.side} size=${fill.executedSize} price=${fill.avgPrice}`);
+
+    // Emit a lightweight decision snapshot for audit and tracing
+    try {
+      const traceId = fill.correlationId ?? fill.traceId ?? null;
+      const prePositions = Object.assign({}, pos);
+      const snapshot = {
+        traceId,
+        timestamp: new Date(),
+        agents: ['PortfolioAgent'],
+        contributions: { executedSize: fill.executedSize, side: fill.side },
+        positionSizing: { estimatedCost: (fill.avgPrice || 0) * (fill.executedSize || 0) },
+        marketFrameId: fill.marketFrameId ?? null,
+        extra: { prePositions, postPositions: pos, balance: this.balances.get(exchange) }
+      } as any;
+      storage.createDecisionSnapshot(snapshot).catch((e: any) => { console.warn('[PortfolioAgent] createDecisionSnapshot failed', e); });
+    } catch (err) {
+      console.warn('[PortfolioAgent] Failed to emit decision snapshot', (err as any)?.message || err);
+    }
   }
 
   private onArbSignal(sig: any): void {

@@ -11,7 +11,7 @@
 
 import React, { useState } from 'react';
 import { BarChart3, CheckCircle, AlertCircle, TrendingUp, Zap, Settings, Download, Play } from 'lucide-react';
-import { LineChart, Line, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, ScatterChart, Scatter } from 'recharts';
+// Recharts not required here; heavy chart libs are lazy-loaded by chart-specific components
 
 interface CapabilityMetrics {
   returnImprovement: number;

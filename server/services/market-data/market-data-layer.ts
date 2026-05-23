@@ -24,11 +24,17 @@ import { MarketDataIntegrityChecker } from './integrity-checker';
 import { storage } from '../../storage';
 import { EventEmitter } from 'events';
 import { getRegimeService } from '../regime-service';
+import { symbolManager } from '../symbol-manager';
+import type { SymbolRuntimeState } from '../../types/symbol-universe';
 
 export class MarketDataLayer extends EventEmitter implements WorldState {
   private adapters: Map<string, MarketDataAdapter>;
   private integrity: MarketDataIntegrityChecker;
   private adapterPriority: string[];
+  // Concurrency control
+  private maxConcurrentRequests = 5;
+  private activeRequests = 0;
+  private requestQueue: Array<() => void> = [];
 
   constructor(
     adapters: Map<string, MarketDataAdapter>,
@@ -40,6 +46,31 @@ export class MarketDataLayer extends EventEmitter implements WorldState {
     
     // Default priority: try adapters in order
     this.adapterPriority = adapterPriority || Array.from(adapters.keys());
+  }
+
+  setConcurrency(n: number): void {
+    this.maxConcurrentRequests = Math.max(1, Math.floor(n));
+    console.log(`[MDL] concurrency set to ${this.maxConcurrentRequests}`);
+  }
+
+  private async acquireSlot(): Promise<void> {
+    if (this.activeRequests < this.maxConcurrentRequests) {
+      this.activeRequests++;
+      return;
+    }
+
+    return new Promise(resolve => {
+      this.requestQueue.push(() => {
+        this.activeRequests++;
+        resolve();
+      });
+    });
+  }
+
+  private releaseSlot(): void {
+    this.activeRequests = Math.max(0, this.activeRequests - 1);
+    const next = this.requestQueue.shift();
+    if (next) next();
   }
 
   /**
@@ -60,20 +91,27 @@ export class MarketDataLayer extends EventEmitter implements WorldState {
     limit?: number,
     adapterHint?: string
   ): Promise<Candle[]> {
+    await this.acquireSlot();
+    const start = Date.now();
     // Select adapter
     const adapter = this.selectAdapter(adapterHint);
     if (!adapter) {
-      throw new Error('No market data adapters available');
+      const err = new Error('No market data adapters available');
+      this.emit('metrics', { adapter: adapterHint || 'none', latency: Date.now() - start, success: false, error: err.message });
+      this.releaseSlot();
+      throw err;
     }
 
     // Fetch raw candles
     console.log(`[MDL] Fetching ${symbol} ${timeframe}s from ${adapter.venue}`);
-    const rawCandles = await adapter.fetchOHLCV(
-      symbol,
-      timeframe,
-      since,
-      limit
-    );
+    let rawCandles: Candle[] = [];
+    try {
+      rawCandles = await adapter.fetchOHLCV(symbol, timeframe, since, limit);
+    } catch (err: any) {
+      this.emit('metrics', { adapter: adapter.venue || adapterHint || 'unknown', latency: Date.now() - start, success: false, error: (err && err.message) || String(err) });
+      this.releaseSlot();
+      throw err;
+    }
 
     // Validate integrity
     console.log(
@@ -119,8 +157,23 @@ export class MarketDataLayer extends EventEmitter implements WorldState {
         `[MDL] Validation failed for ${symbol}, but returning candles anyway`
       );
     }
+    // Emit metrics about fetch
+    this.emit('metrics', { adapter: adapter.venue || adapterHint || 'unknown', latency: Date.now() - start, success: true, candles: result.candles.length });
+    this.releaseSlot();
 
     return result.candles;
+  }
+
+  /**
+   * Batch fetch multiple symbols/timeframes (concurrent, bounded by concurrency)
+   */
+  async batchFetchAndValidate(requests: Array<{ symbol: string; timeframe: number; since?: number; limit?: number; adapterHint?: string }>) {
+    const promises = requests.map(r => this.fetchAndValidate(r.symbol, r.timeframe, r.since, r.limit, r.adapterHint).then(
+      data => ({ ok: true, data, req: r }),
+      err => ({ ok: false, error: err, req: r })
+    ));
+
+    return Promise.all(promises);
   }
 
   /**
@@ -232,44 +285,107 @@ export class MarketDataLayer extends EventEmitter implements WorldState {
   }
 
   /**
+   * Build an enriched runtime state for a symbol by combining SymbolManager hints
+   * with live adapter health and recent market volume.
+   */
+  async getSymbolRuntimeState(symbol: string, currentMode: 'LIVE' | 'REPLAY' = 'LIVE'): Promise<SymbolRuntimeState | null> {
+    const base = symbolManager.getRuntimeState(symbol, currentMode as any);
+    if (!base) return null;
+
+    // Determine venue availability: any adapter that supports this symbol and is healthy
+    let venueAvailable = false;
+    try {
+      for (const [venue, adapter] of this.adapters.entries()) {
+        // If this symbol is listed for this venue
+        const symDef = symbolManager.getSymbol(symbol);
+        if (symDef && symDef.venues && Object.prototype.hasOwnProperty.call(symDef.venues, venue)) {
+          if (adapter.getHealth) {
+            try {
+              const h = await adapter.getHealth();
+              if (h.healthy) { venueAvailable = true; break; }
+            } catch (err) {
+              // ignore individual adapter errors
+            }
+          } else {
+            // No health endpoint - assume adapter present
+            venueAvailable = true;
+            break;
+          }
+        }
+      }
+    } catch (err) {
+      // Non-fatal
+      console.warn('[MDL] getSymbolRuntimeState adapter health check failed:', (err as any)?.message || err);
+    }
+
+    // Estimate liquidity using recent candles (hourly window if available)
+    let liquidityState: 'HIGH' | 'MEDIUM' | 'LOW' = base.liquidityState;
+    try {
+      const recent = await this.getSnapshot(symbol, 3600, 24).catch(() => []);
+      const totalVol = recent.reduce((acc, c) => acc + (c.volume || 0), 0);
+      const avgVol = recent.length ? totalVol / recent.length : 0;
+      if (avgVol >= 1_000_000) liquidityState = 'HIGH';
+      else if (avgVol >= 10_000) liquidityState = 'MEDIUM';
+      else liquidityState = 'LOW';
+      // Update popularity score with a bounded metric
+      symbolManager.setPopularity(symbol, Math.min(10_000_000_000, Math.round(avgVol)));
+    } catch (err) {
+      // ignore
+    }
+
+    const enriched: SymbolRuntimeState = {
+      ...base,
+      venueAvailable,
+      liquidityState,
+      isTradeable: base.isMarketOpen && venueAvailable && liquidityState !== 'LOW' && !!base.meta,
+      lastTradeTs: (await this.getLatest(symbol, 60))?.ts || base.lastTradeTs,
+      lastQuoteTs: (await this.getLatest(symbol, 1))?.ts || base.lastQuoteTs,
+      estimatedSpread: undefined,
+      meta: base.meta,
+    };
+
+    return enriched;
+  }
+
+  /**
    * Select an adapter
    * Priority: explicit hint > priority list > first available
    */
   private selectAdapter(hint?: string): MarketDataAdapter | undefined {
     if (hint) {
       const adapter = this.adapters.get(hint);
-      if (adapter) {
-        return adapter;
-      }
-      console.warn(`[MDL] Adapter hint ${hint} not found, using priority list`);
+      if (adapter) return adapter;
+      console.warn(`[MDL] Adapter hint '${hint}' not found in adapters map; falling back to priority list.`);
     }
 
-    // Use priority order
+    // Use configured priority list
     for (const venue of this.adapterPriority) {
       const adapter = this.adapters.get(venue);
       if (adapter) {
+        console.log(`[MDL] selectAdapter -> using priority adapter '${venue}'`);
         return adapter;
       }
     }
 
-    // Fallback: return any adapter
-    return this.adapters.values().next().value;
+    // Fallback: pick any adapter but log clearly
+    const any = this.adapters.values().next();
+    if (!any.done) {
+      console.warn('[MDL] No adapter in priority list available, using first registered adapter');
+      return any.value;
+    }
+
+    console.error('[MDL] No adapters available (empty map)');
+    return undefined;
   }
 
   /**
    * Merge two candle arrays, removing duplicates
    */
   private mergeCandles(existing: Candle[], new_: Candle[]): Candle[] {
-    const merged = [...existing];
-    const existingTimestamps = new Set(existing.map(c => c.ts));
-
-    for (const candle of new_) {
-      if (!existingTimestamps.has(candle.ts)) {
-        merged.push(candle);
-      }
-    }
-
-    // Sort by timestamp
+    const map = new Map<number, Candle>();
+    for (const c of existing) map.set(c.ts, c);
+    for (const c of new_) map.set(c.ts, c);
+    const merged = Array.from(map.values());
     return merged.sort((a, b) => a.ts - b.ts);
   }
 }

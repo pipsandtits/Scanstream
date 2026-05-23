@@ -2,10 +2,11 @@
 import React, { useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { ArrowLeft, Brain, Target, Shield, TrendingUp, Activity, Zap } from 'lucide-react';
-import { useLocation } from 'wouter';
+import { useNavigate } from 'react-router-dom';
 import { useTheme } from '../contexts/ThemeContext';
 import { useSymbolUniverse } from '../hooks/useSymbolUniverse';
-import { LineChart, Line, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
+import { Suspense, lazy } from 'react';
+const RLTrainingPerformanceChart = lazy(() => import('@/components/RLTrainingPerformanceChart'));
 import { formatPct, formatMetric, formatQuantity } from '@/utils/formatting';
 
 interface RLSignal {
@@ -34,7 +35,7 @@ interface RLStats {
 }
 
 export default function RLPositionAgent() {
-  const [, setLocation] = useLocation();
+  const navigate = useNavigate();
   const { colors } = useTheme();
   const { symbols: universeSymbols } = useSymbolUniverse();
   const [selectedSymbol, setSelectedSymbol] = useState('BTC/USDT');
@@ -85,7 +86,7 @@ export default function RLPositionAgent() {
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
           <div className="flex items-center justify-between h-16">
             <button
-              onClick={() => setLocation('/')}
+              onClick={() => navigate('/')}
               className="flex items-center transition-all hover:translate-x-[-2px]"
               style={{ color: colors.textSecondary }}
             >
@@ -180,20 +181,9 @@ export default function RLPositionAgent() {
           {statsLoading ? (
             <div className="animate-pulse h-64 rounded-lg" style={{ backgroundColor: colors.surface }} />
           ) : (
-            <ResponsiveContainer width="100%" height={300}>
-              <LineChart data={statsData?.stats?.recentPerformance || []}>
-                <CartesianGrid strokeDasharray="3 3" stroke={colors.border} />
-                <XAxis dataKey="episode" stroke={colors.textSecondary} />
-                <YAxis stroke={colors.textSecondary} />
-                <Tooltip
-                  contentStyle={{ backgroundColor: colors.surface, border: `1px solid ${colors.border}`, borderRadius: '8px' }}
-                  labelStyle={{ color: colors.text }}
-                />
-                <Legend />
-                <Line type="monotone" dataKey="reward" stroke={colors.accent} strokeWidth={2} name="Episode Reward" />
-                <Line type="monotone" dataKey="avgReturn" stroke={colors.success} strokeWidth={2} strokeDasharray="5 5" name="Avg Return" />
-              </LineChart>
-            </ResponsiveContainer>
+            <Suspense fallback={<div className="h-64 flex items-center justify-center">Loading chart…</div>}>
+              <RLTrainingPerformanceChart data={statsData?.stats?.recentPerformance || []} colors={colors} />
+            </Suspense>
           )}
         </div>
 

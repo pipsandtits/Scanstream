@@ -4,6 +4,7 @@ import path from 'path';
 import fs from 'fs/promises';
 import { Request, Response } from 'express'; // Ensure Request and Response are imported
 import { storage } from '../storage';
+import { formatError } from '../utils/logger';
 
 const router = Router();
 
@@ -367,8 +368,9 @@ router.get('/backtest/results', async (req: Request, res: Response) => {
 
     res.json({ results: enrichedResults });
   } catch (error: any) {
-    console.error('Failed to fetch backtest results:', error);
-    res.status(500).json({ error: error.message });
+    const fe = formatError(error);
+    console.error('Failed to fetch backtest results:', fe.message, { stack: fe.stack });
+    res.status(500).json({ error: fe.message });
   }
 });
 
@@ -514,8 +516,9 @@ router.post('/backtest/run', async (req: Request, res: Response) => {
       },
     });
   } catch (error: any) {
-    console.error('Failed to run backtest:', error);
-    res.status(500).json({ error: error.message || 'Failed to run backtest' });
+    const fe = formatError(error);
+    console.error('Failed to run backtest:', fe.message, { stack: fe.stack });
+    res.status(500).json({ error: fe.message || 'Failed to run backtest' });
   }
 });
 
@@ -526,8 +529,9 @@ router.delete('/backtest/:id', async (req: Request, res: Response) => {
     await storage.deleteBacktestResult(id);
     res.json({ success: true });
   } catch (error: any) {
-    console.error('Failed to delete backtest:', error);
-    res.status(500).json({ error: error.message });
+    const fe = formatError(error);
+    console.error('Failed to delete backtest:', fe.message, { stack: fe.stack });
+    res.status(500).json({ error: fe.message });
   }
 });
 
@@ -543,7 +547,8 @@ router.get('/:id', async (req: Request, res: Response) => {
 
     res.json({ success: true, strategy });
   } catch (error) {
-    console.error('Error fetching strategy:', error);
+    const fe = formatError(error);
+    console.error('Error fetching strategy:', fe.message, { stack: fe.stack });
     res.status(500).json({ success: false, error: 'Failed to fetch strategy' });
   }
 });
@@ -599,7 +604,8 @@ router.post('/enhanced-bounce/execute', async (req: Request, res: Response) => {
       }
     });
   } catch (error) {
-    console.error('Error executing enhanced bounce strategy:', error);
+    const fe = formatError(error);
+    console.error('Error executing enhanced bounce strategy:', fe.message, { stack: fe.stack });
     res.status(500).json({ success: false, error: 'Failed to execute enhanced bounce strategy' });
   }
 });
@@ -653,7 +659,8 @@ router.post('/:id/execute', async (req: Request, res: Response) => {
       }
     });
   } catch (error) {
-    console.error('Error executing strategy:', error);
+    const fe = formatError(error);
+    console.error('Error executing strategy:', fe.message, { stack: fe.stack });
     res.status(500).json({ success: false, error: 'Failed to execute strategy' });
   }
 });
@@ -683,7 +690,8 @@ router.post('/bounce/backtest', async (req: Request, res: Response) => {
       }
     });
   } catch (error) {
-    console.error('Error backtesting enhanced bounce strategy:', error);
+    const fe = formatError(error);
+    console.error('Error backtesting enhanced bounce strategy:', fe.message, { stack: fe.stack });
     res.status(500).json({ success: false, error: 'Failed to backtest enhanced bounce strategy' });
   }
 });
@@ -701,7 +709,8 @@ router.post('/consensus', async (req: Request, res: Response) => {
       consensus: result
     });
   } catch (error) {
-    console.error('Error generating consensus:', error);
+    const fe = formatError(error);
+    console.error('Error generating consensus:', fe.message, { stack: fe.stack });
     res.status(500).json({ success: false, error: 'Failed to generate consensus' });
   }
 });
@@ -731,7 +740,8 @@ router.post('/:id/backtest', async (req: Request, res: Response) => {
       }
     });
   } catch (error) {
-    console.error('Error backtesting strategy:', error);
+    const fe = formatError(error);
+    console.error('Error backtesting strategy:', fe.message, { stack: fe.stack });
     res.status(500).json({ success: false, error: 'Failed to backtest strategy' });
   }
 });
@@ -921,7 +931,8 @@ router.post('/execute-all', async (req: Request, res: Response) => {
             success: result.success
           });
         } catch (error) {
-          console.error(`Error executing ${strategy.name} on ${symbol}:`, error);
+          const fe = formatError(error);
+          console.error(`Error executing ${strategy.name} on ${symbol}: ${fe.message}`, { stack: fe.stack });
         }
       }
     }
@@ -932,7 +943,8 @@ router.post('/execute-all', async (req: Request, res: Response) => {
       totalSignals: results.filter(r => r.signal !== 'HOLD').length
     });
   } catch (error) {
-    console.error('Error executing strategies:', error);
+    const fe = formatError(error);
+    console.error('Error executing strategies:', fe.message, { stack: fe.stack });
     res.status(500).json({ success: false, error: 'Failed to execute strategies' });
   }
 });

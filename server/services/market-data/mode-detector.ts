@@ -56,6 +56,10 @@ export class ModeDetector {
   private readonly liveThreshold = 2000; // < 2s = LIVE
   private readonly replayThreshold = 60000; // > 60s = REPLAY
   private readonly wsThreshold = 80; // > 80% WS = LIVE (if recent)
+  // Hysteresis to avoid rapid flip-flopping
+  private previousStableMode: OperationMode | null = null;
+  private stabilityCounter = 0;
+  private hysteresisThreshold = 3; // require N consecutive detections to flip
 
   private constructor() {}
 
@@ -64,6 +68,10 @@ export class ModeDetector {
       ModeDetector.instance = new ModeDetector();
     }
     return ModeDetector.instance;
+  }
+
+  setHysteresisThreshold(n: number): void {
+    this.hysteresisThreshold = Math.max(1, Math.floor(n));
   }
 
   /**
@@ -97,9 +105,18 @@ export class ModeDetector {
       console.log('[ModeDetector] ✅ REST backfill complete');
       
       // Initialize LIVE epoch when backfill finishes
-      const { getLiveEpoch } = require('./integrity-gate');
-      const liveEpoch = getLiveEpoch();
-      liveEpoch.initializeLiveStart();
+      // Use dynamic import to avoid circular require issues in ESM contexts
+      (async () => {
+        try {
+          const mod = await import('./integrity-gate');
+          if (mod && typeof mod.getLiveEpoch === 'function') {
+            const liveEpoch = mod.getLiveEpoch();
+            try { liveEpoch.initializeLiveStart(); } catch (e) { /* ignore init errors */ }
+          }
+        } catch (e) {
+          // Non-fatal: initialization best-effort
+        }
+      })();
     }
   }
 
@@ -127,14 +144,32 @@ export class ModeDetector {
   detectMode(): OperationMode {
     const total = this.wsTickCount + this.restTickCount;
     const wsPercentage = total > 0 ? Math.round((this.wsTickCount / total) * 100) : 0;
+    const avgEmitLag =
+      this.emitLags.length > 0 ? Math.round(this.emitLags.reduce((a, b) => a + b, 0) / this.emitLags.length) : Infinity;
 
-    // If we have data and most is from WS, we're LIVE
-    if (total > 0 && wsPercentage > 50) {
-      return OperationMode.LIVE;
+    // More nuanced detection using backfill status, WS percentage and emit-lag
+    let candidate: OperationMode;
+
+    if (this.backfillComplete && wsPercentage > 75 && avgEmitLag < 1500) {
+      candidate = OperationMode.LIVE;
+    } else if (this.backfillComplete || wsPercentage > 40) {
+      candidate = OperationMode.MIXED;
+    } else {
+      candidate = OperationMode.REPLAY;
     }
 
-    // Otherwise MIXED (includes initial state)
-    return OperationMode.MIXED;
+    // Hysteresis: require stability across several assessments before flipping
+    if (this.previousStableMode === candidate) {
+      this.stabilityCounter = Math.min(this.hysteresisThreshold, this.stabilityCounter + 1);
+    } else {
+      this.stabilityCounter = 1;
+    }
+
+    if (this.stabilityCounter >= this.hysteresisThreshold) {
+      this.previousStableMode = candidate;
+    }
+
+    return this.previousStableMode || candidate;
   }
 
   /**

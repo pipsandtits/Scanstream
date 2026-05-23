@@ -17,6 +17,12 @@ export interface EntryTimingConfig {
   require_trend_formation?: boolean;
 }
 
+const DEFAULT_ENTRY_TIMING_CONFIG: Required<EntryTimingConfig> = {
+  max_confirmation_bars: 3,
+  min_confirmation_strength: 0.62,
+  require_trend_formation: true,
+};
+
 export interface ConfirmationHistory {
   bar_number: number;
   signal_strength: number;
@@ -64,12 +70,29 @@ export class EntryTimingOptimizer {
   private signalHistory: Map<string, ConfirmationHistory[]>;
 
   constructor(config: EntryTimingConfig = {}) {
-    this.config = {
-      max_confirmation_bars: config.max_confirmation_bars ?? 3,
-      min_confirmation_strength: config.min_confirmation_strength ?? 0.60,
-      require_trend_formation: config.require_trend_formation ?? true,
-    };
+    this.config = { ...DEFAULT_ENTRY_TIMING_CONFIG, ...config };
     this.signalHistory = new Map();
+  }
+
+  /**
+   * Adjust configuration heuristics based on market regime
+   */
+  adjustForRegime(currentRegime?: 'TRENDING' | 'RANGING' | 'VOLATILE' | string) {
+    if (!currentRegime) return;
+    if (currentRegime === 'TRENDING') {
+      // Give more time for confirmation in strong trends
+      this.config.max_confirmation_bars = Math.max(this.config.max_confirmation_bars, 5);
+      // allow slightly lower min strength when trend is strong
+      this.config.min_confirmation_strength = Math.max(0.58, Math.min(this.config.min_confirmation_strength, 0.9));
+    } else if (currentRegime === 'VOLATILE') {
+      // Be stricter in volatile markets
+      this.config.max_confirmation_bars = Math.min(this.config.max_confirmation_bars, 2);
+      this.config.min_confirmation_strength = Math.max(this.config.min_confirmation_strength, 0.65);
+    } else if (currentRegime === 'RANGING') {
+      // Ranging markets should confirm quickly
+      this.config.max_confirmation_bars = Math.min(this.config.max_confirmation_bars, 3);
+      this.config.min_confirmation_strength = Math.max(this.config.min_confirmation_strength, 0.60);
+    }
   }
 
   /**
@@ -81,15 +104,21 @@ export class EntryTimingOptimizer {
     signal_strength: number,
     cluster_strength: number,
     trend_formation: boolean,
-    bars_since_signal: number
+    bars_since_signal: number,
+    momentum_acceleration: number = 0,
+    volume_confirmation: number = 0,
+    currentRegime?: 'TRENDING' | 'RANGING' | 'VOLATILE' | string
   ): DelayedEntryDecision {
     const reasoning: string[] = [];
 
     // Get history for this signal
     let history = this.signalHistory.get(signal_id) || [];
 
-    // Determine if clusters confirm
-    const clusters_confirm = this._clustersConfirm(cluster_strength, trend_formation);
+    // Optionally adjust heuristics for current regime
+    this.adjustForRegime(currentRegime);
+
+    // Determine if clusters confirm (include momentum & volume confirmations)
+    const clusters_confirm = this._clustersConfirm(cluster_strength, trend_formation, momentum_acceleration, volume_confirmation);
 
     // Determine action
     let action: 'WAIT' | 'ENTER' | 'CANCEL';
@@ -147,9 +176,11 @@ export class EntryTimingOptimizer {
    */
   isEntryConfirmed(
     cluster_strength: number,
-    trend_formation: boolean
+    trend_formation: boolean,
+    momentum_acceleration: number = 0,
+    volume_confirmation: number = 0
   ): boolean {
-    return this._clustersConfirm(cluster_strength, trend_formation);
+    return this._clustersConfirm(cluster_strength, trend_formation, momentum_acceleration, volume_confirmation);
   }
 
   /**
@@ -269,12 +300,51 @@ export class EntryTimingOptimizer {
     };
   }
 
+  /**
+   * Return currently pending signals (still waiting for confirmation)
+   */
+  getPendingSignals(): Array<{
+    signal_id: string;
+    bars_waiting: number;
+    last_action: ConfirmationHistory['action'];
+    last_cluster_strength: number;
+    last_trend_formation: boolean;
+  }> {
+    const pending: Array<any> = [];
+    for (const [signal_id, history] of this.signalHistory.entries()) {
+      if (!history || history.length === 0) continue;
+      const last = history[history.length - 1];
+      if (last.action === 'WAIT') {
+        pending.push({
+          signal_id,
+          bars_waiting: last.bar_number,
+          last_action: last.action,
+          last_cluster_strength: last.cluster_strength,
+          last_trend_formation: last.trend_formation,
+        });
+      }
+    }
+    return pending;
+  }
+
   // Private helpers
 
-  private _clustersConfirm(cluster_strength: number, trend_formation: boolean): boolean {
+  private _clustersConfirm(
+    cluster_strength: number,
+    trend_formation: boolean,
+    momentum_acceleration: number = 0,
+    volume_confirmation: number = 0
+  ): boolean {
     const strength_ok = cluster_strength > this.config.min_confirmation_strength;
     const formation_ok = !this.config.require_trend_formation || trend_formation;
-    return strength_ok && formation_ok;
+
+    // Momentum acceleration: require small positive acceleration to be considered confirming
+    const momentum_ok = typeof momentum_acceleration === 'number' ? momentum_acceleration >= 0.01 : true;
+
+    // Volume confirmation: require at least moderate volume support if provided (0-1 scale)
+    const volume_ok = typeof volume_confirmation === 'number' && volume_confirmation > 0 ? volume_confirmation >= 0.55 : true;
+
+    return strength_ok && formation_ok && momentum_ok && volume_ok;
   }
 
   private _calculateConfidence(

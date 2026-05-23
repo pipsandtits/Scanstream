@@ -20,6 +20,7 @@ import type {
   SymbolLookupQuery,
   SymbolLookupResult,
   UniverseValidationRule,
+  SymbolRuntimeState,
 } from '../types/symbol-universe';
 import { AssetClass } from '../types/symbol-universe';
 
@@ -59,6 +60,12 @@ export class SymbolManager extends EventEmitter {
   // venue -> exchange-format -> canonical-symbol
   private venueMapping: Map<string, Map<string, string>> = new Map();
 
+  // Popularity / liquidity score for ordering watchlists
+  private popularity: Map<string, number> = new Map();
+
+  // Dependency graph for composite symbols (index -> components)
+  private dependencyGraph: Map<string, Set<string>> = new Map();
+
   constructor() {
     super();
     this.initializeValidationRules();
@@ -69,31 +76,43 @@ export class SymbolManager extends EventEmitter {
    * @throws if symbol already exists or validation fails
    */
   registerSymbol(symbol: Symbol): void {
-    const canonical = symbol.symbol;
+    const canonical = this.normalizeSymbol(symbol.symbol);
 
-    // Check for duplicates
+    // Normalize and canonicalize fields
+    const normalized: Symbol = {
+      ...symbol,
+      symbol: canonical,
+      base: symbol.base?.toUpperCase(),
+      quote: symbol.quote?.toUpperCase(),
+      createdAt: symbol.createdAt || Date.now(),
+    };
+
+    // Check for duplicates using canonical form
     if (this.symbols.has(canonical)) {
       throw new Error(`Symbol already registered: ${canonical}`);
     }
 
     // Validate
-    this.validate(symbol);
+    this.validate(normalized);
+
+    // If instrument has already expired, mark inactive immediately
+    if (normalized.metadata?.expirationDate && Date.now() > normalized.metadata.expirationDate) {
+      normalized.active = false;
+    }
 
     // Register
-    this.symbols.set(canonical, {
-      ...symbol,
-      createdAt: symbol.createdAt || Date.now(),
-    });
+    this.symbols.set(canonical, normalized);
 
     // Index by venue
-    for (const [venue, format] of Object.entries(symbol.venues)) {
+    for (const [venue, format] of Object.entries(normalized.venues)) {
       if (!this.venueMapping.has(venue)) {
         this.venueMapping.set(venue, new Map());
       }
       this.venueMapping.get(venue)!.set(format, canonical);
     }
 
-    // Emit event
+    // Emit specific event and generic change event
+    this.emit('symbol.added', { symbol: canonical, data: normalized });
     this.emitEvent({
       type: 'symbol.added',
       symbol: canonical,
@@ -130,7 +149,7 @@ export class SymbolManager extends EventEmitter {
    * Get symbol by canonical name
    */
   getSymbol(canonical: string): Symbol | undefined {
-    return this.symbols.get(canonical);
+    return this.symbols.get(this.normalizeSymbol(canonical));
   }
 
   /**
@@ -155,6 +174,57 @@ export class SymbolManager extends EventEmitter {
   }
 
   /**
+   * Build a runtime state snapshot for a canonical symbol.
+   * Returns `null` if symbol not found.
+   */
+  getRuntimeState(canonical: string, currentMode: 'LIVE' | 'REPLAY'): SymbolRuntimeState | null {
+    const s = this.getSymbol(canonical);
+    if (!s) return null;
+
+    const now = Date.now();
+
+    // Basic market-open heuristic: '24h' trading hours means always open.
+    const tradingHours = s.metadata?.tradingHours ?? '24h';
+    const isMarketOpen = tradingHours === '24h';
+
+    // Venue availability unknown at this layer — assume true (data layer should override)
+    const venueAvailable = true;
+
+    // Simple liquidity heuristic using volume24h
+    const vol = s.metadata?.volume24h ?? 0;
+    const liquidityState: 'HIGH' | 'MEDIUM' | 'LOW' = vol >= 1_000_000 ? 'HIGH' : vol >= 10_000 ? 'MEDIUM' : 'LOW';
+
+    const isTradeable = isMarketOpen && venueAvailable && liquidityState !== 'LOW' && !!s.active;
+
+    const meta = {
+      assetClass: s.assetClass,
+      precisionPrice: s.metadata.precisionPrice,
+      precisionSize: s.metadata.precisionSize,
+      custody: s.metadata.custody,
+      settlement: s.metadata.settlement,
+      settlementCurrency: s.metadata.settlementCurrency,
+      marginCurrency: s.metadata.marginCurrency,
+      instrumentType: s.instrumentType,
+      maxLeverage: s.metadata.maxLeverage,
+      contractMultiplier: s.metadata.contractMultiplier,
+      expirationDate: s.metadata.expirationDate,
+      minOrderValue: s.metadata.minOrderValue,
+    };
+
+    const runtime: SymbolRuntimeState = {
+      symbol: s.symbol,
+      isMarketOpen,
+      isTradeable,
+      venueAvailable,
+      liquidityState,
+      mode: currentMode,
+      meta,
+    };
+
+    return runtime;
+  }
+
+  /**
    * Lookup symbols by query
    */
   lookup(query: SymbolLookupQuery): SymbolLookupResult {
@@ -162,7 +232,7 @@ export class SymbolManager extends EventEmitter {
 
     // Filter by symbol (substring match)
     if (query.symbol) {
-      const q = query.symbol.toUpperCase();
+      const q = this.normalizeSymbol(query.symbol).toUpperCase();
       results = results.filter((s) =>
         s.symbol.toUpperCase().includes(q) ||
         s.base.toUpperCase().includes(q) ||
@@ -451,6 +521,136 @@ export class SymbolManager extends EventEmitter {
         severity: 'warn',
       },
     ];
+  }
+
+  /**
+   * Normalize symbol textual form into canonical format.
+   * - Uppercases
+   * - Replaces common separators (-, _) with '/'
+   * - Trims whitespace
+   */
+  private normalizeSymbol(raw: string): string {
+    if (!raw) return raw;
+    let s = raw.trim().toUpperCase();
+    // Replace underscores and dashes with slash for pair-like symbols
+    s = s.replace(/[-_]/g, '/');
+    // Collapse repeated slashes
+    s = s.replace(/\/+/g, '/');
+    // Remove surrounding slashes
+    s = s.replace(/^\/+|\/+$/g, '');
+    return s;
+  }
+
+  /**
+   * Public API: canonicalize a raw symbol string.
+   * Backwards-compatible alias for internal normalization.
+   */
+  public canonicalize(raw: string): string {
+    return this.normalizeSymbol(raw);
+  }
+
+  /**
+   * Public alias `normalize` for convenience in callsites.
+   */
+  public normalize(raw: string): string {
+    return this.normalizeSymbol(raw);
+  }
+
+  /**
+   * Set or update popularity score (higher = more popular)
+   * Used for default watchlist ordering and UI hints
+   */
+  setPopularity(canonical: string, score: number): void {
+    const key = this.normalizeSymbol(canonical);
+    this.popularity.set(key, score);
+  }
+
+  getPopularity(canonical: string): number {
+    return this.popularity.get(this.normalizeSymbol(canonical)) ?? 0;
+  }
+
+  /**
+   * Return a default watchlist ordered by popularity then 24h volume
+   */
+  getDefaultWatchlist(limit = 100): Symbol[] {
+    return Array.from(this.symbols.values())
+      .filter((s) => s.active)
+      .sort((a, b) => {
+        const pa = this.getPopularity(a.symbol) || 0;
+        const pb = this.getPopularity(b.symbol) || 0;
+        if (pa !== pb) return pb - pa;
+        const va = a.metadata?.volume24h || 0;
+        const vb = b.metadata?.volume24h || 0;
+        return vb - va;
+      })
+      .slice(0, limit);
+  }
+
+  /**
+   * Register a composite/index symbol and its components
+   */
+  registerCompositeSymbol(canonical: string, components: string[]): void {
+    const key = this.normalizeSymbol(canonical);
+    const set = new Set<string>();
+    for (const comp of components) {
+      const k = this.normalizeSymbol(comp);
+      if (!this.symbols.has(k)) {
+        throw new Error(`Component symbol not found: ${k}`);
+      }
+      set.add(k);
+    }
+    this.dependencyGraph.set(key, set);
+    this.emit('symbol.composite.registered', { symbol: key, components: Array.from(set) });
+  }
+
+  getDependencies(canonical: string): string[] {
+    return Array.from(this.dependencyGraph.get(this.normalizeSymbol(canonical)) || []);
+  }
+
+  /**
+   * Deactivate symbols that have expired (futures/options)
+   */
+  pruneExpiredSymbols(): string[] {
+    const now = Date.now();
+    const deactivated: string[] = [];
+    for (const [k, s] of this.symbols.entries()) {
+      const exp = s.metadata?.expirationDate;
+      if (exp && exp < now && s.active) {
+        this.updateSymbol(k, { active: false });
+        deactivated.push(k);
+      }
+    }
+    return deactivated;
+  }
+
+  /**
+   * Set or update the correlation group for a symbol.
+   */
+  setCorrelationGroup(canonical: string, groupName: string): void {
+    const key = this.normalizeSymbol(canonical);
+    const current = this.getSymbol(key);
+    if (!current) throw new Error(`Symbol not found: ${key}`);
+    this.updateSymbol(key, { metadata: { ...current.metadata, correlationGroup: groupName } });
+    this.emit('symbol.correlation.updated', { symbol: key, group: groupName });
+  }
+
+  getCorrelationGroup(canonical: string): string | undefined {
+    return this.getSymbol(canonical)?.metadata?.correlationGroup;
+  }
+
+  /**
+   * Set or update risk classification for a symbol
+   */
+  setRiskClassification(canonical: string, risk: 'high-vol' | 'safe-haven' | 'speculative' | 'stable' | 'leveraged') {
+    const key = this.normalizeSymbol(canonical);
+    const current = this.getSymbol(key);
+    if (!current) throw new Error(`Symbol not found: ${key}`);
+    this.updateSymbol(key, { metadata: { ...current.metadata, riskClassification: risk } });
+    this.emit('symbol.risk.updated', { symbol: key, risk });
+  }
+
+  getRiskClassification(canonical: string) {
+    return this.getSymbol(canonical)?.metadata?.riskClassification;
   }
 
   /**

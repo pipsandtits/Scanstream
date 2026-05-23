@@ -3,8 +3,6 @@ import { X, Copy, Play, Pause, TrendingUp, DollarSign, AlertCircle, CheckCircle,
 import {
   LineChart,
   Line,
-  AreaChart,
-  Area,
   XAxis,
   YAxis,
   CartesianGrid,
@@ -12,6 +10,7 @@ import {
   Legend,
   ResponsiveContainer,
 } from 'recharts';
+import AreaChartCore from './charts/AreaChartCore';
 
 interface CopiedStrategy {
   id: string;
@@ -394,27 +393,14 @@ export default function StrategyCopyTrading({ onClose }: StrategyCopyTradingProp
               {/* P&L Chart */}
               <div className="bg-slate-700/50 rounded-lg p-6 border border-slate-600">
                 <h3 className="text-lg font-semibold text-white mb-4">P&L Over Time</h3>
-                <ResponsiveContainer width="100%" height={250}>
-                  <AreaChart data={pnlHistory}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-                    <XAxis dataKey="date" stroke="#94a3b8" tick={{ fontSize: 12 }} />
-                    <YAxis stroke="#94a3b8" tick={{ fontSize: 12 }} />
-                    <Tooltip
-                      contentStyle={{
-                        backgroundColor: 'rgba(15, 23, 42, 0.95)',
-                        border: '1px solid rgba(100, 116, 139, 0.5)',
-                        borderRadius: '8px',
-                      }}
-                    />
-                    <Area
-                      type="monotone"
-                      dataKey="pnl"
-                      stroke={totalPnL >= 0 ? '#10b981' : '#ef4444'}
-                      fill={totalPnL >= 0 ? '#10b981' : '#ef4444'}
-                      fillOpacity={0.2}
-                    />
-                  </AreaChart>
-                </ResponsiveContainer>
+                  <AreaChartCore
+                    data={pnlHistory}
+                    dataKey="pnl"
+                    height={250}
+                    gradientId="pnlGradient"
+                    stroke={totalPnL >= 0 ? '#10b981' : '#ef4444'}
+                    fill={totalPnL >= 0 ? '#10b981' : '#ef4444'}
+                  />
               </div>
             </div>
           </div>

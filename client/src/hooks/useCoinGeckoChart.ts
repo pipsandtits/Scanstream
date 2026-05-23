@@ -17,7 +17,7 @@ export function useCoinGeckoChart(symbol: string, days: number = 90, extended: b
   
   return useQuery<ChartDataPoint[]>({
     queryKey: ['coingecko-chart', coinId, days, extended],
-    queryFn: async () => {
+    queryFn: async ({ signal }: any) => {
       if (!coinId) {
         console.warn(`[CoinGecko Chart] Unknown symbol: ${symbol}`);
         return [];
@@ -25,7 +25,7 @@ export function useCoinGeckoChart(symbol: string, days: number = 90, extended: b
       
       try {
         const url = `/api/coingecko/chart/${coinId}?days=${days}${extended ? '&extended=true' : ''}`;
-        const response = await fetch(url);
+        const response = await fetch(url, { signal });
         
         if (!response.ok) {
           throw new Error(`HTTP ${response.status}: ${response.statusText}`);
@@ -66,10 +66,9 @@ export function useCoinGeckoMLData(symbol: string) {
   
   return useQuery({
     queryKey: ['coingecko-ml-data', coinId],
-    queryFn: async () => {
+    queryFn: async ({ signal }: any) => {
       if (!coinId) return null;
-      
-      const response = await fetch(`/api/coingecko/chart/${coinId}/multi-timeframe`);
+      const response = await fetch(`/api/coingecko/chart/${coinId}/multi-timeframe`, { signal });
       if (!response.ok) throw new Error('Failed to fetch ML data');
       
       const result = await response.json();

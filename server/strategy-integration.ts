@@ -1,12 +1,20 @@
 
 import { MarketFrame, Signal } from '@shared/schema';
+import { symbolManager } from './services/symbol-manager';
 import { spawn } from 'child_process';
 import path from 'path';
 import { UnifiedRegimeDetector, RegimeDetectionResult, UnifiedRegimeType } from './services/unified-regime-system';
 import { RegimeConsolidationBridge } from './services/regime-consolidation-bridge';
 import { getAdaptiveConsensusWeights, calculateWeightedConsensusScore } from './rl-system-integration';
+import { getConfidenceScorer } from './services/market-data/confidence-scorer';
+import { liveVelocityCalculator } from './services/live-velocity-calculator';
 import { applyDecoupledPositionSizing } from './services/issue-1-decoupling-bridge';
 import { AgentCouncil, type CouncilVote } from './services/agent-council';
+import { storage } from './storage';
+import crypto from 'crypto';
+import { incrementDecision, incrementFallback } from './rl-metrics';
+import { ClusterValidator } from './services/clustering/cluster-validator';
+import type { ClusterMetrics, ClusterEnhancedEntry } from './services/clustering/cluster-validator';
 
 // ═════════════════════════════════════════════════════════════════════════════
 // RPG TRADING AGENTS (Council Members)
@@ -70,6 +78,9 @@ export interface SynthesizedSignal extends Signal {
     volumeMechanicalConfidence?: number;
   };
   volumeGateApproval?: boolean;
+  // Optional clustering outputs
+  clusterValidation?: ClusterEnhancedEntry;
+  clusterMetrics?: ClusterMetrics;
 }
 
 export class StrategyIntegrationEngine {
@@ -77,11 +88,114 @@ export class StrategyIntegrationEngine {
   private agentCouncil: AgentCouncil = new AgentCouncil();
   private volumePhysicsAgent: VolumePhysicsAgent | null = null;
   private volumeMechanicalAgent: VolumeMechanicalVerifierAgent | null = null;
+  // Lightweight runtime configuration (tweakable)
+  private readonly config = {
+    consensusWeights: { scanner: 0.30, ml: 0.28, rl: 0.20, council: 0.22 },
+    volumeVetoThreshold: 0.4,
+    maxPythonProcesses: 4,
+    signalAgeHalfLife: 5,
+    regimeCacheTtlMs: 30 * 1000,
+    volumeFailOpen: false, // when true, errors in gate allow through; when false, fail-closed (safer)
+    volumeVetoConfidenceMultiplier: 0.35,
+    pythonExecTimeoutMs: 20_000,
+    maxPythonStdoutBytes: 512 * 1024,
+  } as const;
+
+  // Simple semaphore for limiting concurrent Python processes
+  private pythonSemaphore = new (class Semaphore {
+    private queue: Array<() => void> = [];
+    private permits: number;
+    constructor(private maxPermits: number) {
+      this.permits = maxPermits;
+    }
+    async acquire() {
+      if (this.permits > 0) {
+        this.permits -= 1;
+        return;
+      }
+      await new Promise<void>(resolve => this.queue.push(resolve));
+    }
+    release() {
+      this.permits += 1;
+      const next = this.queue.shift();
+      if (next) {
+        this.permits -= 1;
+        next();
+      }
+    }
+    async withLock<T>(fn: () => Promise<T>) {
+      await this.acquire();
+      try {
+        return await fn();
+      } finally {
+        this.release();
+      }
+    }
+  })(this.config.maxPythonProcesses);
+
+  // Caches to avoid repeated heavy computation per timeframe / symbol
+  private regimeCache: Map<string, { ts: number; regime: MarketRegime }> = new Map();
+  private weightsCache: Map<string, { ts: number; weights: StrategyWeight[] }> = new Map();
+  private strategyResultCache: Map<string, { ts: number; result: any }> = new Map();
+  private cleanupTimer: NodeJS.Timeout | null = null;
+
+  private createCacheKey(symbol: string, timestamp: number, windowMs = this.config.regimeCacheTtlMs): string {
+    // Normalize symbol to canonical form for consistent cache keys
+    const canonical = symbolManager.canonicalize(symbol);
+    const window = Math.floor(timestamp / windowMs);
+    return `${canonical}:${window}`;
+  }
+
+  /**
+   * Apply lightweight adjustments to strategy multipliers based on velocity profile
+   */
+  private applyVelocityAdjustments(velProfile: any): void {
+    try {
+      // velProfile expected shape: has fields like '7D', '14D', etc. with vwAvgDollarMove and volatilityAdjustedPercent
+      const short = velProfile['7D'];
+      const mid = velProfile['14D'];
+      const long = velProfile['30D'];
+
+      // If we have a strong volume-weighted move on short horizons, favor trend/breakout strategies
+      const vwShort = short?.vwAvgDollarMove ?? 0;
+      const volAdjShort = short?.volatilityAdjustedPercent ?? 0;
+
+      if (vwShort > 0 && volAdjShort > 0) {
+        // Heuristic: if short-term VW avg move is large relative to median, boost trend/volume strategies
+        const boost = Math.min(1.5, 1 + Math.min(2, volAdjShort / 2));
+        const trendWeight = this.strategyWeights.get('gradient_trend_filter');
+        const volWeight = this.strategyWeights.get('volume_profile');
+        if (trendWeight) trendWeight.volatilityMultiplier *= boost;
+        if (volWeight) volWeight.volatilityMultiplier *= Math.min(1.6, boost * 1.1);
+      }
+
+      // If long-term volatility-adjusted velocity is low, favor mean-reversion
+      const volAdjLong = long?.volatilityAdjustedPercent ?? 0;
+      if (volAdjLong > 0 && volAdjLong < 0.8) {
+        const mr = this.strategyWeights.get('mean_reversion');
+        if (mr) mr.regimeMultiplier *= 1.2;
+      }
+
+      // If very high velocity on mid horizons, temper mean reversion
+      if (mid?.volatilityAdjustedPercent && mid.volatilityAdjustedPercent > 2.0) {
+        const mr = this.strategyWeights.get('mean_reversion');
+        if (mr) mr.regimeMultiplier *= 0.75;
+      }
+    } catch (err) {
+      console.warn('[Strategy] applyVelocityAdjustments error', err);
+    }
+  }
   
   constructor() {
     this.initializeStrategyWeights();
     this.initializeVolumeFrontline();
     this.initializeAgentCouncil();
+    // periodic cache cleanup
+    try {
+      this.cleanupTimer = setInterval(() => this.cleanupCaches(), this.config.regimeCacheTtlMs);
+    } catch (err) {
+      // ignore timer setup failures
+    }
   }
 
   /**
@@ -278,7 +392,17 @@ export class StrategyIntegrationEngine {
       };
     }
 
+    // Simple cache by symbol + time window to avoid repeated heavy calculations
     const latest = frames[frames.length - 1];
+    const symbol = (latest as any).symbol || 'unknown';
+    const windowId = Math.floor(new Date((latest as any).timestamp).getTime() / this.config.regimeCacheTtlMs);
+    const cacheKey = `${symbol}:${windowId}`;
+    const cached = this.regimeCache.get(cacheKey);
+    if (cached && (Date.now() - cached.ts) < this.config.regimeCacheTtlMs) {
+      return cached.regime;
+    }
+
+    // latest already defined above when using cache
     const prices = frames.slice(-30).map(f => (f.price as any).close);
     const volumes = frames.slice(-30).map(f => f.volume);
     
@@ -356,7 +480,7 @@ export class StrategyIntegrationEngine {
     
     const trend = avgMomentum > 0.02 ? 'up' : avgMomentum < -0.02 ? 'down' : 'sideways';
     
-    return {
+    const regimeObj: MarketRegime = {
       type: regimeType,
       volatility: volLevel,
       momentum: avgMomentum,
@@ -365,6 +489,13 @@ export class StrategyIntegrationEngine {
       unifiedConfidence: unifiedRegimeResult.confidence,
       unifiedStrength: unifiedRegimeResult.strength
     };
+    try {
+      // store cache keyed by symbol+window
+      this.regimeCache.set(cacheKey, { ts: Date.now(), regime: regimeObj });
+    } catch (err) {
+      // ignore cache failures
+    }
+    return regimeObj;
   }
 
   /**
@@ -497,6 +628,25 @@ export class StrategyIntegrationEngine {
     return Math.exp(-0.693 * signalAge / halfLife);
   }
 
+  private cleanupCaches(): void {
+    const now = Date.now();
+    try {
+      // remove old regime entries (10x TTL)
+      for (const [key, entry] of this.regimeCache.entries()) {
+        if (now - entry.ts > this.config.regimeCacheTtlMs * 10) this.regimeCache.delete(key);
+      }
+      for (const [key, entry] of this.weightsCache.entries()) {
+        if (now - entry.ts > this.config.regimeCacheTtlMs * 10) this.weightsCache.delete(key);
+      }
+      // strategy result cache: keep short lived (15s)
+      for (const [key, entry] of this.strategyResultCache.entries()) {
+        if (now - entry.ts > 30 * 1000) this.strategyResultCache.delete(key);
+      }
+    } catch (err) {
+      // ignore cleanup failures
+    }
+  }
+
   /**
    * Update final weights
    */
@@ -530,46 +680,89 @@ export class StrategyIntegrationEngine {
     timeframe: string,
     params: any
   ): Promise<any> {
-    return new Promise((resolve, reject) => {
-      const pythonScript = path.join(process.cwd(), 'strategies', 'executor.py');
-      
-      const args = [
-        pythonScript,
-        '--strategy', strategyId,
-        '--symbol', symbol,
-        '--timeframe', timeframe,
-        '--params', JSON.stringify(params || {})
-      ];
-      
-      // Use python from venv or fallback to python3
-      const pythonPath = process.env.VIRTUAL_ENV 
-        ? path.join(process.env.VIRTUAL_ENV, process.platform === 'win32' ? 'Scripts\\python.exe' : 'bin/python')
-        : 'python3';
-      
-      const python = spawn(pythonPath, args);
-      
-      let output = '';
-      let errorOutput = '';
-      
-      python.stdout.on('data', (data) => {
-        output += data.toString();
-      });
-      
-      python.stderr.on('data', (data) => {
-        errorOutput += data.toString();
-      });
-      
-      python.on('close', (code) => {
-        if (code !== 0) {
-          reject(new Error(`Strategy ${strategyId} failed: ${errorOutput}`));
-        } else {
-          try {
-            const result = JSON.parse(output);
-            resolve(result);
-          } catch (error) {
-            reject(new Error(`Failed to parse strategy output: ${output}`));
+    // Limit concurrent Python processes and add timeout + output validation
+    return this.pythonSemaphore.withLock(async () => {
+      return await new Promise((resolve, reject) => {
+        const pythonScript = path.join(process.cwd(), 'strategies', 'executor.py');
+
+        const args = [
+          pythonScript,
+          '--strategy', strategyId,
+          '--symbol', symbol,
+          '--timeframe', timeframe,
+          '--params', JSON.stringify(params || {})
+        ];
+
+        const pythonPath = process.env.VIRTUAL_ENV
+          ? path.join(process.env.VIRTUAL_ENV, process.platform === 'win32' ? 'Scripts\\python.exe' : 'bin/python')
+          : 'python3';
+
+        const proc = spawn(pythonPath, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+
+        let output = '';
+        let errorOutput = '';
+        let killed = false;
+
+        const killWith = (reason: string) => {
+          if (!killed) {
+            killed = true;
+            try { proc.kill(); } catch {}
+            reject(new Error(reason));
           }
-        }
+        };
+
+        const timer = setTimeout(() => {
+          killWith(`Strategy ${strategyId} timed out after ${this.config.pythonExecTimeoutMs}ms`);
+        }, this.config.pythonExecTimeoutMs);
+
+        proc.stdout.on('data', (data: Buffer) => {
+          output += data.toString();
+          if (output.length > this.config.maxPythonStdoutBytes) {
+            clearTimeout(timer);
+            killWith('Strategy stdout exceeded maximum allowed size');
+          }
+        });
+
+        proc.stderr.on('data', (data: Buffer) => {
+          errorOutput += data.toString();
+          if (errorOutput.length > this.config.maxPythonStdoutBytes) {
+            clearTimeout(timer);
+            killWith('Strategy stderr exceeded maximum allowed size');
+          }
+        });
+
+        proc.on('close', (code) => {
+          clearTimeout(timer);
+          if (killed) return; // already rejected
+          if (code !== 0) {
+            // avoid leaking raw stderr into logs; provide safe summary
+            const safeMsg = errorOutput ? (errorOutput.split('\n')[0].slice(0, 256)) : `exit code ${code}`;
+            return reject(new Error(`Strategy ${strategyId} failed: ${safeMsg}`));
+          }
+          try {
+              const parsed = JSON.parse(output || '{}');
+              // Basic validation: must be an object
+              if (typeof parsed !== 'object' || Array.isArray(parsed) || parsed === null) {
+                return reject(new Error('Invalid strategy output format'));
+              }
+              // Optional: ensure minimal expected fields
+              if (parsed.success === false) {
+                return reject(new Error('Strategy reported failure'));
+              }
+              if (typeof parsed.signal !== 'string' && parsed.signal !== undefined) {
+                return reject(new Error('Strategy output missing signal field'));
+              }
+              if (parsed.metadata && typeof parsed.metadata.confidence !== 'number') {
+                // micro-tolerant: coerce if possible
+                const c = Number(parsed.metadata.confidence);
+                if (Number.isFinite(c)) parsed.metadata.confidence = c;
+                else parsed.metadata.confidence = 0.5;
+              }
+              resolve(parsed);
+          } catch (err) {
+            return reject(new Error('Failed to parse strategy output as JSON'));
+          }
+        });
       });
     });
   }
@@ -587,18 +780,51 @@ export class StrategyIntegrationEngine {
     // ─── REGIME DETECTION & CONSOLIDATION ────────────────────────────────────
     // Unified regime detection with high-confidence regime classification
     const regime = this.detectMarketRegime(frames);
-    
-    // Calculate smart weights
-    this.calculateRegimeWeights(regime);
-    this.calculateVolatilityWeights(regime);
+
+    // Try to reuse recently calculated weights for same symbol/time window
+    try {
+      const latest = frames[frames.length - 1];
+      const sym = (latest as any).symbol || 'unknown';
+      const windowId = Math.floor(new Date((latest as any).timestamp).getTime() / this.config.regimeCacheTtlMs);
+      const weightsKey = `${sym}:${windowId}`;
+      const cached = this.weightsCache.get(weightsKey);
+      if (cached && (Date.now() - cached.ts) < this.config.regimeCacheTtlMs) {
+        // restore cached weights
+        this.strategyWeights = new Map(cached.weights.map(w => [w.strategyId, { ...w }] as [string, StrategyWeight]));
+      } else {
+        // Calculate smart weights
+        this.calculateRegimeWeights(regime);
+        this.calculateVolatilityWeights(regime);
+        // cache snapshot
+        this.weightsCache.set(weightsKey, { ts: Date.now(), weights: Array.from(this.strategyWeights.values()) });
+      }
+    } catch (err) {
+      // fallback: always calculate
+      this.calculateRegimeWeights(regime);
+      this.calculateVolatilityWeights(regime);
+    }
     
     // Execute all strategies in parallel
+    const now = Date.now();
     const strategyPromises = Array.from(this.strategyWeights.keys()).map(async (strategyId) => {
       try {
+        // strategy result short-term cache to avoid re-running Python frequently
+        const latest = frames[frames.length - 1];
+        const sym = (latest as any).symbol || 'unknown';
+        const windowId = Math.floor(new Date((latest as any).timestamp).getTime() / (15 * 1000)); // 15s strategy cache window
+        const key = `${strategyId}:${sym}:${windowId}`;
+        const cached = this.strategyResultCache.get(key);
+        if (cached && (now - cached.ts) < 15 * 1000) {
+          return { strategyId, result: cached.result };
+        }
         const result = await this.executeStrategy(strategyId, symbol, timeframe, {});
+        // cache safe results only
+        try {
+          this.strategyResultCache.set(key, { ts: Date.now(), result });
+        } catch (e) {}
         return { strategyId, result };
       } catch (error) {
-        console.error(`Strategy ${strategyId} failed:`, error);
+        console.error(`Strategy ${strategyId} failed:`, (error as any)?.message ?? error);
         return { strategyId, result: null };
       }
     });
@@ -615,6 +841,20 @@ export class StrategyIntegrationEngine {
     
     // Update final weights
     this.updateFinalWeights();
+
+    // Integrate velocity profile (live) to adjust strategy multipliers when available
+    try {
+      // non-blocking fetch with reasonable lookback — use 90D for profile
+      const velProfile = await liveVelocityCalculator.calculateLiveVelocityProfile(symbol, 90);
+      if (velProfile) {
+        this.applyVelocityAdjustments(velProfile);
+        // recalc final weights after adjustments
+        this.updateFinalWeights();
+      }
+    } catch (err) {
+      // velocity integration should not break synthesis
+      console.warn('[Strategy] Velocity integration failed:', (err as any)?.message ?? err);
+    }
     
     // ─── Get RL-adaptive consensus weights ─────────────────────────────────────
     // This replaces static 0.40/0.35/0.25 weights with RL-learned adaptive weights
@@ -664,6 +904,9 @@ export class StrategyIntegrationEngine {
       });
     }
     
+    // Attach or create correlationId for this synthesis
+    const correlationId = (frames[frames.length - 1] as any)?.correlationId ?? crypto.randomUUID();
+
     // ─── Collect AgentCouncil vote (4th source) ─────────────────────────────────
     const councilVote = this.agentCouncil.vote(frames, (regime.unifiedRegime as any) || 'RANGING');
     
@@ -671,46 +914,55 @@ export class StrategyIntegrationEngine {
     let councilScore = 0;
     if (councilVote.direction === 'BUY') councilScore = 1;
     else if (councilVote.direction === 'SELL') councilScore = -1;
+    try {
+      incrementDecision('COUNCIL', false);
+      try {
+        storage.createDecisionEvent({ correlationId, phase: 'COUNCIL', domain: 'AGENT_COUNCIL', actionPayload: councilVote, metrics: { activeAgents: councilVote.activeAgents, confidence: councilVote.confidence }, timestamp: Date.now() });
+      } catch (e) {}
+    } catch (err) {}
 
     // ─── DUAL VOLUME VETO GATES (Critical safety layer) ──────────────────────
     // Both VolumePhysics and VolumeMechanical must approve (or signal is held)
     let volumePhysicsApproval = false;
-    let volumeMechanicalApproval = true;
-    let volumePhysicsConfidence = 0.5;
-    let volumeMechanicalConfidence = 0.5;
-    
+    let volumeMechanicalApproval = false;
+    let volumePhysicsConfidence = 0.0;
+    let volumeMechanicalConfidence = 0.0;
+    const vetoThreshold = this.config.volumeVetoThreshold;
     try {
       if (this.volumePhysicsAgent) {
-        const physicsSignal = (this.volumePhysicsAgent as any).generateSignal(frames);
-        volumePhysicsConfidence = physicsSignal.confidence || 0.5;
-        // Physics agent approves if confidence > 0.4 (weak threshold for gate)
-        volumePhysicsApproval = volumePhysicsConfidence >= 0.4;
+        const physicsSignal = (this.volumePhysicsAgent as any).generateSignal(frames) || {};
+        volumePhysicsConfidence = physicsSignal.confidence ?? 0.0;
+        volumePhysicsApproval = volumePhysicsConfidence >= vetoThreshold;
       }
       if (this.volumeMechanicalAgent) {
-        const mechSignal = (this.volumeMechanicalAgent as any).processSignal({ ticks: frames });
-        volumeMechanicalConfidence = mechSignal.confidence || 0.5;
-        // Mechanical agent approves if confidence > 0.4 (weak threshold for gate)
-        volumeMechanicalApproval = volumeMechanicalConfidence >= 0.4;
+        const mechSignal = (this.volumeMechanicalAgent as any).processSignal({ ticks: frames }) || {};
+        volumeMechanicalConfidence = mechSignal.confidence ?? 0.0;
+        volumeMechanicalApproval = volumeMechanicalConfidence >= vetoThreshold;
       }
     } catch (err) {
-      console.warn(`[Strategy] Volume veto gate error:`, err);
-      // If veto gates fail, allow through (fail-open for safety)
-      volumePhysicsApproval = false;
-      volumeMechanicalApproval = true;
+      // Fail-closed by default: if an internal veto gate errors, veto the trade unless configured otherwise
+      if (this.config.volumeFailOpen) {
+        volumePhysicsApproval = true;
+        volumeMechanicalApproval = true;
+        console.warn('[Strategy] Volume gate error (fail-open): allowing through');
+      } else {
+        volumePhysicsApproval = false;
+        volumeMechanicalApproval = false;
+        console.warn('[Strategy] Volume gate error: vetoing for safety');
+      }
     }
 
     // Both gates must approve - if either vetoes, reduce confidence
     const volumeVetoActive = !(volumePhysicsApproval && volumeMechanicalApproval);
+    try {
+      if (volumeVetoActive) incrementFallback('VOLUME_VETO');
+      else incrementDecision('VOLUME_VETO', false);
+    } catch (err) {}
     
     // ─── 4-SOURCE CONSENSUS CALCULATION ──────────────────────────────────────
     // Weights: Scanner 30% · ML 28% · RL 20% · Council 22%
     // VOLUME VETO: If either volume agent vetoes, shift to HOLD
-    const CONSENSUS_WEIGHTS = {
-      scanner: 0.30,
-      ml: 0.28,
-      rl: 0.20,
-      council: 0.22
-    };
+    const CONSENSUS_WEIGHTS = this.config.consensusWeights;
     
     let consensusScore = 0;
     let consensusConfidence = 0;
@@ -734,11 +986,30 @@ export class StrategyIntegrationEngine {
     consensusConfidence = 
       weightedConfidence * 0.78 +
       councilVote.confidence * 0.22;
+
+    try {
+      // Mode-aware adjustment to consensus confidence (pre-finalization)
+      const scorer = getConfidenceScorer();
+      const scored = scorer.scoreWithCurrentMode(consensusConfidence, 'consensus');
+      consensusConfidence = scored.adjusted;
+      // If scoring indicates not tradeworthy, enforce HOLD
+      if (!scored.canTrade) {
+        console.log('[Strategy] Consensus suppressed by confidence scorer (not tradeworthy)');
+      }
+    } catch (e) {
+      // ignore scoring failures
+    }
+
+    try {
+      // Persist consensus decision event with correlation
+      try {
+        storage.createDecisionEvent({ correlationId, phase: 'CONSENSUS', domain: 'CONSENSUS', actionPayload: { score: consensusScore, confidence: consensusConfidence }, metrics: { weights: CONSENSUS_WEIGHTS }, timestamp: Date.now() });
+      } catch (e) {}
+    } catch (e) {}
     
     // Apply volume veto gates - if either vetoes, force HOLD or reduce confidence significantly
     if (volumeVetoActive) {
-      // If volume gates veto: reject BUY/SELL, force HOLD
-      consensusConfidence *= 0.4; // Severely reduce confidence when vetoed
+      consensusConfidence *= this.config.volumeVetoConfidenceMultiplier; // configurable penalty
       console.log(`[Strategy] VOLUME VETO ACTIVE: Physics=${volumePhysicsApproval} (${volumePhysicsConfidence.toFixed(2)}), Mechanical=${volumeMechanicalApproval} (${volumeMechanicalConfidence.toFixed(2)})`);
     }
     
@@ -791,6 +1062,74 @@ export class StrategyIntegrationEngine {
     const stopLoss = signalType === 'BUY' ? price - atr * 2 : price + atr * 2;
     const takeProfit = signalType === 'BUY' ? price + atr * 3 : price - atr * 3;
     
+    try {
+      incrementDecision('SYNTHESIS', rlWeights.isRLControlled);
+    } catch (err) {}
+    // ─── Integrate ClusterValidator for entry quality and sizing ───────────
+    let _clusterResult: any = null;
+    let _baseClusterMetrics: any = null;
+    try {
+      const clusterValidator = new ClusterValidator();
+      // Provide market context for RL-adaptive thresholds
+      clusterValidator.setMarketContext(frames, mlConfidence, marketRegimeStr, currentDrawdown);
+
+      // Convert frames -> minimal Candle[] shape expected by ClusterValidator
+      const candlesForCluster = frames.map(f => ({
+        ts: typeof f.timestamp === 'number' ? (f.timestamp as any) : (new Date(f.timestamp as any)).getTime(),
+        open: (f.price as any).open,
+        high: (f.price as any).high,
+        low: (f.price as any).low,
+        close: (f.price as any).close,
+        volume: (f as any).volume || 0,
+        isFinal: true
+      }));
+
+      const minClusterSize = 2;
+      _baseClusterMetrics = ClusterValidator.computeClusterMetricsFromCandles(candlesForCluster, minClusterSize);
+
+      // Compute a simple follow-through: proportion of last N returns aligned with consensus direction
+      const recent = candlesForCluster.slice(-6);
+      let followThrough = 0;
+      if (recent.length > 1) {
+        let matches = 0;
+        const directionSign = Math.sign(weightedSignalScore || 0);
+        for (let i = 1; i < recent.length; i++) {
+          const d = recent[i].close - recent[i - 1].close;
+          if (directionSign === 0) {
+            // if consensus is neutral, consider any move as weak follow-through
+            if (Math.abs(d) > 0) matches++;
+          } else if ((d > 0 && directionSign > 0) || (d < 0 && directionSign < 0)) {
+            matches++;
+          }
+        }
+        followThrough = matches / (recent.length - 1);
+      }
+
+      _baseClusterMetrics.follow_through = Math.max(0, Math.min(1, followThrough));
+
+      // Inject symbol into cluster metrics so ClusterValidator can consult canonical consensus
+      try { (_baseClusterMetrics as any)._symbol = symbol; } catch (e) {}
+      _clusterResult = clusterValidator.validateEntry(baseConfidence, _baseClusterMetrics);
+
+      // Apply clustering size multiplier to decoupled position size
+      if (typeof _clusterResult?.size_multiplier === 'number' && _clusterResult.size_multiplier > 0) {
+        decoupledPositionSize = decoupledPositionSize * _clusterResult.size_multiplier;
+        // add a human-readable note to reasoning
+        try { (Array.isArray((latest as any).reasoning) ? (latest as any).reasoning : []).push(`Cluster: ${Math.round((_clusterResult.final_entry_quality || 0) * 100)}% -> ${_clusterResult.entry_recommendation}`); } catch(e) {}
+      }
+    } catch (err) {
+      // clustering integration should never throw the synthesis flow
+      console.warn('[Strategy] ClusterValidator integration error', err);
+    }
+
+    try {
+      if (_clusterResult) {
+        try {
+          storage.createDecisionEvent({ correlationId, phase: 'CLUSTER_VALIDATION', domain: 'CLUSTER', actionPayload: _clusterResult, metrics: _baseClusterMetrics || {}, timestamp: Date.now() });
+        } catch (e) {}
+      }
+    } catch (e) {}
+
     return {
       id: crypto.randomUUID(),
       timestamp: new Date(),
@@ -824,6 +1163,8 @@ export class StrategyIntegrationEngine {
       positionSize: decoupledPositionSize, // 🔧 ISSUE #1: Using decoupled sizing (no inflation)
       contributingStrategies,
       regimeContext: regime,
+      clusterValidation: _clusterResult || undefined,
+      clusterMetrics: _baseClusterMetrics || undefined,
       unifiedRegimeContext: regime.unifiedRegime ? {
         regime: regime.unifiedRegime,
         confidence: regime.unifiedConfidence || 0.5,

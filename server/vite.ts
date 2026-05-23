@@ -72,7 +72,7 @@ export async function setupVite(app: Express, server: Server) {
   };
 
   app.get("/", serveIndexHtml);
-  app.get("/*", (req, res, next) => {
+  app.get(/.*/, (req, res, next) => {
     if (req.path.startsWith('/api') || 
         req.path.startsWith('/ws') ||
         req.path.includes('.') ||
@@ -100,7 +100,7 @@ export function serveStatic(app: Express) {
   };
 
   app.get("/", serveIndexHtml);
-  app.get("/*", (req, res, next) => {
+  app.get(/.*/, (req, res, next) => {
     if (req.path.startsWith('/api') || 
         req.path.startsWith('/ws') ||
         req.path.includes('.') ||

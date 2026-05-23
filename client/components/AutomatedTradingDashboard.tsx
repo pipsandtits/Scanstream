@@ -5,23 +5,10 @@
  * Displays active trades, P&L, risk metrics, and allows manual intervention.
  */
 
-import React, { useEffect, useState } from 'react';
-import { useQuery, useQueryClient } from '@tanstack/react-query';
-import {
-  BarChart,
-  Bar,
-  LineChart,
-  Line,
-  XAxis,
-  YAxis,
-  CartesianGrid,
-  Tooltip,
-  Legend,
-  ResponsiveContainer,
-  PieChart,
-  Pie,
-  Cell,
-} from 'recharts';
+import React, { useEffect, useState, Suspense } from 'react';
+import { useQueryClient } from '@tanstack/react-query';
+import { useActiveTrades, useTradeStats } from '@/lib/hooks';
+const AutomatedTradingChartsImpl = React.lazy(() => import('./AutomatedTradingChartsImpl'));
 
 interface ActiveTrade {
   id: string;
@@ -73,27 +60,11 @@ const AutomatedTradingDashboard: React.FC<{
   const [closePrice, setClosePrice] = useState<string>('');
   const [isClosing, setIsClosing] = useState(false);
 
-  // Fetch active trades
-  const { data: activeTrades = [] } = useQuery<ActiveTrade[]>({
-    queryKey: ['active-trades'],
-    queryFn: async () => {
-      const res = await fetch('/api/ml/trades/active');
-      const data = await res.json();
-      return data.trades || [];
-    },
-    refetchInterval: refreshInterval,
-  });
-
-  // Fetch trade statistics
-  const { data: stats } = useQuery<TradeStatistics>({
-    queryKey: ['trade-stats'],
-    queryFn: async () => {
-      const res = await fetch('/api/ml/trades/statistics');
-      const data = await res.json();
-      return data.stats;
-    },
-    refetchInterval: refreshInterval,
-  });
+  // Fetch active trades and stats via typed hooks
+  const activeTradesQ = useActiveTrades();
+  const statsQ = useTradeStats();
+  const activeTrades = activeTradesQ.data?.trades || [];
+  const stats = statsQ.data?.stats || null;
 
   // Calculate risk metrics
   const riskMetrics: RiskMetrics = {
@@ -386,27 +357,9 @@ const AutomatedTradingDashboard: React.FC<{
           {/* Win Rate Chart */}
           <div className="bg-white rounded-lg border border-gray-200 p-6">
             <h3 className="text-lg font-semibold text-gray-900 mb-4">📈 Trade Distribution</h3>
-            <ResponsiveContainer width="100%" height={300}>
-              <PieChart>
-                <Pie
-                  data={[
-                    { name: 'Wins', value: stats.winningTrades },
-                    { name: 'Losses', value: stats.losingTrades },
-                  ]}
-                  cx="50%"
-                  cy="50%"
-                  labelLine={false}
-                  label={({ name, value }) => `${name}: ${value}`}
-                  outerRadius={80}
-                  fill="#8884d8"
-                  dataKey="value"
-                >
-                  <Cell fill="#22c55e" />
-                  <Cell fill="#ef4444" />
-                </Pie>
-                <Tooltip />
-              </PieChart>
-            </ResponsiveContainer>
+            <Suspense fallback={<div className="h-72 bg-gray-50 rounded" />}>
+              <AutomatedTradingChartsImpl stats={stats} />
+            </Suspense>
           </div>
 
           {/* Performance Metrics */}

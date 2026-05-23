@@ -4,7 +4,8 @@ generator client {
 
 datasource db {
   provider = "postgresql"
-  url      = env("DATABASE_URL")
+  // connection URL moved to prisma.config.ts for Prisma v7+ compatibility
+  // url      = env("DATABASE_URL")
 }
 
 model MarketFrame {
@@ -32,6 +33,7 @@ model Signal {
   id                  String        @id @default(uuid())
   timestamp           DateTime      @default(now())
   symbol              String
+  correlationId       String?       // trace / correlation id for signals
   type                String        // 'BUY' | 'SELL' | 'HOLD'
   strength            Float
   confidence          Float
@@ -71,6 +73,7 @@ model Signal {
   signalTrades        SignalTrade[]
   
   @@index([symbol])
+  @@index([correlationId])
   @@index([timestamp])
   @@index([outcome])
   @@index([entryTimestamp])
@@ -148,6 +151,25 @@ model Trade {
   status     String    @default("OPEN")
 }
 
+model TradeProvenance {
+  id          String   @id @default(uuid())
+  tradeId     String?  // engine-specific trade id or order id
+  engine      String   // LIVE | PAPER | MANUAL
+  symbol      String
+  correlationId String?
+  signalId    String?
+  signal      Json?
+  consensus   Json?
+  agentDecision Json?
+  execution   Json?
+  extra       Json?    @default("{}")
+  createdAt   DateTime @default(now())
+
+  @@index([tradeId])
+  @@index([signalId])
+  @@index([symbol])
+}
+
 model Strategy {
   id          String           @id @default(uuid())
   name        String
@@ -156,6 +178,64 @@ model Strategy {
   performance Json
   isActive    Boolean          @default(true)
   backtests   BacktestResult[]
+}
+
+model DecisionEvent {
+  id            String   @id @default(uuid())
+  correlationId String?
+  phase         String
+  domain        String?
+  actionPayload Json?
+  metrics       Json?
+  agentIds      String[] @default([])
+  moduleVersion String?
+  marketFrameId String?
+  timestamp     DateTime @default(now())
+  extra         Json?    @default("{}")
+
+  @@index([correlationId])
+  @@index([timestamp])
+}
+
+/// Detailed per-decision snapshot for tracing and ML auditing
+model DecisionSnapshot {
+  id                 String   @id @default(uuid())
+  traceId            String?  // UUID that links the whole trace (signals/decisions/orders)
+  timestamp          DateTime @default(now())
+  agents             Json     @default("[]") // list of agent identifiers consulted
+  contributions      Json     @default("{}") // per-agent weight / score contributions
+  policyOutputs      Json?    @default("{}") // model logits/temperature/outputs
+  positionSizing     Json?    @default("{}") // inputs used for sizing decisions
+  marketFrameId      String?  // optional FK to MarketFrame.id
+  worldTime          DateTime?
+  moduleVersion      String?  // commit SHA or model version for reproducibility
+  extra              Json?    @default("{}")
+
+  @@index([traceId])
+  @@index([marketFrameId])
+  @@index([timestamp])
+}
+
+/// Audit record for orders and execution provenance, updated on fills
+model OrderAudit {
+  id                 String   @id @default(uuid())
+  traceId            String?  // links back to originating trace / signal
+  orderId            String?  // engine or exchange order id
+  exchange           String?
+  venue              String?
+  params             Json?    @default("{}") // chosen order params (type, price, amount, flags)
+  preBalances        Json?    @default("{}") // balances snapshot before placement
+  reservationAmounts Json?    @default("{}") // reservation tokens / amounts
+  fills              Json?    @default("[]") // array of fills recorded
+  simulatedSlippage  Float?
+  realSlippage       Float?
+  realizedPnl        Float?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  @@index([traceId])
+  @@index([orderId])
+  @@index([exchange])
 }
 
 model BacktestResult {
@@ -228,6 +308,9 @@ model User {
   apiKeys         ApiKey[]
   watchlist       Watchlist[]
   portfolio       Portfolio?
+  // Relations
+  modelArtifacts  ModelArtifact[]
+  clusteringResults ClusteringResult[]
 }
 
 model Session {
@@ -459,5 +542,92 @@ model ScannerSignalStats {
 
   @@index([symbol])
   @@index([lastUpdated])
+}
+
+/// --- Generated stubs for missing artifacts, RL and ML persistence ---
+
+model ModelArtifact {
+  id         String   @id @default(uuid())
+  modelName  String
+  version    String?
+  createdBy  String?
+  createdByUser User? @relation(fields: [createdBy], references: [id], onDelete: SetNull)
+  createdAt  DateTime @default(now())
+  storageUri String?
+  blob       Bytes?
+  metadata   Json?    @default("{}")
+  checkpoints ModelCheckpoint[]
+
+  @@index([modelName])
+}
+
+model ModelCheckpoint {
+  id         String   @id @default(uuid())
+  artifactId String?
+  artifact   ModelArtifact? @relation(fields: [artifactId], references: [id], onDelete: SetNull)
+  modelName  String?
+  version    String?
+  createdAt  DateTime @default(now())
+  description String?
+  metadata   Json?    @default("{}")
+
+  @@index([modelName])
+}
+
+model RlQTable {
+  id        String   @id @default(uuid())
+  domain    String?
+  regime    String?
+  stateKey  String
+  actionKey String
+  qValue    Float
+  metadata  Json?    @default("{}")
+  updatedAt DateTime @updatedAt
+
+  @@unique([domain, regime, stateKey, actionKey])
+  @@index([stateKey])
+}
+
+model RlExperience {
+  id        String   @id @default(uuid())
+  domain    String?
+  regime    String?
+  state     Json
+  action    Json
+  reward    Float?
+  nextState Json?
+  done      Boolean  @default(false)
+  createdAt DateTime @default(now())
+  metadata  Json?    @default("{}")
+
+  @@index([domain])
+}
+
+model ClusteringResult {
+  id         String   @id @default(uuid())
+  algorithm  String
+  parameters Json?    @default("{}")
+  clusters   Json?    @default("{}")
+  createdBy  String?
+  createdByUser User? @relation(fields: [createdBy], references: [id], onDelete: SetNull)
+  createdAt  DateTime @default(now())
+  metadata   Json?    @default("{}")
+
+  @@index([algorithm])
+}
+
+model ModelMetric {
+  id         String   @id @default(uuid())
+  modelName  String
+  timestamp  DateTime @default(now())
+  accuracy   Float?
+  precision  Float?
+  recall     Float?
+  driftScore Float?
+  dataPoints Int?     @default(0)
+  isStale    Boolean  @default(false)
+  metadata   Json?    @default("{}")
+
+  @@index([modelName, timestamp])
 }
 

@@ -47,12 +47,12 @@ export const useSystemMetrics = () => {
   // Fetch real accrual data from API
   const { data: apiData } = useQuery({
     queryKey: ['system-metrics-accrual'],
-    queryFn: async () => {
+    queryFn: async ({ signal }: any) => {
       try {
         const [performanceRes, positionsRes, learningRes] = await Promise.all([
-          fetch('/api/trading/performance'),
-          fetch('/api/trading/positions'),
-          fetch('/api/learning/metrics')
+          fetch('/api/trading/performance', { signal }),
+          fetch('/api/trading/positions', { signal }),
+          fetch('/api/learning/metrics', { signal })
         ]);
 
         const performance = await performanceRes.json();
@@ -64,7 +64,10 @@ export const useSystemMetrics = () => {
           positions: positions.positions || [],
           learning: learning.metrics || {}
         };
-      } catch (error) {
+      } catch (error: any) {
+        if (error && error.name === 'AbortError') {
+          return { performance: {}, positions: [], learning: {} };
+        }
         console.warn('Failed to fetch accrual metrics:', error);
         return { performance: {}, positions: [], learning: {} };
       }

@@ -749,8 +749,83 @@ export function slope(values: number[], window?: number): number {
   return (w * sumXY - sumX * sumY) / denom;
 }
 
-// ========== EXPORTS ==========
+// exports are declared after helper implementations to avoid TDZ issues
 
+// ========== FEATURE / STREAMING HELPERS ==========
+
+/** Streaming EMA class for O(1) updates */
+export class StreamingEMA {
+  private alpha: number;
+  private value: number | null = null;
+  constructor(period: number) {
+    this.alpha = 2 / (period + 1);
+  }
+  update(x: number) {
+    if (this.value === null || Number.isNaN(this.value)) this.value = x;
+    else this.value = this.alpha * x + (1 - this.alpha) * this.value;
+    return this.value;
+  }
+  get() { return this.value; }
+}
+
+/** Welford online variance accumulator for numerical stability */
+export class Welford {
+  private n = 0;
+  private mean = 0;
+  private m2 = 0;
+  add(x: number) {
+    this.n += 1;
+    const delta = x - this.mean;
+    this.mean += delta / this.n;
+    const delta2 = x - this.mean;
+    this.m2 += delta * delta2;
+  }
+  variance() { return this.n > 1 ? this.m2 / (this.n - 1) : 0; }
+  std() { return Math.sqrt(this.variance()); }
+  count() { return this.n; }
+  getMean() { return this.mean; }
+}
+
+/** Build a compact feature vector for ML/RL engines from prices/volumes */
+export function buildFeatureVector(close: number[], volume?: number[]) {
+  const n = close.length;
+  const last = (arr: number[]) => arr[arr.length - 1];
+  const rsiArr = rsi(close, 14);
+  const rsiVal = rsiArr.filter(v => !Number.isNaN(v)).slice(-1)[0] ?? 50;
+  const mac = macd(close);
+  const macdArr = mac.macd;
+  const signalArr = mac.signal;
+  const macdDelta = (macdArr && signalArr && macdArr.length && signalArr.length) ? ((last(macdArr) ?? 0) - (last(signalArr) ?? 0)) : 0;
+  const emaShort = ema(close, 8);
+  const emaLong = ema(close, 21);
+  const emaDistance = ( (last(emaShort) ?? last(close)) - (last(emaLong) ?? last(close)) ) / (Math.abs(last(emaLong) ?? 1)) ;
+  const volRatio = (volume && volume.length >= 1) ? (last(volume) / (volume.slice(Math.max(0, volume.length - 20)).reduce((a,b)=>a+b,0) / Math.min(20, volume.length) || 1)) : 1;
+  const atrArr = atr(close.map((_,i)=>close[i]), close.map((_,i)=>close[i]), close, 14);
+  const atrVal = atrArr.filter(v=>!Number.isNaN(v)).slice(-1)[0] ?? 0;
+  const atrHist = atrArr.filter(v=>!Number.isNaN(v));
+  const atrPercentile = atrHist.length ? (atrHist[atrHist.length-1] - Math.min(...atrHist)) / (Math.max(...atrHist) - Math.min(...atrHist) || 1) : 0;
+  const trendStrengthArr = adx(close.map((_,i)=>close[i]), close.map((_,i)=>close[i]), close, 14);
+  const trendStrength = (Array.isArray(trendStrengthArr) && trendStrengthArr.length) ? (trendStrengthArr.filter(v=>!Number.isNaN(v)).slice(-1)[0] ?? 0) : 0;
+
+  return {
+    rsi: Number(rsiVal),
+    macd_delta: Number(macdDelta),
+    ema_distance: Number(emaDistance),
+    volume_ratio: Number(volRatio),
+    atr_percentile: Number(atrPercentile),
+    trend_strength: Number(trendStrength)
+  };
+}
+
+/** Simple feature normalization helpers */
+export function normalizeFeatureZ(value: number, mean: number, std: number) {
+  if (std === 0) return 0;
+  return (value - mean) / std;
+}
+
+// (module exports already expose helpers and default includes them)
+
+// Final export (after helper declarations)
 export default {
   // Moving Averages
   sma, ema, vwma,
@@ -765,5 +840,10 @@ export default {
   // Support/Resistance
   fibLevels,
   // Utilities
-  slope
+  slope,
+  // Streaming / feature helpers
+  StreamingEMA,
+  Welford,
+  buildFeatureVector,
+  normalizeFeatureZ
 };

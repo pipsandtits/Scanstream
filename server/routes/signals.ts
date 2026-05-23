@@ -1,11 +1,18 @@
 import { Router, Request, Response } from 'express';
-import { PrismaClient } from '@prisma/client';
+import pkg from '@prisma/client';
+const { PrismaClient } = pkg as any;
 import axios from 'axios';
+import { coinGeckoService } from '../services/coingecko';
 import { SignalPersistenceService } from '../services/signal-persistence-service';
 
 const prisma = new PrismaClient();
 const router = Router();
 const signalService = new SignalPersistenceService();
+
+function normalizeParamSymbol(s: string | string[] | undefined): string {
+  if (!s) return '';
+  return Array.isArray(s) ? s[0] : s;
+}
 
 // Simple MA crossover signal
 function checkMACrossover(prices: number[]): { signal: string; strength: number } {
@@ -62,8 +69,9 @@ export function setupSignalRoutes(app: any) {
   // Get signals for a symbol
   app.get('/api/signals/:symbol', async (req: any, res: Response) => {
     try {
+      const raw = normalizeParamSymbol(req.params.symbol);
       const signals = await prisma.signal.findMany({
-        where: { symbol: req.params.symbol.toUpperCase() },
+        where: { symbol: raw.toUpperCase() },
         orderBy: { timestamp: 'desc' },
         take: 10
       });
@@ -76,7 +84,8 @@ export function setupSignalRoutes(app: any) {
   // Generate signals for symbol
   app.post('/api/signals/generate', isAuthenticated, async (req: any, res: Response) => {
     try {
-      const { symbol, timeframe = '1h' } = req.body;
+      const { symbol: rawSymbol, timeframe = '1h' } = req.body;
+      const symbol = Array.isArray(rawSymbol) ? rawSymbol[0] : rawSymbol;
       if (!symbol) {
         return res.status(400).json({ error: 'Symbol is required' });
       }
@@ -86,11 +95,9 @@ export function setupSignalRoutes(app: any) {
       // Fetch price data from a simple API or stored data
       let prices: number[] = [];
       try {
-        // Try CoinGecko for demo data
-        const response = await axios.get(`https://api.coingecko.com/api/v3/coins/${symbol.toLowerCase()}/market_chart`, {
-          params: { vs_currency: 'usd', days: 90 }
-        });
-        prices = response.data.prices.map((p: any) => p[1]);
+        // Use centralized CoinGecko service (rate-limited, queued)
+        const mc = await coinGeckoService.getMarketChart(symbol.toLowerCase(), 'usd', 90);
+        prices = (mc.prices || []).map((p: any) => p[1]);
       } catch (e) {
         return res.status(400).json({ error: 'Could not fetch price data' });
       }
@@ -172,8 +179,10 @@ router.post('/track', async (req: Request, res: Response) => {
       userId
     } = req.body;
 
+    const symbolStr = Array.isArray(symbol) ? symbol[0] : symbol;
+
     // Validate required fields
-    if (!symbol || !type || strength === undefined || confidence === undefined || !entryPrice) {
+    if (!symbolStr || !type || strength === undefined || confidence === undefined || !entryPrice) {
       return res.status(400).json({
         success: false,
         error: 'Missing required fields: symbol, type, strength, confidence, entryPrice'
@@ -182,7 +191,7 @@ router.post('/track', async (req: Request, res: Response) => {
 
     // Record signal
     const signal = await signalService.recordSignal({
-      symbol,
+      symbol: symbolStr,
       type: type as 'BUY' | 'SELL' | 'HOLD',
       strength,
       confidence,
@@ -203,7 +212,7 @@ router.post('/track', async (req: Request, res: Response) => {
     res.json({
       success: true,
       signalId: signal.id,
-      message: `Signal recorded: ${symbol} ${type} @ ${entryPrice}`
+      message: `Signal recorded: ${symbolStr} ${type} @ ${entryPrice}`
     });
   } catch (error: any) {
     console.error('[SignalAPI] Error recording signal:', error);
@@ -221,6 +230,7 @@ router.post('/track', async (req: Request, res: Response) => {
 router.put('/:id/outcome', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
+    const idStr = Array.isArray(id) ? id[0] : id;
     const {
       exitPrice,
       outcome,
@@ -248,7 +258,7 @@ router.put('/:id/outcome', async (req: Request, res: Response) => {
 
     // Update signal
     const signal = await signalService.updateSignalOutcome({
-      signalId: id,
+      signalId: idStr,
       exitPrice,
       outcome: outcome as 'WIN' | 'LOSS' | 'BREAKEVEN',
       realizedPnL: realizedPnL || 0,
@@ -279,8 +289,8 @@ router.put('/:id/outcome', async (req: Request, res: Response) => {
  */
 router.get('/stats/:symbol', async (req: Request, res: Response) => {
   try {
-    const { symbol } = req.params;
-    const stats = await signalService.getSignalStats(symbol.toUpperCase());
+    const raw = normalizeParamSymbol(req.params.symbol);
+    const stats = await signalService.getSignalStats(raw.toUpperCase());
 
     if (!stats) {
       return res.json({
@@ -325,12 +335,12 @@ router.get('/stats/:symbol', async (req: Request, res: Response) => {
  */
 router.get('/open/:symbol', async (req: Request, res: Response) => {
   try {
-    const { symbol } = req.params;
-    const signals = await signalService.getOpenSignals(symbol.toUpperCase());
+    const raw = normalizeParamSymbol(req.params.symbol);
+    const signals = await signalService.getOpenSignals(raw.toUpperCase());
 
     res.json({
       success: true,
-      symbol: symbol.toUpperCase(),
+      symbol: raw.toUpperCase(),
       openSignals: signals.length,
       signals: signals.map((s: any) => ({
         id: s.id,
@@ -359,14 +369,14 @@ router.get('/open/:symbol', async (req: Request, res: Response) => {
  */
 router.get('/recent/:symbol', async (req: Request, res: Response) => {
   try {
-    const { symbol } = req.params;
+    const raw = normalizeParamSymbol(req.params.symbol);
     const limit = Math.min(parseInt(req.query.limit as string) || 50, 200);
     
-    const signals = await signalService.getRecentSignals(symbol.toUpperCase(), limit);
+    const signals = await signalService.getRecentSignals(raw.toUpperCase(), limit);
 
     res.json({
       success: true,
-      symbol: symbol.toUpperCase(),
+      symbol: raw.toUpperCase(),
       count: signals.length,
       signals: signals.map((s: any) => ({
         id: s.id,
@@ -400,12 +410,12 @@ router.get('/recent/:symbol', async (req: Request, res: Response) => {
  */
 router.get('/patterns/:symbol', async (req: Request, res: Response) => {
   try {
-    const { symbol } = req.params;
-    const performance = await signalService.getPatternPerformance(symbol.toUpperCase());
+    const raw = normalizeParamSymbol(req.params.symbol);
+    const performance = await signalService.getPatternPerformance(raw.toUpperCase());
 
     res.json({
       success: true,
-      symbol: symbol.toUpperCase(),
+      symbol: raw.toUpperCase(),
       patterns: Object.entries(performance).map(([pattern, stats]: any) => ({
         pattern,
         ...stats,

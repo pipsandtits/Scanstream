@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { useLocation } from 'wouter';
+import { useNavigate } from 'react-router-dom';
 import { ArrowLeft, RefreshCw, Settings, Filter, Search, TrendingUp, TrendingDown, AlertTriangle, CheckCircle, Star, Download, BarChart3, Bell, BellOff, Calculator, Activity, Target, ChevronDown, ChevronUp, ChevronRight, Grid3x3, List, Zap } from 'lucide-react';
 import { useSymbolUniverse } from '../hooks/useSymbolUniverse';
 import { useQuery } from '@tanstack/react-query';
@@ -61,7 +61,7 @@ interface ScannerResponse {
 }
 
 export default function ScannerPage() {
-  const [, setLocation] = useLocation();
+  const navigate = useNavigate();
   const { symbols: universeSymbols } = useSymbolUniverse();
   
   // UI State
@@ -128,17 +128,18 @@ export default function ScannerPage() {
 
   // Load cached FastScanner results on mount
   useEffect(() => {
+    const controller = new AbortController();
     const loadCachedResults = async () => {
       try {
         console.log('[Scanner] Fetching cached results from /api/scanner/results');
-        const response = await fetch('/api/scanner/results');
+        const response = await fetch('/api/scanner/results', { signal: controller.signal });
         console.log('[Scanner] Response status:', response.status, response.ok);
 
         if (response.ok) {
           const data = await response.json();
           console.log('[Scanner] Received cached data:', data);
 
-          if (data.success && data.signals && data.signals.length > 0) {
+          if (!controller.signal.aborted && data.success && data.signals && data.signals.length > 0) {
             console.log('[Scanner] ✅ Loaded', data.signals.length, 'cached FastScanner signals');
             setRealTimeSignals(data.signals);
             setLastScanTime(data.status?.lastScan?.timestamp ? new Date(data.status.lastScan.timestamp) : new Date());
@@ -148,12 +149,14 @@ export default function ScannerPage() {
         } else {
           console.error('[Scanner] ❌ Failed to fetch cached results:', response.status, response.statusText);
         }
-      } catch (error) {
+      } catch (error: any) {
+        if (error?.name === 'AbortError') return;
         console.error('[Scanner] ❌ Error loading cached results:', error);
       }
     };
 
     loadCachedResults();
+    return () => { controller.abort(); };
   }, []);
 
   // Check Scanner API health periodically
@@ -564,6 +567,7 @@ export default function ScannerPage() {
   const handleScan = async () => {
     setIsScanning(true);
     try {
+      const controller = new AbortController();
       const response = await fetch('/api/scanner/scan', {
         method: 'POST',
         headers: {
@@ -576,6 +580,7 @@ export default function ScannerPage() {
           minStrength: selectedFilters.minStrength,
           fullAnalysis: true
         }),
+        signal: controller.signal,
       });
 
       if (response.status === 202) {
@@ -594,7 +599,7 @@ export default function ScannerPage() {
           }
           
           try {
-            const statusResponse = await fetch('/api/scanner/status');
+              const statusResponse = await fetch('/api/scanner/status', { signal: AbortSignal.timeout(5000) });
             const status = await statusResponse.json();
             console.log(`[Scan Poll ${pollCount}] Status:`, status);
             
@@ -606,6 +611,7 @@ export default function ScannerPage() {
               console.log('✅ Scan complete and results loaded');
             }
           } catch (pollErr) {
+            if (pollErr && (pollErr.name === 'AbortError' || pollErr.name === 'CanceledError')) return;
             console.error('Poll error:', pollErr);
           }
         }, 5000);
@@ -686,10 +692,12 @@ export default function ScannerPage() {
         timeframe: selectedFilters.timeframe === 'all' ? '1h' : selectedFilters.timeframe
       };
 
+      const controller = new AbortController();
       const resp = await fetch('/api/scanner/run-scan', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body)
+        body: JSON.stringify(body),
+        signal: controller.signal,
       });
 
       if (!resp.ok) {
@@ -724,6 +732,7 @@ export default function ScannerPage() {
     setIsScanning(true);
 
     try {
+      const controller = new AbortController();
       const response = await fetch('/api/scanner/scan', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -734,6 +743,7 @@ export default function ScannerPage() {
           minStrength: selectedFilters.minStrength,
           fullAnalysis: true
         }),
+        signal: controller.signal,
       });
 
       if (response.ok) {
@@ -792,7 +802,7 @@ export default function ScannerPage() {
   const handleDownloadTrainingData = async () => {
     try {
       const symbol = (universeSymbols && universeSymbols.length) ? universeSymbols[0].symbol : 'BTC/USDT';
-      const response = await fetch(`/api/scanner/training-data/${symbol.replace('/', '%2F')}?days=30`);
+      const response = await fetch(`/api/scanner/training-data/${symbol.replace('/', '%2F')}?days=30`, { signal: AbortSignal.timeout(10000) });
       
       if (response.ok) {
         const data = await response.json();
@@ -813,7 +823,7 @@ export default function ScannerPage() {
   const handleCheckConfluence = async () => {
     try {
       const symbol = (universeSymbols && universeSymbols.length) ? universeSymbols[0].symbol : 'BTC/USDT';
-      const response = await fetch(`/api/scanner/continuous/confluence/${symbol.replace('/', '%2F')}?min_score=60`);
+      const response = await fetch(`/api/scanner/continuous/confluence/${symbol.replace('/', '%2F')}?min_score=60`, { signal: AbortSignal.timeout(10000) });
       
       if (response.ok) {
         const data = await response.json();

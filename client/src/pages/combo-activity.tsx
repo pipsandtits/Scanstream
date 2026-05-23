@@ -1,5 +1,5 @@
 import React, { useState, useMemo } from 'react';
-import { useLocation } from 'wouter';
+import { useNavigate } from 'react-router-dom';
 import {
   Zap, ArrowLeft, Users, TrendingUp, Flame, Shield, Clock,
   Search, Filter, ChevronDown, BarChart3, Trophy, Activity
@@ -85,7 +85,7 @@ const SAMPLE_COMBO_LOGS: ComboLog[] = [
 type SortBy = 'timestamp' | 'impact' | 'multiplier' | 'pnl';
 
 const ComboActivityPage: React.FC = () => {
-  const [, navigate] = useLocation();
+  const navigate = useNavigate();
   const [searchTerm, setSearchTerm] = useState('');
   const [sortBy, setSortBy] = useState<SortBy>('timestamp');
   const [sortAsc, setSortAsc] = useState(false);

@@ -61,6 +61,21 @@ export function validateWorldTick(t: any): t is WorldTick {
   return validateRawTick(t);
 }
 
+function reportClientError(payload: any) {
+  try {
+    const body = JSON.stringify(payload);
+    // try navigator.sendBeacon first
+    if (typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function') {
+      navigator.sendBeacon('/api/client/error', body);
+      return;
+    }
+    // fallback to fetch
+    fetch('/api/client/error', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body }).catch(() => {});
+  } catch (e) {
+    // noop
+  }
+}
+
 type Sub = {
   id: string;
   symbol: string;
@@ -83,44 +98,85 @@ export class MarketDataLayer {
   private reconnectAttempts = 0;
 
   constructor(url?: string) {
-    // Connect to Socket.IO endpoint
+    // Connect to raw WebSocket endpoint. Allow overriding via constructor for tests.
     this.url = url || `http${window.location.protocol === 'https:' ? 's' : ''}://${window.location.host}`;
     this.connect();
+    // register global client-side handlers
+    try {
+      window.addEventListener('unhandledrejection', (ev) => {
+        try { reportClientError({ event: 'unhandledrejection', reason: String(ev.reason) }); } catch (e) {}
+      });
+      window.addEventListener('error', (ev: any) => {
+        try { reportClientError({ event: 'error', message: ev?.message, filename: ev?.filename, lineno: ev?.lineno }); } catch (e) {}
+      });
+    } catch (e) {}
   }
-
   private connect() {
     if (this.ws && (this.ws as any).connected) return;
-    try {
-      // Connect to raw WebSocket endpoint (NOT Socket.IO protocol)
-      const socketUrl = `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/ws`;
-      this.ws = new WebSocket(socketUrl);
-      this.ws.onopen = () => {
-        this.reconnectAttempts = 0;
-        this.emit('connected');
-        // re-subscribe server-side for active subscriptions
-        this.subs.forEach(s => this.send({ type: 'subscribe', symbol: s.symbol, options: s.opts }));
-      };
-      this.ws.onmessage = (evt) => {
-        try {
-          const msg = JSON.parse(evt.data);
-          this.handleMessage(msg);
-        } catch (err) {
-          console.debug('[MarketDataLayer] bad message', err);
+
+    const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+    const sameHost = `${proto}://${window.location.host}/ws`;
+    const backendHost = `${proto}://localhost:5000/ws`;
+
+    let triedFallback = false;
+
+    const tryConnect = (socketUrl: string) => {
+      try {
+        this.ws = new WebSocket(socketUrl);
+
+        this.ws.onopen = () => {
+          this.reconnectAttempts = 0;
+          this.emit('connected');
+          this.subs.forEach(s => this.send({ type: 'subscribe', symbol: s.symbol, options: s.opts }));
+        };
+
+        this.ws.onmessage = (evt) => {
+          try {
+            const msg = JSON.parse(evt.data);
+            this.handleMessage(msg);
+          } catch (err) {
+            console.debug('[MarketDataLayer] bad message', err);
+            try { reportClientError({ source: 'MarketDataLayer', context: 'bad_message', error: String(err) }); } catch (e) {}
+          }
+        };
+
+        this.ws.onclose = () => {
+          this.ws = null;
+          this.emit('disconnected');
+          const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 30000);
+          this.reconnectAttempts++;
+          this.emit('retry', { attempt: this.reconnectAttempts, delay });
+          setTimeout(() => this.connect(), delay);
+        };
+
+        this.ws.onerror = (e) => {
+          this.emit('error', e);
+          console.warn('[MarketDataLayer] ws error', e);
+          try { reportClientError({ source: 'MarketDataLayer', context: 'ws_error', error: String(e) }); } catch (err) {}
+          if (!triedFallback) {
+            triedFallback = true;
+            // try the other host
+            const next = socketUrl === backendHost ? sameHost : backendHost;
+            tryConnect(next);
+          }
+        };
+      } catch (err) {
+        console.warn('[MarketDataLayer] failed to connect', err);
+        try { reportClientError({ source: 'MarketDataLayer', context: 'connect_failed', error: String(err) }); } catch (e) {}
+        this.emit('error', err);
+        if (!triedFallback) {
+          triedFallback = true;
+          const next = socketUrl === backendHost ? sameHost : backendHost;
+          tryConnect(next);
         }
-      };
-      this.ws.onclose = () => {
-        this.ws = null;
-        this.emit('disconnected');
-        // exponential backoff reconnect
-        const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 30000);
-        this.reconnectAttempts++;
-        this.emit('retry', { attempt: this.reconnectAttempts, delay });
-        setTimeout(() => this.connect(), delay);
-      };
-      this.ws.onerror = (e) => { this.emit('error', e); console.warn('[MarketDataLayer] ws error', e); };
-    } catch (err) {
-      console.warn('[MarketDataLayer] failed to connect', err);
-      this.emit('error', err);
+      }
+    };
+
+    // Prefer backend host when running under Vite dev (frontend host 5173)
+    if (window.location.port === '5173') {
+      tryConnect(backendHost);
+    } else {
+      tryConnect(sameHost);
     }
   }
 
@@ -223,13 +279,14 @@ export class MarketDataLayer {
               sub.handler(uiT);
             } catch (e) {
                 console.warn('[MarketDataLayer] handler error', e);
+                try { reportClientError({ source: 'MarketDataLayer', context: 'handler_error', error: String(e) }); } catch (err) {}
             }
           });
         }
       }, rate) as unknown as number;
     } else {
       if (!sub.paused) {
-        try { sub.handler(uiTick); } catch (e) { console.warn('[MarketDataLayer] handler error', e); }
+        try { sub.handler(uiTick); } catch (e) { console.warn('[MarketDataLayer] handler error', e); try { reportClientError({ source: 'MarketDataLayer', context: 'handler_error', error: String(e) }); } catch (err) {} }
       }
     }
   }
@@ -335,6 +392,7 @@ export class MarketDataLayer {
           return data as UITick[];
         } catch (err) {
           console.warn('[MarketDataLayer] replay request failed, falling back to local buffer', err);
+          try { reportClientError({ source: 'MarketDataLayer', context: 'replay_failed', error: String(err) }); } catch (e) {}
           // Fallback: deliver local buffer ticks as UITick
           const snap = sub.buffer.slice().reverse();
           snap.forEach(t => {
@@ -343,6 +401,7 @@ export class MarketDataLayer {
               handler(uiTick);
             } catch (e) {
               console.warn('[MarketDataLayer] fallback handler error', e);
+              try { reportClientError({ source: 'MarketDataLayer', context: 'fallback_handler_error', error: String(e) }); } catch (err) {}
             }
           });
           return snap.map(t => this.transformToUITick(t, sub));

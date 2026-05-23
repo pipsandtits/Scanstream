@@ -1,22 +1,6 @@
 import { useState } from 'react';
-import {
-  RadarChart,
-  Radar,
-  PolarGrid,
-  PolarAngleAxis,
-  PolarRadiusAxis,
-  ResponsiveContainer,
-  LineChart,
-  Line,
-  XAxis,
-  YAxis,
-  CartesianGrid,
-  Tooltip,
-  Legend,
-  Cell,
-  Area,
-  ComposedChart,
-} from 'recharts';
+import React, { Suspense, lazy } from 'react';
+const StrategyComparisonCharts = lazy(() => import('@/components/StrategyComparisonCharts'));
 import {
   CheckCircle2,
   XCircle,
@@ -248,78 +232,9 @@ export default function StrategyComparisonDashboard({
               </div>
 
               {/* Tab Content */}
-              {activeTab === 'radar' && (
-                <div className="bg-slate-900/50 rounded-lg p-6 border border-slate-700">
-                  <h3 className="text-lg font-bold text-white mb-6">
-                    Performance Comparison
-                  </h3>
-                  <ResponsiveContainer width="100%" height={400}>
-                    <RadarChart data={radarData}>
-                      <PolarGrid />
-                      <PolarAngleAxis
-                        dataKey="metric"
-                        tick={{ fill: '#cbd5e1', fontSize: 12 }}
-                      />
-                      <PolarRadiusAxis
-                        angle={90}
-                        domain={[0, 100]}
-                        tick={{ fill: '#cbd5e1', fontSize: 10 }}
-                      />
-                      {selectedStrategyData.map((strategy, index) => (
-                        <Radar
-                          key={strategy.id}
-                          name={strategy.name}
-                          dataKey={strategy.name}
-                          stroke={colors[index]}
-                          fill={colors[index]}
-                          fillOpacity={0.3}
-                          strokeWidth={2}
-                        />
-                      ))}
-                      <Legend />
-                    </RadarChart>
-                  </ResponsiveContainer>
-                </div>
-              )}
-
-              {activeTab === 'equity' && (
-                <div className="bg-slate-900/50 rounded-lg p-6 border border-slate-700">
-                  <h3 className="text-lg font-bold text-white mb-6">
-                    Equity Curve Comparison
-                  </h3>
-                  <ResponsiveContainer width="100%" height={400}>
-                    <ComposedChart data={equityData}>
-                      <CartesianGrid strokeDasharray="3 3" stroke="#334155" opacity={0.3} />
-                      <XAxis
-                        dataKey="date"
-                        stroke="#94a3b8"
-                        tick={{ fontSize: 12 }}
-                        tickFormatter={(value) => value.substring(0, 5)}
-                      />
-                      <YAxis stroke="#94a3b8" tick={{ fontSize: 12 }} />
-                      <Tooltip
-                        contentStyle={{
-                          backgroundColor: 'rgba(15, 23, 42, 0.95)',
-                          border: '1px solid rgba(100, 116, 139, 0.5)',
-                          borderRadius: '8px',
-                        }}
-                      />
-                      <Legend />
-                      {selectedStrategyData.map((strategy, index) => (
-                        <Line
-                          key={strategy.id}
-                          type="monotone"
-                          dataKey={strategy.name}
-                          stroke={colors[index]}
-                          strokeWidth={2}
-                          dot={false}
-                          name={strategy.name}
-                        />
-                      ))}
-                    </ComposedChart>
-                  </ResponsiveContainer>
-                </div>
-              )}
+              <Suspense fallback={<div className="h-96 flex items-center justify-center">Loading comparison charts…</div>}>
+                <StrategyComparisonCharts radarData={radarData} equityData={equityData} selectedStrategyData={selectedStrategyData} colors={colors} activeTab={activeTab} />
+              </Suspense>
 
               {activeTab === 'heatmap' && (
                 <div className="bg-slate-900/50 rounded-lg p-6 border border-slate-700">

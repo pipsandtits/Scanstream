@@ -1,5 +1,5 @@
 /* stylelint-disable-next-line */
-import { useEffect, useState } from 'react';
+import React, { useEffect, useState, useMemo, useCallback, memo } from 'react';
 import { Card } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { TrendingUp, TrendingDown, AlertCircle, X, ChevronDown } from 'lucide-react';
@@ -25,6 +25,94 @@ interface Dataframe {
   fullData?: FullDataframe;
 }
 
+const formatValue = (value: any, decimals = 2) => {
+  if (value === undefined || value === null) return 'N/A';
+  if (typeof value === 'number') return value.toFixed(decimals);
+  return String(value);
+};
+
+const getProgressBarWidth = (confidence: number) => `${Math.min(100, confidence || 0)}%`;
+
+const TechDataSection = memo(function TechDataSection({ title, icon, data, isExpanded, onToggle }: { title: string; icon: string; data: Array<[string, any]>; isExpanded: boolean; onToggle: () => void }) {
+  const sectionKey = title.toLowerCase().replace(/\s+/g, '_');
+  return (
+    <div className="border rounded-lg overflow-hidden">
+      <button
+        onClick={onToggle}
+        className="w-full px-4 py-3 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 flex items-center justify-between transition-colors"
+      >
+        <div className="flex items-center gap-2 font-semibold">
+          <span>{icon}</span>
+          <span>{title}</span>
+        </div>
+      </button>
+      {isExpanded && (
+        <div className="p-4 space-y-2 bg-slate-50 dark:bg-slate-900">
+          {data.map(([label, value], idx) => (
+            <div key={idx} className="flex justify-between items-center text-sm">
+              <span className="text-muted-foreground">{label}</span>
+              <span className="font-mono font-semibold">{formatValue(value)}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+});
+
+const SymbolCard = memo(function SymbolCard({ symbol, df, onClick, onOpen }: { symbol: string; df?: Dataframe; onClick: (s: string) => void; onOpen?: () => void }) {
+  return (
+    <Card
+      key={symbol}
+      className="p-4 hover:shadow-lg transition-shadow cursor-pointer hover:border-primary"
+      onClick={() => onClick(symbol)}
+    >
+      <div className="space-y-3">
+        <div className="flex items-start justify-between">
+          <div>
+            <h3 className="font-bold text-lg">{symbol}</h3>
+            <p className="text-sm text-muted-foreground">${df?.close?.toFixed(2) || 'Loading...'}</p>
+          </div>
+          <div className="flex items-center gap-2">
+            {df && (df.trendDirection === 'UPTREND' ? <TrendingUp className="w-4 h-4 text-green-500" /> : <TrendingDown className="w-4 h-4 text-red-500" />)}
+            <Badge className={`${df ? (df.signal === 'BUY' ? 'bg-green-500/10 text-green-700 dark:text-green-400 border-green-200 dark:border-green-800' : df.signal === 'SELL' ? 'bg-red-500/10 text-red-700 dark:text-red-400 border-red-200 dark:border-red-800' : 'bg-slate-500/10 text-slate-700 dark:text-slate-400 border-slate-200 dark:border-slate-800') : 'bg-slate-500/10 text-slate-700'} border`}> 
+              {df?.signal || 'HOLD'}
+            </Badge>
+          </div>
+        </div>
+
+        {df?.priceChangePercent !== undefined && (
+          <div className="text-sm">
+            <span className={df.priceChangePercent >= 0 ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}>
+              {df.priceChangePercent >= 0 ? '+' : ''}{df.priceChangePercent?.toFixed(2)}%
+            </span>
+          </div>
+        )}
+
+        <div className="grid grid-cols-2 gap-2 pt-2 border-t">
+          <div><p className="text-xs text-muted-foreground">RSI</p><p className="text-sm font-mono">{df?.rsi?.toFixed(1) || 'N/A'}</p></div>
+          <div><p className="text-xs text-muted-foreground">MACD</p><p className="text-sm font-mono">{df?.macd?.toFixed(3) || 'N/A'}</p></div>
+          <div><p className="text-xs text-muted-foreground">ATR</p><p className="text-sm font-mono">{df?.atr?.toFixed(2) || 'N/A'}</p></div>
+          <div><p className="text-xs text-muted-foreground">Volume</p><p className="text-sm font-mono">{df?.volume ? (df.volume / 1000).toFixed(0) : '0'}k</p></div>
+        </div>
+
+        <div className="border-t pt-2">
+          <p className="text-xs text-muted-foreground font-semibold mb-1">Confidence</p>
+          <div className="flex items-center justify-between mb-1">
+            <span className="text-sm font-mono">{df?.signalConfidence?.toFixed(0) || '0'}%</span>
+          </div>
+          <div className="w-full bg-slate-200 dark:bg-slate-700 rounded-full h-1.5 overflow-hidden">
+            <div 
+              className="bg-blue-500 h-1.5 rounded-full transition-all"
+              style={{ width: getProgressBarWidth(df?.signalConfidence) } as React.CSSProperties} 
+            />
+          </div>
+        </div>
+      </div>
+    </Card>
+  );
+});
+
 const DEFAULT_SYMBOLS = [
   'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'AVAX/USDT', 'ADA/USDT',
   'DOT/USDT', 'LINK/USDT', 'XRP/USDT', 'DOGE/USDT', 'ATOM/USDT',
@@ -48,6 +136,7 @@ export default function GatewayScannerPage() {
   const { symbols: universeSymbols } = useSymbolUniverse();
 
   useEffect(() => {
+    let mounted = true;
     const fetchData = async () => {
       try {
         setLoading(true);
@@ -55,45 +144,58 @@ export default function GatewayScannerPage() {
         let successCount = 0;
 
         const symbolsToFetch = (universeSymbols && universeSymbols.length) ? universeSymbols.map(s => s.symbol).slice(0,15) : DEFAULT_SYMBOLS;
-        for (const symbol of symbolsToFetch) {
+
+        // Parallelize requests for faster updates
+        const promises = symbolsToFetch.map(async (symbol) => {
           try {
             const encodedSymbol = symbol.replace('/', '%2F');
-            const response = await fetch(
-              `/api/gateway/dataframe/${encodedSymbol}?timeframe=1h&limit=100`
-            );
-            
-            if (response.ok) {
-              const json = await response.json();
-              if (json.dataframe) {
-                const df = json.dataframe;
-                const hasPrice = df.close && df.close > 0;
-                
-                results[symbol] = {
-                  symbol: df.symbol || symbol,
-                  signal: df.signal || 'HOLD',
-                  signalConfidence: df.trendStrength || 0,
-                  close: df.close || 0,
-                  rsi: df.rsi || 50,
-                  ema20: df.ema20 || 0,
-                  ema50: df.ema50 || 0,
-                  macd: df.macd || 0,
-                  atr: df.atr || 0,
-                  trendDirection: df.trendDirection || 'UPTREND',
-                  volume: df.volume || 0,
-                  volumeTrend: df.volumeTrend || 'DECREASING',
-                  priceChangePercent: df.momentum || 0,
-                  fullData: df
-                };
-                
-                if (hasPrice) successCount++;
-              }
+            const url = `/api/gateway/dataframe/${encodedSymbol}?timeframe=1h&limit=100`;
+            const response = await fetch(url, { signal: (AbortSignal as any).timeout ? (AbortSignal as any).timeout(10000) : undefined });
+            if (!response || !response.ok) return null;
+            const json = await response.json();
+            if (!json?.dataframe) return null;
+            const df = json.dataframe;
+            const hasPrice = df.close && df.close > 0;
+            const mapped: Dataframe = {
+              symbol: df.symbol || symbol,
+              signal: df.signal || 'HOLD',
+              signalConfidence: df.trendStrength || 0,
+              close: df.close || 0,
+              rsi: df.rsi || 50,
+              ema20: df.ema20 || 0,
+              ema50: df.ema50 || 0,
+              macd: df.macd || 0,
+              atr: df.atr || 0,
+              trendDirection: df.trendDirection || 'UPTREND',
+              volume: df.volume || 0,
+              volumeTrend: df.volumeTrend || 'DECREASING',
+              priceChangePercent: df.momentum || 0,
+              fullData: df
+            };
+            return { symbol, mapped, hasPrice };
+          } catch (err: any) {
+            if (err && err.name === 'AbortError') {
+              // fetch timed out or was aborted; skip
+              return null;
             }
-          } catch (err) {
             console.error(`Failed to fetch ${symbol}:`, err);
+            return null;
+          }
+        });
+
+        const settled = await Promise.all(promises);
+        for (const res of settled) {
+          if (res && res.mapped) {
+            results[res.symbol] = res.mapped;
+            if (res.hasPrice) successCount++;
           }
         }
 
+        if (!mounted) return;
+
+        // Only update state if results changed to avoid unnecessary renders
         setData(results);
+
         if (Object.keys(results).length === 0) {
           setError('No data available from gateway - ensure exchange connection is active');
         } else if (successCount === 0) {
@@ -104,14 +206,17 @@ export default function GatewayScannerPage() {
       } catch (err) {
         setError(err instanceof Error ? err.message : 'Failed to fetch data');
       } finally {
-        setLoading(false);
+        if (mounted) setLoading(false);
       }
     };
 
     fetchData();
     const interval = setInterval(fetchData, 30000);
-    return () => clearInterval(interval);
-  }, []);
+    return () => {
+      mounted = false;
+      clearInterval(interval);
+    };
+  }, [universeSymbols]);
 
   const getSignalColor = (signal: string) => {
     if (signal === 'BUY') return 'bg-green-500/10 text-green-700 dark:text-green-400 border-green-200 dark:border-green-800';
@@ -127,52 +232,14 @@ export default function GatewayScannerPage() {
     );
   };
 
-  const toggleSection = (section: string) => {
+  const toggleSection = useCallback((section: string) => {
     setExpandedSections(prev => ({
       ...prev,
       [section]: !prev[section]
     }));
-  };
+  }, []);
 
-  const getProgressBarWidth = (confidence: number) => {
-    return `${Math.min(100, confidence || 0)}%`;
-  };
-
-  const formatValue = (value: any, decimals = 2) => {
-    if (value === undefined || value === null) return 'N/A';
-    if (typeof value === 'number') return value.toFixed(decimals);
-    return String(value);
-  };
-
-  const TechDataSection = ({ title, icon, data: sectionData }: { title: string; icon: string; data: Array<[string, any]> }) => {
-    const sectionKey = title.toLowerCase().replace(/\s+/g, '_');
-    const isExpanded = expandedSections[sectionKey] ?? true;
-    
-    return (
-      <div className="border rounded-lg overflow-hidden">
-        <button
-          onClick={() => toggleSection(sectionKey)}
-          className="w-full px-4 py-3 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 flex items-center justify-between transition-colors"
-        >
-          <div className="flex items-center gap-2 font-semibold">
-            <span>{icon}</span>
-            <span>{title}</span>
-          </div>
-          <ChevronDown className={`w-4 h-4 transition-transform ${isExpanded ? 'rotate-180' : ''}`} />
-        </button>
-        {isExpanded && (
-          <div className="p-4 space-y-2 bg-slate-50 dark:bg-slate-900">
-            {sectionData.map(([label, value], idx) => (
-              <div key={idx} className="flex justify-between items-center text-sm">
-                <span className="text-muted-foreground">{label}</span>
-                <span className="font-mono font-semibold">{formatValue(value)}</span>
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
-    );
-  };
+  const sectionKeyFromTitle = (title: string) => title.toLowerCase().replace(/\s+/g, '_');
 
   if (loading) {
     return (
@@ -188,7 +255,11 @@ export default function GatewayScannerPage() {
   const selectedData = selectedSymbol ? data[selectedSymbol]?.fullData : null;
 
   // Symbol list used for rendering grid; prefer universeSymbols if available
-  const SYMBOLS = (universeSymbols && universeSymbols.length) ? universeSymbols.map(s => s.symbol).slice(0,15) : DEFAULT_SYMBOLS;
+  const SYMBOLS = useMemo(() => (universeSymbols && universeSymbols.length) ? universeSymbols.map(s => s.symbol).slice(0,15) : DEFAULT_SYMBOLS, [universeSymbols]);
+
+  const symbolsLoadedCount = useMemo(() => Object.keys(data).length, [data]);
+  const buyCount = useMemo(() => Object.values(data).filter(d => d.signal === 'BUY').length, [data]);
+  const sellCount = useMemo(() => Object.values(data).filter(d => d.signal === 'SELL').length, [data]);
 
   return (
     <div className="space-y-6 p-6">
@@ -241,6 +312,8 @@ export default function GatewayScannerPage() {
                 ['ROC (12)', selectedData.roc],
                 ['Momentum', selectedData.momentum],
               ]}
+              isExpanded={expandedSections[sectionKeyFromTitle('📊 Momentum Indicators')] ?? true}
+              onToggle={() => toggleSection(sectionKeyFromTitle('📊 Momentum Indicators'))}
             />
 
             <TechDataSection
@@ -254,6 +327,8 @@ export default function GatewayScannerPage() {
                 ['BB Width %', selectedData.bbWidthPercent],
                 ['Keltner', selectedData.keltner],
               ]}
+              isExpanded={expandedSections[sectionKeyFromTitle('📈 Volatility & Bands')] ?? true}
+              onToggle={() => toggleSection(sectionKeyFromTitle('📈 Volatility & Bands'))}
             />
 
             <TechDataSection
@@ -267,6 +342,8 @@ export default function GatewayScannerPage() {
                 ['Trend Direction', selectedData.trendDirection],
                 ['Trend Strength', `${selectedData.trendStrength?.toFixed(1)}%`],
               ]}
+              isExpanded={expandedSections[sectionKeyFromTitle('🔄 Trend Analysis')] ?? true}
+              onToggle={() => toggleSection(sectionKeyFromTitle('🔄 Trend Analysis'))}
             />
 
             <TechDataSection
@@ -278,6 +355,8 @@ export default function GatewayScannerPage() {
                 ['Volume Change', selectedData.volumeChange],
                 ['On Balance Volume', selectedData.onBalanceVolume],
               ]}
+              isExpanded={expandedSections[sectionKeyFromTitle('📦 Volume Analysis')] ?? true}
+              onToggle={() => toggleSection(sectionKeyFromTitle('📦 Volume Analysis'))}
             />
 
             <TechDataSection
@@ -288,6 +367,8 @@ export default function GatewayScannerPage() {
                 ['Stoch %D', selectedData.stochD],
                 ['Stoch RSI', selectedData.stochRSI],
               ]}
+              isExpanded={expandedSections[sectionKeyFromTitle('🎯 Stochastic')] ?? true}
+              onToggle={() => toggleSection(sectionKeyFromTitle('🎯 Stochastic'))}
             />
 
             <TechDataSection
@@ -298,6 +379,8 @@ export default function GatewayScannerPage() {
                 ['Resistance', selectedData.resistance],
                 ['Price to Support', selectedData.priceToSupport],
               ]}
+              isExpanded={expandedSections[sectionKeyFromTitle('🎪 Support/Resistance')] ?? true}
+              onToggle={() => toggleSection(sectionKeyFromTitle('🎪 Support/Resistance'))}
             />
 
             <TechDataSection
@@ -308,6 +391,8 @@ export default function GatewayScannerPage() {
                 ['Price Range', selectedData.priceRange],
                 ['Price Change %', `${selectedData.priceChangePercent?.toFixed(2)}%`],
               ]}
+              isExpanded={expandedSections[sectionKeyFromTitle('⚠️ Risk Metrics')] ?? true}
+              onToggle={() => toggleSection(sectionKeyFromTitle('⚠️ Risk Metrics'))}
             />
 
             <TechDataSection
@@ -318,6 +403,8 @@ export default function GatewayScannerPage() {
                 ['Strength', `${selectedData.signalStrength?.toFixed(1)}%`],
                 ['Confidence', `${selectedData.signalConfidence?.toFixed(1)}%`],
               ]}
+              isExpanded={expandedSections[sectionKeyFromTitle('✨ Signal')] ?? true}
+              onToggle={() => toggleSection(sectionKeyFromTitle('✨ Signal'))}
             />
           </div>
 
@@ -333,57 +420,7 @@ export default function GatewayScannerPage() {
           {SYMBOLS.map((symbol) => {
             const df = data[symbol];
             if (!df && Object.keys(data).length > 0) return null;
-
-            return (
-              <Card
-                key={symbol}
-                className="p-4 hover:shadow-lg transition-shadow cursor-pointer hover:border-primary"
-                onClick={() => setSelectedSymbol(symbol)}
-              >
-                <div className="space-y-3">
-                  <div className="flex items-start justify-between">
-                    <div>
-                      <h3 className="font-bold text-lg">{symbol}</h3>
-                      <p className="text-sm text-muted-foreground">${df?.close?.toFixed(2) || 'Loading...'}</p>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      {getTrendIcon(df?.trendDirection || 'UPTREND')}
-                      <Badge className={`${getSignalColor(df?.signal || 'HOLD')} border`}>
-                        {df?.signal || 'HOLD'}
-                      </Badge>
-                    </div>
-                  </div>
-
-                  {df?.priceChangePercent !== undefined && (
-                    <div className="text-sm">
-                      <span className={df.priceChangePercent >= 0 ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}>
-                        {df.priceChangePercent >= 0 ? '+' : ''}{df.priceChangePercent?.toFixed(2)}%
-                      </span>
-                    </div>
-                  )}
-
-                  <div className="grid grid-cols-2 gap-2 pt-2 border-t">
-                    <div><p className="text-xs text-muted-foreground">RSI</p><p className="text-sm font-mono">{df?.rsi?.toFixed(1) || 'N/A'}</p></div>
-                    <div><p className="text-xs text-muted-foreground">MACD</p><p className="text-sm font-mono">{df?.macd?.toFixed(3) || 'N/A'}</p></div>
-                    <div><p className="text-xs text-muted-foreground">ATR</p><p className="text-sm font-mono">{df?.atr?.toFixed(2) || 'N/A'}</p></div>
-                    <div><p className="text-xs text-muted-foreground">Volume</p><p className="text-sm font-mono">{df?.volume ? (df.volume / 1000).toFixed(0) : '0'}k</p></div>
-                  </div>
-
-                  <div className="border-t pt-2">
-                    <p className="text-xs text-muted-foreground font-semibold mb-1">Confidence</p>
-                    <div className="flex items-center justify-between mb-1">
-                      <span className="text-sm font-mono">{df?.signalConfidence?.toFixed(0) || '0'}%</span>
-                    </div>
-                    <div className="w-full bg-slate-200 dark:bg-slate-700 rounded-full h-1.5 overflow-hidden">
-                      <div 
-                        className="bg-blue-500 h-1.5 rounded-full transition-all"
-                        style={{ width: getProgressBarWidth(df?.signalConfidence) } as React.CSSProperties} 
-                      />
-                    </div>
-                  </div>
-                </div>
-              </Card>
-            );
+            return <SymbolCard key={symbol} symbol={symbol} df={df} onClick={(s) => setSelectedSymbol(s)} />;
           })}
         </div>
       )}
@@ -397,19 +434,15 @@ export default function GatewayScannerPage() {
       <Card className="p-4 bg-slate-50 dark:bg-slate-900">
         <div className="grid grid-cols-3 gap-4 text-center">
           <div>
-            <p className="text-2xl font-bold text-primary">{Object.keys(data).length}</p>
+            <p className="text-2xl font-bold text-primary">{symbolsLoadedCount}</p>
             <p className="text-sm text-muted-foreground">Symbols Loaded</p>
           </div>
           <div>
-            <p className="text-2xl font-bold text-green-600">
-              {Object.values(data).filter(d => d.signal === 'BUY').length}
-            </p>
+            <p className="text-2xl font-bold text-green-600">{buyCount}</p>
             <p className="text-sm text-muted-foreground">Buy Signals</p>
           </div>
           <div>
-            <p className="text-2xl font-bold text-red-600">
-              {Object.values(data).filter(d => d.signal === 'SELL').length}
-            </p>
+            <p className="text-2xl font-bold text-red-600">{sellCount}</p>
             <p className="text-sm text-muted-foreground">Sell Signals</p>
           </div>
         </div>

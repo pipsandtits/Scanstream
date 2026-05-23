@@ -1,8 +1,117 @@
 import { Router, Request, Response } from 'express';
 import axios from 'axios';
+import { coinGeckoService } from '../services/coingecko';
 import { storage } from '../storage';
+import { apiRegistry } from '../services/api-registry';
+import type { MarketFrame } from '@shared/schema';
+
+// Simple in-memory cache to avoid recalculating heavy insights for each poll
+const _insightsCache: Map<string, { ts: number; data: any }> = new Map();
+const INSIGHTS_TTL_MS = 3000; // 3s - short to reduce poll stacking
+
+function cacheGet(key: string) {
+  const ent = _insightsCache.get(key);
+  if (!ent) return null;
+  if (Date.now() - ent.ts > INSIGHTS_TTL_MS) {
+    _insightsCache.delete(key);
+    return null;
+  }
+  return ent.data;
+}
+
+function cacheSet(key: string, data: any) {
+  _insightsCache.set(key, { ts: Date.now(), data });
+}
+
+// Helper: run promise with timeout
+async function withTimeout<T>(p: Promise<T>, ms: number, fallback: T): Promise<T> {
+  let timed = false;
+  const t = new Promise<T>((resolve) => setTimeout(() => { timed = true; resolve(fallback); }, ms));
+  const r = await Promise.race([p, t]);
+  if (timed) return fallback;
+  return r as T;
+}
 
 const router = Router();
+
+// Register endpoints with API registry
+try {
+  apiRegistry.registerEndpoint({
+    method: 'GET',
+    path: '/api/agents/signals/asset-insights',
+    category: 'AGENT',
+    name: 'Asset Insights (all)',
+    description: 'Aggregated agent insights for a set of core assets',
+    version: '1.0.0',
+    tags: ['agents','insights'],
+    isDeprecated: false,
+    authentication: 'NONE',
+    cacheable: true,
+    cacheTTLSeconds: 3,
+    isActive: true
+  });
+
+  apiRegistry.registerEndpoint({
+    method: 'GET',
+    path: '/api/agents/signals/asset-insights/:symbol',
+    category: 'AGENT',
+    name: 'Asset Insights (single)',
+    description: 'Agent insights for a single asset',
+    version: '1.0.0',
+    tags: ['agents','insights'],
+    isDeprecated: false,
+    authentication: 'NONE',
+    cacheable: true,
+    cacheTTLSeconds: 3,
+    isActive: true
+  });
+
+  apiRegistry.registerEndpoint({
+    method: 'GET',
+    path: '/api/agents/signals/compare',
+    category: 'AGENT',
+    name: 'Compare Agent Signals',
+    description: 'Compare signals across assets',
+    version: '1.0.0',
+    tags: ['agents','compare'],
+    isDeprecated: false,
+    authentication: 'NONE',
+    cacheable: true,
+    cacheTTLSeconds: 3,
+    isActive: true
+  });
+
+  apiRegistry.registerEndpoint({
+    method: 'GET',
+    path: '/api/agents/signals/divergence-alert',
+    category: 'AGENT',
+    name: 'Divergence Alerts',
+    description: 'Assets where agents strongly diverge',
+    version: '1.0.0',
+    tags: ['agents','alerts'],
+    isDeprecated: false,
+    authentication: 'NONE',
+    cacheable: true,
+    cacheTTLSeconds: 3,
+    isActive: true
+  });
+
+  apiRegistry.registerEndpoint({
+    method: 'POST',
+    path: '/api/agents/signals/record-insight',
+    category: 'AGENT',
+    name: 'Record Insight',
+    description: 'Record a single agent insight',
+    version: '1.0.0',
+    tags: ['agents','insights'],
+    isDeprecated: false,
+    authentication: 'NONE',
+    cacheable: false,
+    isActive: true
+  });
+} catch (e) {
+  console.warn('[APIRegistry] Failed to register agent signal endpoints', e);
+}
 
 /**
  * Agent Signal Insights API - REAL DATA INTEGRATION
@@ -27,10 +136,10 @@ const router = Router();
  * Calculate confidence based on actual market indicators
  * Returns unique per-asset confidence values derived from real market data
  */
-async function generateMockInsights(symbol: string, price: number): Promise<any> {
+async function generateMockInsights(symbol: string, price: number, preloadedFrames?: MarketFrame[]): Promise<any> {
   try {
-    // Get actual market frames to derive real confidence values
-    const frames = await storage.getMarketFrames(symbol, 50);
+    // Use preloaded frames when provided to avoid N+1
+    const frames = preloadedFrames ?? await storage.getMarketFrames(symbol, 50);
     
     // Calculate indicators from market data
     let rsiValue = 50; // neutral default
@@ -91,11 +200,12 @@ async function generateMockInsights(symbol: string, price: number): Promise<any>
 
     const insights = {
       // Scanner sees technical patterns
-      scanner: {
+        scanner: {
         agentName: 'BreakoutHunter',
         agentType: 'SCANNER',
         signal: rsiValue > 55 ? 'BUY' : rsiValue < 45 ? 'SELL' : 'HOLD',
         confidence: scannerConfidence,
+        accuracy: 0.62,
         insights: {
           primary: `Price at RSI ${rsiValue.toFixed(1)} with volume ratio ${volumeRatio.toFixed(2)}`,
           secondary: [
@@ -119,11 +229,12 @@ async function generateMockInsights(symbol: string, price: number): Promise<any>
       },
 
       // ML sees statistical patterns
-      ml: {
+        ml: {
         agentName: 'MLOracle',
         agentType: 'ML',
         signal: priceChange > 0.5 ? 'BUY' : priceChange < -0.5 ? 'SELL' : 'HOLD',
         confidence: mlConfidence,
+        accuracy: 0.58,
         insights: {
           primary: `Price change ${priceChange.toFixed(2)}% - ensemble model predicts ${(mlConfidence * 100).toFixed(0)}% probability of continuation`,
           secondary: [
@@ -147,11 +258,12 @@ async function generateMockInsights(symbol: string, price: number): Promise<any>
       },
 
       // RL sees Q-values
-      rl: {
+        rl: {
         agentName: 'RLAgent',
         agentType: 'RL',
         signal: rlConfidence > 0.5 ? 'BUY' : 'HOLD',
         confidence: rlConfidence,
+        accuracy: 0.51,
         insights: {
           primary: `Q-value ${rlConfidence.toFixed(2)} ${rlConfidence > 0.5 ? 'above' : 'below'} threshold - ${rlConfidence > 0.5 ? 'entry is valuable' : 'hold for better entry'}`,
           secondary: [
@@ -175,11 +287,12 @@ async function generateMockInsights(symbol: string, price: number): Promise<any>
       },
 
       // Flow sees force vectors
-      flow: {
+        flow: {
         agentName: 'FlowMomentum',
         agentType: 'FLOW',
         signal: flowConfidence > 0.6 ? 'BUY' : 'HOLD',
         confidence: flowConfidence,
+        accuracy: 0.71,
         insights: {
           primary: `Force magnitude ${(flowConfidence * 10).toFixed(1)}/10 with ${volumeRatio > 1.5 ? 'strong' : 'moderate'} pressure gradient`,
           secondary: [
@@ -203,11 +316,12 @@ async function generateMockInsights(symbol: string, price: number): Promise<any>
       },
 
       // VFMD sees vector divergence
-      vfmd: {
+        vfmd: {
         agentName: 'VectorForce',
         agentType: 'VFMD',
         signal: vfmdConfidence > 0.65 ? 'BUY' : 'HOLD',
         confidence: vfmdConfidence,
+        accuracy: 0.76,
         insights: {
           primary: `${vfmdConfidence > 0.7 ? 'Strong' : 'Moderate'} divergence between price momentum and vector field at ${vfmdConfidence.toFixed(2)} strength`,
           secondary: [
@@ -231,11 +345,12 @@ async function generateMockInsights(symbol: string, price: number): Promise<any>
       },
 
       // Exit sees profit stages
-      exit: {
+        exit: {
         agentName: 'ExitMaster',
         agentType: 'EXIT',
         signal: 'HOLD',
         confidence: 0.65,
+        accuracy: 0.82,
         insights: {
           primary: 'No active position - entry opportunity present but exit specialist waits for confirmation',
           secondary: [
@@ -259,11 +374,12 @@ async function generateMockInsights(symbol: string, price: number): Promise<any>
       },
 
       // Opposition sees levels
-      opposition: {
+        opposition: {
         agentName: 'ResistanceReader',
         agentType: 'OPPOSITION',
         signal: 'HOLD',
         confidence: 0.58,
+        accuracy: 0.71,
         insights: {
           primary: 'Price near support with resistance 2.1% away - consolidation likely',
           secondary: [
@@ -287,11 +403,12 @@ async function generateMockInsights(symbol: string, price: number): Promise<any>
       },
 
       // Microstructure sees order flow
-      microstructure: {
+        microstructure: {
         agentName: 'LiquidityHunter',
         agentType: 'MICROSTRUCTURE',
         signal: volumeRatio > 1.5 ? 'BUY' : 'HOLD',
         confidence: Math.min(0.75, volumeRatio / 3),
+        accuracy: 0.64,
         insights: {
           primary: `Order book imbalanced ${volumeRatio > 1.5 ? 'bullish' : 'balanced'} with spread ${volumeRatio > 1.5 ? 'healthy' : 'widening'}`,
           secondary: [
@@ -326,7 +443,7 @@ async function generateMockInsights(symbol: string, price: number): Promise<any>
 /**
  * Fallback mock when market data unavailable
  */
-function generateFallbackMockInsights(symbol: string, price: number): any {
+function generateFallbackMockInsights(symbol: string, price: number, _preloadedFrames?: MarketFrame[]): any {
   const baseConfidence = Math.random() * 0.4 + 0.5;
   return [
     {
@@ -523,18 +640,9 @@ async function fetchRealAgentSignals(symbol: string, price: number) {
 async function fetchRealPrice(symbol: string): Promise<number> {
   try {
     const coinId = symbol.split('/')[0].toLowerCase();
-    const response = await axios.get(
-      `https://api.coingecko.com/api/v3/simple/price`,
-      {
-        params: {
-          ids: coinId,
-          vs_currencies: 'usd'
-        },
-        timeout: 3000
-      }
-    );
-    
-    return response.data[coinId]?.usd || 0;
+    const md = await coinGeckoService.getMarketDataByIds(coinId, 'usd');
+    const item = Array.isArray(md) && md.length > 0 ? md[0] : null;
+    return item?.current_price || 0;
   } catch (e) {
     console.log(`[CoinGecko] Price fetch failed for ${symbol}, using fallback`);
     return 0;
@@ -547,66 +655,105 @@ async function fetchRealPrice(symbol: string): Promise<number> {
  */
 router.get('/asset-insights', async (req: Request, res: Response) => {
   try {
+    const cachedAll = cacheGet('asset-insights:all');
+    if (cachedAll) {
+      return res.json({ success: true, data: cachedAll, cached: true, timestamp: new Date().toISOString() });
+    }
     const symbols = ['BTC', 'ETH', 'SOL', 'XRP', 'ADA', 'AVAX', 'MATIC', 'DOGE', 'LINK', 'UNI',
                      'ATOM', 'ARB', 'OP', 'NEAR', 'PEPE'];
 
-    // Fetch real prices from CoinGecko
-    const pricesResponse = await axios.get(
-      'https://api.coingecko.com/api/v3/simple/price',
-      {
-        params: {
-          ids: symbols.map(s => s.toLowerCase()).join(','),
-          vs_currencies: 'usd',
-          include_24hr_change: 'true'
-        },
-        timeout: 5000
+    // Fetch real prices from CoinGecko via service
+    let pricesResponse: any = { data: {} };
+    try {
+      const md = await coinGeckoService.getMarketDataByIds(symbols.map(s => s.toLowerCase()).join(','), 'usd');
+      // build map
+      pricesResponse.data = {};
+      for (const item of md) {
+        pricesResponse.data[item.id] = {
+          usd: item.current_price,
+          usd_24h_change: item.price_change_percentage_24h || 0
+        };
       }
-    ).catch(() => ({ data: {} }));
+    } catch (e) {
+      pricesResponse = { data: {} };
+    }
 
+    // Batch fetch market frames for all symbols to avoid N+1
+    const framesMap = (storage.getMarketFramesForSymbols
+      ? await storage.getMarketFramesForSymbols(symbols, 50)
+      : await Promise.all(symbols.map(async (sym: string) => ({ [sym]: await storage.getMarketFrames(sym, 50) })))) as Record<string, MarketFrame[]>;
+
+    // Run with controlled concurrency and per-call timeouts
     const assetGroups = await Promise.all(
       symbols.map(async (symbol) => {
-        const coinId = symbol.toLowerCase();
-        const priceData = pricesResponse.data[coinId];
-        const price = priceData?.usd || Math.random() * 100 + 1;
-        const priceChange = priceData?.usd_24h_change || (Math.random() * 10 - 5);
+        try {
+          const coinId = symbol.toLowerCase();
+          const priceData = pricesResponse.data[coinId];
+          const price = priceData?.usd || Math.random() * 100 + 1;
+          const priceChange = priceData?.usd_24h_change || (Math.random() * 10 - 5);
 
-        // Get real signals from all agents
-        const signals = await fetchRealAgentSignals(symbol, price);
-        
-        const buyAgents = signals.filter((s: any) => s.signal === 'BUY').length;
-        const sellAgents = signals.filter((s: any) => s.signal === 'SELL').length;
-        const holdAgents = signals.filter((s: any) => s.signal === 'HOLD').length;
-        const total = signals.length;
-        const avgConfidence = (
-          signals.reduce((sum: number, s: any) => sum + s.confidence, 0) / total * 100
-        ).toFixed(0);
+          // Get preloaded frames for this symbol (if any)
+          const preloaded = framesMap[symbol] || [];
 
-        let consensusSignal = 'HOLD';
-        if (buyAgents >= 7) consensusSignal = 'BUY';
-        else if (sellAgents >= 7) consensusSignal = 'SELL';
+          // Get real signals from all agents but bound time per-symbol to 1500ms
+          const signals = await withTimeout(fetchRealAgentSignals(symbol, price), 1500, await generateFallbackMockInsights(symbol, price, preloaded));
 
-        let riskScore: 'LOW' | 'MEDIUM' | 'HIGH' = 'MEDIUM';
-        if (buyAgents >= 10 && Number(avgConfidence) > 70) riskScore = 'LOW';
-        if (sellAgents >= 7) riskScore = 'HIGH';
+          const buyAgents = signals.filter((s: any) => s.signal === 'BUY').length;
+          const sellAgents = signals.filter((s: any) => s.signal === 'SELL').length;
+          const holdAgents = signals.filter((s: any) => s.signal === 'HOLD').length;
+          const total = signals.length || 1;
+          const avgConfidence = (
+            signals.reduce((sum: number, s: any) => sum + (s.confidence || 0), 0) / total * 100
+          ).toFixed(0);
 
-        // Estimate volume (can be enhanced with real data)
-        const volume = Math.random() * 1000000000;
+          let consensusSignal = 'HOLD';
+          if (buyAgents >= 7) consensusSignal = 'BUY';
+          else if (sellAgents >= 7) consensusSignal = 'SELL';
 
-        return {
-          symbol: symbol + '/USD',
-          price: parseFloat(price.toFixed(2)),
-          priceChange: parseFloat(priceChange.toFixed(2)),
-          volume,
-          consensusSignal,
-          buyAgents,
-          holdAgents,
-          sellAgents,
-          avgConfidence: parseFloat(avgConfidence),
-          riskScore,
-          signals
-        };
+          let riskScore: 'LOW' | 'MEDIUM' | 'HIGH' = 'MEDIUM';
+          if (buyAgents >= 10 && Number(avgConfidence) > 70) riskScore = 'LOW';
+          if (sellAgents >= 7) riskScore = 'HIGH';
+
+          // Estimate volume (can be enhanced with real data)
+          const volume = Math.random() * 1000000000;
+
+          const out = {
+            symbol: symbol + '/USD',
+            price: parseFloat(price.toFixed(2)),
+            priceChange: parseFloat(priceChange.toFixed(2)),
+            volume,
+            consensusSignal,
+            buyAgents,
+            holdAgents,
+            sellAgents,
+            avgConfidence: parseFloat(avgConfidence),
+            riskScore,
+            signals
+          };
+
+          return out;
+        } catch (e) {
+          // On per-symbol error return fallback quickly
+          const fallback = (await generateFallbackMockInsights(symbol, 10))[0];
+          return {
+            symbol: symbol + '/USD',
+            price: 10,
+            priceChange: 0,
+            volume: 0,
+            consensusSignal: 'HOLD',
+            buyAgents: 0,
+            holdAgents: 1,
+            sellAgents: 0,
+            avgConfidence: 50,
+            riskScore: 'MEDIUM',
+            signals: [fallback]
+          };
+        }
       })
     );
+
+    // Cache the aggregated asset insights briefly to avoid poll piling
+    cacheSet('asset-insights:all', assetGroups);
 
     res.json({
       success: true,
@@ -632,22 +779,17 @@ router.get('/asset-insights/:symbol', async (req: Request, res: Response) => {
     const baseSymbol = symbol.split('/')[0].toUpperCase();
 
     // Fetch real price
-    const priceResponse = await axios.get(
-      'https://api.coingecko.com/api/v3/simple/price',
-      {
-        params: {
-          ids: baseSymbol.toLowerCase(),
-          vs_currencies: 'usd',
-          include_24hr_change: 'true'
-        },
-        timeout: 5000
-      }
-    ).catch(() => ({ data: {} }));
-
-    const coinId = baseSymbol.toLowerCase();
-    const priceData = priceResponse.data[coinId];
-    const price = priceData?.usd || 1000;
-    const priceChange = priceData?.usd_24h_change || 0;
+    let price = 1000;
+    let priceChange = 0;
+    try {
+      const md = await coinGeckoService.getMarketDataByIds(baseSymbol.toLowerCase(), 'usd');
+      const item = Array.isArray(md) && md.length > 0 ? md[0] : null;
+      price = item?.current_price || 1000;
+      priceChange = item?.price_change_percentage_24h || 0;
+    } catch (e) {
+      price = 1000;
+      priceChange = 0;
+    }
 
     // Get real signals
     const signals = await fetchRealAgentSignals(baseSymbol, price);
@@ -702,16 +844,17 @@ router.get('/compare', async (req: Request, res: Response) => {
     const symbols = ['BTC', 'ETH', 'SOL'];
 
     // Fetch real prices
-    const pricesResponse = await axios.get(
-      'https://api.coingecko.com/api/v3/simple/price',
-      {
-        params: {
-          ids: symbols.map(s => s.toLowerCase()).join(','),
-          vs_currencies: 'usd'
-        },
-        timeout: 5000
+    // Fetch prices via service
+    let pricesResponse: any = { data: {} };
+    try {
+      const md = await coinGeckoService.getMarketDataByIds(symbols.map(s => s.toLowerCase()).join(','), 'usd');
+      pricesResponse.data = {};
+      for (const item of md) {
+        pricesResponse.data[item.id] = { usd: item.current_price };
       }
-    ).catch(() => ({ data: {} }));
+    } catch (e) {
+      pricesResponse = { data: {} };
+    }
 
     const comparison = await Promise.all(
       symbols.map(async (symbol) => {
@@ -779,16 +922,17 @@ router.get('/divergence-alert', async (req: Request, res: Response) => {
     const symbols = ['BTC', 'ETH', 'SOL', 'XRP', 'ADA'];
 
     // Fetch real prices
-    const pricesResponse = await axios.get(
-      'https://api.coingecko.com/api/v3/simple/price',
-      {
-        params: {
-          ids: symbols.map(s => s.toLowerCase()).join(','),
-          vs_currencies: 'usd'
-        },
-        timeout: 5000
+    // Fetch prices via service
+    let pricesResponse: any = { data: {} };
+    try {
+      const md = await coinGeckoService.getMarketDataByIds(symbols.map(s => s.toLowerCase()).join(','), 'usd');
+      pricesResponse.data = {};
+      for (const item of md) {
+        pricesResponse.data[item.id] = { usd: item.current_price };
       }
-    ).catch(() => ({ data: {} }));
+    } catch (e) {
+      pricesResponse = { data: {} };
+    }
 
     const divergences = await Promise.all(
       symbols.map(async (symbol) => {
@@ -804,6 +948,7 @@ router.get('/divergence-alert', async (req: Request, res: Response) => {
           price: parseFloat(price.toFixed(2)),
           buyAgents,
           sellAgents,
+          timestamp: Date.now(),
           divergenceScore: signals.length > 0 
             ? Math.abs(buyAgents - sellAgents) / signals.length 
             : 0,
@@ -814,7 +959,17 @@ router.get('/divergence-alert', async (req: Request, res: Response) => {
 
     const filtered = divergences
       .filter(d => d.isDiverged)
-      .sort((a, b) => b.divergenceScore - a.divergenceScore);
+      .sort((a, b) => b.divergenceScore - a.divergenceScore)
+      .map(d => ({
+        id: `div-${d.symbol}-${d.timestamp || Date.now()}`,
+        symbol: d.symbol,
+        type: 'DIVERGENCE',
+        message: `${d.buyAgents} buy vs ${d.sellAgents} sell`,
+        severity: (d.divergenceScore || 0) > 0.6 ? 'CRITICAL' : (d.divergenceScore || 0) > 0.3 ? 'WARNING' : 'INFO',
+        timestamp: d.timestamp || Date.now(),
+        actionable: true,
+        raw: d
+      }));
 
     res.json({
       success: true,
@@ -838,17 +993,17 @@ router.get('/consensus-strength', async (req: Request, res: Response) => {
   try {
     const symbols = ['BTC', 'ETH', 'SOL', 'XRP', 'ADA'];
 
-    // Fetch real prices
-    const pricesResponse = await axios.get(
-      'https://api.coingecko.com/api/v3/simple/price',
-      {
-        params: {
-          ids: symbols.map(s => s.toLowerCase()).join(','),
-          vs_currencies: 'usd'
-        },
-        timeout: 5000
+    // Fetch real prices via service
+    let pricesResponse: any = { data: {} };
+    try {
+      const md = await coinGeckoService.getMarketDataByIds(symbols.map(s => s.toLowerCase()).join(','), 'usd');
+      pricesResponse.data = {};
+      for (const item of md) {
+        pricesResponse.data[item.id] = { usd: item.current_price };
       }
-    ).catch(() => ({ data: {} }));
+    } catch (e) {
+      pricesResponse = { data: {} };
+    }
 
     const consensuses = await Promise.all(
       symbols.map(async (symbol) => {

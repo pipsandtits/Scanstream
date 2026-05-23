@@ -4,12 +4,14 @@
  */
 
 import { Request, Response } from 'express';
-import { PrismaClient } from '@prisma/client';
+import pkg from '@prisma/client';
+const { PrismaClient } = pkg as any;
 import crypto from 'crypto';
 
 const prisma = new PrismaClient();
 
-// In-memory caches for settings (TODO: move to database when tables are available)
+// In-memory caches for settings. Preferences and API keys are persisted to the DB;
+// remaining caches are kept in-memory as fallbacks and can be migrated later.
 const userSettingsCache = new Map<string, any>();
 const userPreferencesCache = new Map<string, any>();
 const tradingSettingsCache = new Map<string, any>();
@@ -110,15 +112,13 @@ export async function deleteAccount(req: AuthRequest, res: Response) {
       where: { id: userId }
     });
 
-    // Clear caches
+    // DB cascade will remove related ApiKeys / Preferences; clear in-memory fallbacks
     userSettingsCache.delete(userId);
-    userPreferencesCache.delete(userId);
     tradingSettingsCache.delete(userId);
     dashboardSettingsCache.delete(userId);
     advancedSettingsCache.delete(userId);
     securitySettingsCache.delete(userId);
     loginSessionsCache.delete(userId);
-    apiKeysCache.delete(userId);
 
     res.json({ success: true, message: 'Account deleted successfully' });
   } catch (error: any) {
@@ -135,7 +135,16 @@ export async function getPreferences(req: AuthRequest, res: Response) {
     const userId = req.user?.id;
     if (!userId) return res.status(401).json({ error: 'Unauthorized' });
 
-    const prefs = userPreferencesCache.get(userId) || {
+    // Prefer persisted preferences when available
+    const dbPref = await prisma.userPreference.findUnique({ where: { userId } });
+    if (dbPref) {
+      // return only preference fields
+      const { theme, defaultTimeframe, defaultExchange, notificationsEnabled, emailAlerts, priceAlerts, signalAlerts, soundEnabled } = dbPref;
+      return res.json({ theme, defaultTimeframe, defaultExchange, notificationsEnabled, emailAlerts, priceAlerts, signalAlerts, soundEnabled });
+    }
+
+    // Fallback defaults
+    const prefs = {
       theme: 'dark',
       defaultTimeframe: '1h',
       defaultExchange: 'binance',
@@ -158,7 +167,26 @@ export async function updatePreferences(req: AuthRequest, res: Response) {
     const userId = req.user?.id;
     if (!userId) return res.status(401).json({ error: 'Unauthorized' });
 
-    userPreferencesCache.set(userId, req.body);
+    const payload = {
+      theme: req.body.theme ?? 'dark',
+      defaultTimeframe: req.body.defaultTimeframe ?? '1h',
+      defaultExchange: req.body.defaultExchange ?? 'binance',
+      notificationsEnabled: typeof req.body.notificationsEnabled === 'boolean' ? req.body.notificationsEnabled : true,
+      emailAlerts: typeof req.body.emailAlerts === 'boolean' ? req.body.emailAlerts : false,
+      priceAlerts: typeof req.body.priceAlerts === 'boolean' ? req.body.priceAlerts : true,
+      signalAlerts: typeof req.body.signalAlerts === 'boolean' ? req.body.signalAlerts : true,
+      soundEnabled: typeof req.body.soundEnabled === 'boolean' ? req.body.soundEnabled : true,
+    };
+
+    await prisma.userPreference.upsert({
+      where: { userId },
+      update: payload,
+      create: { userId, ...payload }
+    });
+
+    // keep in-memory fallback in sync
+    userPreferencesCache.set(userId, payload);
+
     res.json({ success: true });
   } catch (error: any) {
     console.error('Update preferences error:', error);
@@ -320,8 +348,26 @@ export async function getLoginSessions(req: AuthRequest, res: Response) {
     const userId = req.user?.id;
     if (!userId) return res.status(401).json({ error: 'Unauthorized' });
 
-    const sessions = loginSessionsCache.get(userId) || [];
-    res.json(sessions);
+    // Try persisted sessions from Prisma `Session` table. The session JSON structure
+    // is app-dependent; we'll parse stored `sess` JSON and filter by userId when available.
+    const dbSessions = await prisma.session.findMany({ take: 1000 });
+    const sessions: any[] = [];
+    for (const s of dbSessions) {
+      try {
+        const sess = s.sess as any;
+        // common patterns: sess.userId or sess.user?.id
+        const storedUserId = sess?.userId ?? sess?.user?.id ?? sess?.user?.userId;
+        if (storedUserId === userId) {
+          sessions.push({ id: s.sid, data: sess, expire: s.expire });
+        }
+      } catch (e) {
+        continue;
+      }
+    }
+
+    // Fallback: in-memory sessions
+    const mem = loginSessionsCache.get(userId) || [];
+    res.json([...sessions, ...mem]);
   } catch (error: any) {
     console.error('Get login sessions error:', error);
     res.status(500).json({ error: 'Failed to fetch login sessions' });
@@ -375,6 +421,8 @@ export async function exportUserData(req: AuthRequest, res: Response) {
       where: { id: userId }
     });
 
+    const dbPref = await prisma.userPreference.findUnique({ where: { userId } });
+
     const exportData = {
       exportDate: new Date().toISOString(),
       user: {
@@ -384,7 +432,7 @@ export async function exportUserData(req: AuthRequest, res: Response) {
         lastName: user?.lastName,
         createdAt: user?.createdAt
       },
-      preferences: userPreferencesCache.get(userId) || {},
+      preferences: dbPref || userPreferencesCache.get(userId) || {},
       settings: {
         trading: tradingSettingsCache.get(userId) || {},
         dashboard: dashboardSettingsCache.get(userId) || {},
@@ -414,8 +462,10 @@ export async function getApiKeys(req: AuthRequest, res: Response) {
     const userId = req.user?.id;
     if (!userId) return res.status(401).json({ error: 'Unauthorized' });
 
-    const keys = apiKeysCache.get(userId) || [];
-    res.json(keys);
+    const keys = await prisma.apiKey.findMany({ where: { userId }, orderBy: { createdAt: 'desc' } });
+    // Mask apiKey before returning
+    const masked = keys.map((k: any) => ({ id: k.id, exchange: k.exchange, name: k.name, isTestnet: k.isTestnet, isActive: k.isActive, createdAt: k.createdAt, lastValidated: k.lastValidated, apiKey: maskApiKey(k.apiKey) }));
+    res.json(masked);
   } catch (error: any) {
     console.error('Get API keys error:', error);
     res.status(500).json({ error: 'Failed to fetch API keys' });
@@ -433,24 +483,24 @@ export async function addApiKey(req: AuthRequest, res: Response) {
       return res.status(400).json({ error: 'Missing required fields' });
     }
 
-    const newKey = {
-      id: crypto.randomUUID(),
-      exchange,
-      name,
-      apiKey: maskApiKey(apiKey),
-      isTestnet: isTestnet || false,
-      isActive: true,
-      createdAt: new Date().toISOString()
-    };
-
-    const keys = apiKeysCache.get(userId) || [];
-    keys.push(newKey);
-    apiKeysCache.set(userId, keys);
-
-    res.status(201).json({
-      success: true,
-      key: newKey
+    const created = await prisma.apiKey.create({
+      data: {
+        userId,
+        exchange,
+        name,
+        apiKey,
+        apiSecret,
+        isTestnet: Boolean(isTestnet),
+        isActive: true
+      }
     });
+
+    // update in-memory fallback
+    const mem = apiKeysCache.get(userId) || [];
+    mem.push({ id: created.id, exchange: created.exchange, name: created.name, apiKey: maskApiKey(created.apiKey), isTestnet: created.isTestnet, isActive: created.isActive, createdAt: created.createdAt });
+    apiKeysCache.set(userId, mem);
+
+    res.status(201).json({ success: true, key: { id: created.id, exchange: created.exchange, name: created.name, apiKey: maskApiKey(created.apiKey), isTestnet: created.isTestnet, isActive: created.isActive, createdAt: created.createdAt } });
   } catch (error: any) {
     console.error('Add API key error:', error);
     res.status(500).json({ error: 'Failed to add API key' });
@@ -463,10 +513,15 @@ export async function deleteApiKey(req: AuthRequest, res: Response) {
     if (!userId) return res.status(401).json({ error: 'Unauthorized' });
 
     const { keyId } = req.params;
-    const keys = apiKeysCache.get(userId) || [];
-    const filtered = keys.filter((k: any) => k.id !== keyId);
-    apiKeysCache.set(userId, filtered);
+    const result = await prisma.apiKey.deleteMany({ where: { id: keyId, userId } });
+    // update in-memory fallback
+    if (result.count > 0) {
+      const keys = apiKeysCache.get(userId) || [];
+      apiKeysCache.set(userId, keys.filter((k: any) => k.id !== keyId));
+      return res.json({ success: true });
+    }
 
+    // If none deleted, still respond success for idempotency
     res.json({ success: true });
   } catch (error: any) {
     console.error('Delete API key error:', error);

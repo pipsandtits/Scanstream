@@ -3,6 +3,7 @@ import axios from 'axios';
 import { gatewayAlertSystem } from '../services/gateway-alerts';
 import { db } from '../db-storage';
 import { signalWebSocketService } from '../services/websocket-signals';
+import { coinGeckoService } from '../services/coingecko';
 
 const router = Router();
 
@@ -161,23 +162,18 @@ router.get('/quick/:symbol', async (req: Request, res: Response) => {
 
     // Get real prices from CoinGecko
     const coinId = symbol.replace(/USDT$|\/USDT$/i, '').toLowerCase();
-    const priceResponse = await axios.get(
-      'https://api.coingecko.com/api/v3/simple/price',
-      {
-        params: {
-          ids: coinId,
-          vs_currencies: 'usd',
-          include_24hr_change: 'true',
-          include_market_cap: 'true'
-        },
-        timeout: 5000
-      }
-    ).catch(() => ({ data: {} }));
-
-    const priceData = priceResponse.data[coinId];
-    const price = priceData?.usd || 0;
-    const priceChange = priceData?.usd_24h_change || 0;
-    const marketCap = priceData?.usd_market_cap || 0;
+    let price = 0;
+    let priceChange = 0;
+    let marketCap = 0;
+    try {
+      const md = await coinGeckoService.getMarketDataByIds(coinId, 'usd');
+      const item = Array.isArray(md) && md.length > 0 ? md[0] : null;
+      price = item?.current_price || 0;
+      priceChange = item?.price_change_percentage_24h || 0;
+      marketCap = item?.market_cap || 0;
+    } catch (e) {
+      // ignore and keep defaults
+    }
 
     // Fetch agent signals for this symbol
     const agents = await fetchAgentSignalsForSymbol(normalizedSymbol);
@@ -250,20 +246,14 @@ router.get('/agent-analysis/:symbol', async (req: Request, res: Response) => {
     
     // Get real prices from CoinGecko
     const coinId = symbol.replace(/USDT$/, '').toLowerCase();
-    const priceResponse = await axios.get(
-      'https://api.coingecko.com/api/v3/simple/price',
-      {
-        params: {
-          ids: coinId,
-          vs_currencies: 'usd',
-          include_24hr_change: 'true'
-        },
-        timeout: 5000
-      }
-    ).catch(() => ({ data: {} }));
-
-    const priceData = priceResponse.data[coinId];
-    const price = priceData?.usd || 0;
+    let price = 0;
+    try {
+      const md = await coinGeckoService.getMarketDataByIds(coinId, 'usd');
+      const item = Array.isArray(md) && md.length > 0 ? md[0] : null;
+      price = item?.current_price || 0;
+    } catch (e) {
+      // ignore and keep default price
+    }
 
     // Fetch agent signals
     const agents = await fetchAgentSignalsForSymbol(symbol);

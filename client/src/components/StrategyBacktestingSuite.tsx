@@ -3,10 +3,7 @@ import { X, Play, BarChart3, TrendingUp, AlertCircle, Download, Settings, Activi
 import {
   LineChart,
   Line,
-  BarChart,
   Bar,
-  AreaChart,
-  Area,
   XAxis,
   YAxis,
   CartesianGrid,
@@ -14,6 +11,8 @@ import {
   Legend,
   ResponsiveContainer,
 } from 'recharts';
+import AreaChartCore from './charts/AreaChartCore';
+import BarChartCore from './charts/BarChartCore';
 
 interface Strategy {
   id: string;
@@ -391,53 +390,27 @@ export default function StrategyBacktestingSuite({
                       {/* Equity Curve */}
                       <div className="bg-slate-700/50 rounded-lg p-6 border border-slate-600">
                         <h3 className="text-lg font-semibold text-white mb-4">Equity Curve</h3>
-                        <ResponsiveContainer width="100%" height={300}>
-                          <AreaChart data={backtestResults.equityCurve}>
-                            <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-                            <XAxis dataKey="date" stroke="#94a3b8" tick={{ fontSize: 12 }} />
-                            <YAxis stroke="#94a3b8" tick={{ fontSize: 12 }} />
-                            <Tooltip
-                              contentStyle={{
-                                backgroundColor: 'rgba(15, 23, 42, 0.95)',
-                                border: '1px solid rgba(100, 116, 139, 0.5)',
-                                borderRadius: '8px',
-                              }}
-                            />
-                            <Area
-                              type="monotone"
-                              dataKey="value"
-                              stroke="#3b82f6"
-                              fill="#3b82f6"
-                              fillOpacity={0.2}
-                            />
-                          </AreaChart>
-                        </ResponsiveContainer>
+                        <AreaChartCore
+                          data={backtestResults.equityCurve}
+                          dataKey="value"
+                          height={300}
+                          gradientId="equityGradient"
+                          stroke="#3b82f6"
+                          fill="#3b82f6"
+                        />
                       </div>
 
                       {/* Drawdown Chart */}
                       <div className="bg-slate-700/50 rounded-lg p-6 border border-slate-600">
                         <h3 className="text-lg font-semibold text-white mb-4">Drawdown Series</h3>
-                        <ResponsiveContainer width="100%" height={200}>
-                          <AreaChart data={backtestResults.drawdownSeries}>
-                            <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-                            <XAxis dataKey="date" stroke="#94a3b8" tick={{ fontSize: 12 }} />
-                            <YAxis stroke="#94a3b8" tick={{ fontSize: 12 }} />
-                            <Tooltip
-                              contentStyle={{
-                                backgroundColor: 'rgba(15, 23, 42, 0.95)',
-                                border: '1px solid rgba(100, 116, 139, 0.5)',
-                                borderRadius: '8px',
-                              }}
-                            />
-                            <Area
-                              type="monotone"
-                              dataKey="value"
-                              stroke="#ef4444"
-                              fill="#ef4444"
-                              fillOpacity={0.3}
-                            />
-                          </AreaChart>
-                        </ResponsiveContainer>
+                        <AreaChartCore
+                          data={backtestResults.drawdownSeries}
+                          dataKey="value"
+                          height={200}
+                          gradientId="drawdownGradient"
+                          stroke="#ef4444"
+                          fill="#ef4444"
+                        />
                       </div>
 
                       {/* Risk Metrics */}
@@ -497,8 +470,8 @@ export default function StrategyBacktestingSuite({
                         <p className="text-sm text-slate-400 mb-4">
                           {monteCarloResults.length} iterations showing distribution of possible outcomes
                         </p>
-                        <ResponsiveContainer width="100%" height={400}>
-                          <BarChart data={monteCarloResults.slice(0, 50)}>
+                        <div style={{ width: '100%', height: 400 }}>
+                          <BarChartCore data={monteCarloResults.slice(0, 50)} dataKey="finalValue" height={400}>
                             <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
                             <XAxis dataKey="iteration" stroke="#94a3b8" />
                             <YAxis stroke="#94a3b8" />
@@ -510,8 +483,8 @@ export default function StrategyBacktestingSuite({
                               }}
                             />
                             <Bar dataKey="finalValue" fill="#3b82f6" name="Final Value ($)" />
-                          </BarChart>
-                        </ResponsiveContainer>
+                          </BarChartCore>
+                        </div>
                       </div>
                     </div>
                   )}

@@ -1,6 +1,6 @@
 
 import React, { useState } from 'react';
-import { useLocation } from 'wouter';
+import { useNavigate } from 'react-router-dom';
 import { ArrowLeft, Play, Download, Settings, BarChart3, TrendingUp, TrendingDown, Calendar, Clock, Trash2, Zap } from 'lucide-react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import BounceBacktestComponent from '../components/BounceBacktestComponent';
@@ -79,7 +79,7 @@ interface Strategy {
 }
 
 export default function BacktestPage() {
-  const [, setLocation] = useLocation();
+  const navigate = useNavigate();
   const [selectedStrategy, setSelectedStrategy] = useState('');
   const [selectedSymbols, setSelectedSymbols] = useState(['BTC/USDT']);
   const [selectedTimeframe, setSelectedTimeframe] = useState('1h');
@@ -503,7 +503,7 @@ export default function BacktestPage() {
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
           <div className="flex items-center justify-between h-16">
             <button
-              onClick={() => setLocation('/')}
+              onClick={() => navigate('/')}
               className="flex items-center text-slate-400 hover:text-white transition-all hover:translate-x-[-2px]"
             >
               <ArrowLeft className="w-5 h-5 mr-2" />
@@ -563,7 +563,7 @@ export default function BacktestPage() {
                 className="w-4 h-4 accent-blue-500"
               />
               <span className="text-sm font-medium text-blue-300">
-                🚀 PHASE 6A: Multi-Asset Backtest Mode (Test ANY asset combo!)
+                🚀 Multi-Asset Backtest Mode (Test ANY asset combo!)
               </span>
             </label>
             {useMultiAsset && (
@@ -601,6 +601,8 @@ export default function BacktestPage() {
                 </div>
               ) : (
                 <select
+                  title="Symbol"
+                  aria-label="Symbol"
                   value={selectedSymbols[0]}
                   onChange={(e) => setSelectedSymbols([e.target.value])}
                   className="w-full px-3 py-2 border border-slate-700/50 rounded-lg bg-slate-800/50 text-white focus:outline-none focus:ring-2 focus:ring-blue-500/50 focus:border-transparent transition-colors"
@@ -619,6 +621,8 @@ export default function BacktestPage() {
             <div>
               <label className="block text-sm font-medium text-slate-300 mb-2">Strategy {useMultiAsset && '(Optional)'}</label>
               <select
+                title="Strategy"
+                aria-label="Strategy"
                 value={selectedStrategy}
                 onChange={(e) => setSelectedStrategy(e.target.value)}
                 className="w-full px-3 py-2 border border-slate-700/50 rounded-lg bg-slate-800/50 text-white focus:outline-none focus:ring-2 focus:ring-blue-500/50 focus:border-transparent transition-colors"
@@ -634,6 +638,8 @@ export default function BacktestPage() {
             <div>
               <label className="block text-sm font-medium text-slate-300 mb-2">Timeframe</label>
               <select
+                title="Timeframe"
+                aria-label="Timeframe"
                 value={selectedTimeframe}
                 onChange={(e) => setSelectedTimeframe(e.target.value)}
                 className="w-full px-3 py-2 border border-slate-700/50 rounded-lg bg-slate-800/50 text-white focus:outline-none focus:ring-2 focus:ring-blue-500/50 focus:border-transparent transition-colors"
@@ -651,6 +657,9 @@ export default function BacktestPage() {
             <div>
               <label className="block text-sm font-medium text-slate-300 mb-2">Initial Capital ($)</label>
               <input
+                title="Initial capital"
+                aria-label="Initial capital"
+                placeholder="e.g. 10000"
                 type="number"
                 value={initialCapital}
                 onChange={(e) => setInitialCapital(Number(e.target.value))}
@@ -693,6 +702,8 @@ export default function BacktestPage() {
               <div>
                 <label className="block text-sm font-medium text-slate-300 mb-2">Voting Strategy</label>
                 <select
+                  title="Voting strategy"
+                  aria-label="Voting strategy"
                   value={votingStrategy}
                   onChange={(e) => setVotingStrategy(e.target.value)}
                   className="w-full px-3 py-2 border border-slate-700/50 rounded-lg bg-slate-800/50 text-white focus:outline-none focus:ring-2 focus:ring-blue-500/50 focus:border-transparent transition-colors text-sm"
@@ -717,6 +728,8 @@ export default function BacktestPage() {
             <div>
               <label className="block text-sm font-medium text-slate-300 mb-2">Start Date</label>
               <input
+                title="Start date"
+                aria-label="Start date"
                 type="date"
                 value={startDate}
                 onChange={(e) => setStartDate(e.target.value)}
@@ -728,6 +741,8 @@ export default function BacktestPage() {
             <div>
               <label className="block text-sm font-medium text-slate-300 mb-2">End Date</label>
               <input
+                title="End date"
+                aria-label="End date"
                 type="date"
                 value={endDate}
                 onChange={(e) => setEndDate(e.target.value)}
@@ -765,6 +780,8 @@ export default function BacktestPage() {
                 <div>
                   <label className="block text-sm font-medium text-slate-300 mb-2">Slippage (%)</label>
                   <input
+                    title="Slippage percentage"
+                    aria-label="Slippage percentage"
                     type="number"
                     step="0.001"
                     value={advancedParams.slippage}
@@ -775,6 +792,8 @@ export default function BacktestPage() {
                 <div>
                   <label className="block text-sm font-medium text-slate-300 mb-2">Commission ($)</label>
                   <input
+                    title="Commission per trade"
+                    aria-label="Commission per trade"
                     type="number"
                     step="0.01"
                     value={advancedParams.commission}
@@ -821,6 +840,8 @@ export default function BacktestPage() {
                         Max gaps to heal (1-100):
                       </label>
                       <input
+                        title="Max gaps to heal"
+                        aria-label="Max gaps to heal"
                         type="number"
                         min="1"
                         max="100"

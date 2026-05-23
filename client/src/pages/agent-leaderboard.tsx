@@ -1,5 +1,5 @@
 import React, { useState, useMemo } from 'react';
-import { useLocation } from 'wouter';
+import { useNavigate } from 'react-router-dom';
 import {
   Trophy, TrendingUp, Award, ChevronDown, ArrowUpDown, Search, Filter,
   ArrowLeft, Users, Target, Zap, BarChart3, Flame, Shield, Crown
@@ -59,7 +59,7 @@ const rankColors: Record<string, { bg: string; text: string; border: string }> =
 };
 
 const AgentLeaderboard: React.FC = () => {
-  const [, navigate] = useLocation();
+  const navigate = useNavigate();
   const [searchTerm, setSearchTerm] = useState('');
   const [sortBy, setSortBy] = useState<SortBy>('winRate');
   const [sortAsc, setSortAsc] = useState(false);
@@ -68,8 +68,8 @@ const AgentLeaderboard: React.FC = () => {
   // Fetch leaderboard
   const { data: leaderboardData, isLoading, error } = useQuery({
     queryKey: ['agent-leaderboard'],
-    queryFn: async () => {
-      const response = await fetch('/api/agents/leaderboard');
+    queryFn: async ({ signal }: any) => {
+      const response = await fetch('/api/agents/leaderboard', { signal });
       if (!response.ok) throw new Error('Failed to fetch leaderboard');
       return response.json();
     },

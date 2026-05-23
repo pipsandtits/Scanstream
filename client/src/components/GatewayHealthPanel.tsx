@@ -1,5 +1,5 @@
 
-import React from 'react';
+import React, { memo } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { Activity, Zap, TrendingUp, AlertCircle } from 'lucide-react';
 
@@ -24,7 +24,7 @@ interface GatewayHealth {
   }>;
 }
 
-export default function GatewayHealthPanel() {
+function GatewayHealthPanel() {
   const { data: health, isLoading } = useQuery<GatewayHealth>({
     queryKey: ['/api/gateway/health'],
     queryFn: async () => {
@@ -123,3 +123,5 @@ export default function GatewayHealthPanel() {
     </div>
   );
 }
+
+export default memo(GatewayHealthPanel);

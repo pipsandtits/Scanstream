@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { useLocation } from 'wouter';
+import { useNavigate } from 'react-router-dom';
 import { ArrowLeft, Brain, Play, Download, Settings, TrendingUp, BarChart3, Zap, Target, Activity, AlertCircle, CheckCircle } from 'lucide-react';
 import { useQuery } from '@tanstack/react-query';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
@@ -70,7 +70,7 @@ const mockMLData = {
 };
 
 export default function MLEnginePage() {
-  const [, setLocation] = useLocation();
+  const navigate = useNavigate();
   const [selectedModel, setSelectedModel] = useState('');
   const [isTraining, setIsTraining] = useState(false);
   const [activeTab, setActiveTab] = useState('models');
@@ -78,15 +78,15 @@ export default function MLEnginePage() {
   // Fetch comprehensive ML data from ALL endpoints
   const { data: mlData, isLoading, error, refetch } = useQuery({
     queryKey: ['ml-comprehensive-data'],
-    queryFn: async () => {
+    queryFn: async ({ signal }: any) => {
       const [predictionsRes, statusRes, performanceRes, ensembleRes, healthRes, backtestRes, logsRes] = await Promise.all([
-        fetch('/api/ml-engine/predictions'),
-        fetch('/api/ml-engine/status'),
-        fetch('/api/model-performance/metrics'),
-        fetch('/api/model-performance/ensemble-status'),
-        fetch('/api/health'),
-        fetch('/api/backtest/stats'),
-        fetch('/api/health/logs?limit=20')
+        fetch('/api/ml-engine/predictions', { signal }),
+        fetch('/api/ml-engine/status', { signal }),
+        fetch('/api/model-performance/metrics', { signal }),
+        fetch('/api/model-performance/ensemble-status', { signal }),
+        fetch('/api/health', { signal }),
+        fetch('/api/backtest/stats', { signal }),
+        fetch('/api/health/logs?limit=20', { signal })
       ]);
 
       // Helper function to safely parse responses, checking status first

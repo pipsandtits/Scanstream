@@ -1,8 +1,12 @@
 import { Router, Request, Response } from 'express';
+import { coinGeckoService } from '../services/coingecko';
+import { apiRegistry } from '../services/api-registry';
+import { priceCache } from '../../src/core/PriceCache';
 import { CacheManager } from '../services/gateway/cache-manager';
 import { RateLimiter } from '../services/gateway/rate-limiter';
 import { ExchangeAggregator } from '../services/gateway/exchange-aggregator';
 import { CCXTScanner } from '../services/gateway/ccxt-scanner';
+import { initAggregator } from '../../src/core/aggregator.singleton';
 import MultiExchangeScanner from '../services/scanner/multi-exchange-scanner';
 import ScannerPersistenceService from '../services/scanner/scanner-persistence';
 
@@ -22,13 +26,9 @@ async function runScanBackground(symbols: string[], timeframe: string, options: 
   isScanning = true;
   try {
     // Ensure aggregator is initialized (safe to call multiple times)
-    try {
-      await aggregator.initialize();
-    } catch (initErr) {
-      console.warn('[Scanner] Aggregator initialize warning:', (initErr as any)?.message || initErr);
-    }
+    const agg = await getScannerAggregator();
 
-    const ccxtScanner = new CCXTScanner(aggregator, cacheManager, rateLimiter);
+    const ccxtScanner = new CCXTScanner(agg, cacheManager, rateLimiter);
     const results = await ccxtScanner.scanSymbols(symbols, timeframe, options || {});
     lastScanResults = results;
     lastScanTimestamp = new Date();
@@ -53,7 +53,13 @@ router.get('/health', (req: Request, res: Response) => {
 // Initialize services
 const cacheManager = new CacheManager(5000);
 const rateLimiter = new RateLimiter();
-const aggregator = new ExchangeAggregator(cacheManager, rateLimiter);
+let aggregator: ExchangeAggregator | null = null;
+
+async function getScannerAggregator(): Promise<ExchangeAggregator> {
+  if (aggregator) return aggregator;
+  aggregator = await initAggregator(cacheManager, rateLimiter);
+  return aggregator;
+}
 
 /**
  * GET /api/scanner/signals
@@ -74,7 +80,8 @@ router.get('/signals', async (req: Request, res: Response) => {
     }
 
     // Use CCXT Scanner to get market data
-    const ccxtScanner = new CCXTScanner(aggregator, cacheManager, rateLimiter);
+    const agg = await getScannerAggregator();
+    const ccxtScanner = new CCXTScanner(agg, cacheManager, rateLimiter);
     
     const symbols = [
       'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'AVAX/USDT', 'ADA/USDT',
@@ -106,11 +113,9 @@ router.get('/signals', async (req: Request, res: Response) => {
     let priceChanges: Record<string, number> = {};
     try {
       const ids = Object.values(symbolMap).join(',');
-      const response = await fetch(
-        `https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&ids=${ids}&order=market_cap_desc&sparkline=false`
-      );
-      if (response.ok) {
-        const coingeckoData = await response.json();
+      // Use coinGeckoService which has retry/backoff and caching
+      const coingeckoData = await coinGeckoService.getMarketDataByIds(ids, 'usd');
+      if (coingeckoData && Array.isArray(coingeckoData)) {
         for (const item of coingeckoData) {
           const sym = Object.entries(symbolMap).find(([, id]) => id === item.id)?.[0];
           if (sym) {
@@ -119,7 +124,7 @@ router.get('/signals', async (req: Request, res: Response) => {
         }
       }
     } catch (error) {
-      console.warn('[Scanner API] Failed to fetch CoinGecko price changes:', error);
+      console.warn('[Scanner API] Failed to fetch CoinGecko price changes via service:', error?.message || error);
     }
 
     const signals = scanResults
@@ -179,6 +184,62 @@ router.get('/signals', async (req: Request, res: Response) => {
   }
 });
 
+// Register scanner endpoints with API registry
+try {
+  apiRegistry.registerEndpoint({
+    method: 'GET',
+    path: '/api/scanner/signals',
+    category: 'SIGNAL',
+    name: 'Scanner Signals',
+    description: 'Return fast scanner signals for core universe',
+    version: '1.0.0',
+    tags: ['scanner','signals'],
+    isDeprecated: false,
+    authentication: 'NONE',
+    cacheable: true,
+    cacheTTLSeconds: 30,
+    isActive: true
+  });
+} catch (e) {
+  console.warn('[APIRegistry] Failed to register /api/scanner/signals', e);
+}
+
+/**
+ * GET /api/scanner/quick/:symbol
+ * Lightweight quick lookup using authoritative `priceCache` (no external calls)
+ */
+router.get('/quick/:symbol', (req: Request, res: Response) => {
+  try {
+    const raw = req.params.symbol || '';
+    const symbol = raw.toUpperCase().includes('/') ? raw.toUpperCase() : `${raw.toUpperCase()}/USDT`;
+    const cached = priceCache.get(symbol) || priceCache.get(symbol.replace('/USDT','/USD'));
+    if (!cached) return res.status(404).json({ success: false, error: 'Symbol not in cache' });
+    return res.json({ success: true, symbol, data: cached, timestamp: new Date().toISOString() });
+  } catch (err: any) {
+    console.error('[Scanner /quick] Error:', err?.message || err);
+    res.status(500).json({ success: false, error: 'Internal error' });
+  }
+});
+
+try {
+  apiRegistry.registerEndpoint({
+    method: 'GET',
+    path: '/api/scanner/quick/:symbol',
+    category: 'SIGNAL',
+    name: 'Quick scanner symbol lookup',
+    description: 'Quick symbol lookup from PriceCache (no external API calls)',
+    version: '1.0.0',
+    tags: ['scanner','quick','priceCache'],
+    isDeprecated: false,
+    authentication: 'NONE',
+    cacheable: true,
+    cacheTTLSeconds: 3,
+    isActive: true
+  });
+} catch (e) {
+  console.warn('[APIRegistry] Failed to register /api/scanner/quick/:symbol', e);
+}
+
 /**
  * GET /api/scanner/scan
  * Trigger a new scan
@@ -188,7 +249,8 @@ router.get('/scan', async (req: Request, res: Response) => {
     const { symbols = 'BTC/USDT,ETH/USDT,SOL/USDT', timeframe = '1h' } = req.query;
     
     const symbolList = (symbols as string).split(',').map(s => s.trim());
-    const ccxtScanner = new CCXTScanner(aggregator, cacheManager, rateLimiter);
+    const agg = await getScannerAggregator();
+    const ccxtScanner = new CCXTScanner(agg, cacheManager, rateLimiter);
     
     const results = await ccxtScanner.scanSymbols(symbolList, timeframe as string, {});
 
@@ -232,13 +294,8 @@ router.post('/scan', async (req: Request, res: Response) => {
     }
 
     // Ensure aggregator is initialized
-    try {
-      await aggregator.initialize();
-    } catch (initErr) {
-      console.warn('[Scanner] Aggregator initialize warning (sync scan):', (initErr as any)?.message || initErr);
-    }
-
-    const ccxtScanner = new CCXTScanner(aggregator, cacheManager, rateLimiter);
+    const agg = await getScannerAggregator();
+    const ccxtScanner = new CCXTScanner(agg, cacheManager, rateLimiter);
     const results = await ccxtScanner.scanSymbols(symbolList, timeframe, options || {});
 
     // Store last results
@@ -295,8 +352,8 @@ router.post('/multi-exchange-scan', async (req: Request, res: Response) => {
     console.log(`[ScannerAPI] Starting multi-exchange scan for ${symbols.length} symbols on ${exchanges?.join(',') || 'all exchanges'}`);
 
     // Initialize services
-    await aggregator.initialize();
-    const multiScanner = new MultiExchangeScanner(aggregator, cacheManager);
+    const agg = await getScannerAggregator();
+    const multiScanner = new MultiExchangeScanner(agg, cacheManager);
     
     // Try to initialize persistence service if available
     let persistence: ScannerPersistenceService | null = null;
@@ -578,3 +635,29 @@ router.get('/config', (req: Request, res: Response) => {
 });
 
 export default router;
+
+// Backwards-compatible alias: /api/scanner/top -> top-performers
+router.get('/top', async (req: Request, res: Response) => {
+  try {
+    const { days, limit } = req.query;
+    const daysNum = parseInt(String(days || '7')) || 7;
+    const limitNum = parseInt(String(limit || '10')) || 10;
+
+    let performers: any[] = [];
+    try {
+      const persistence = new (require('../services/scanner/scanner-persistence').default)(null as any);
+      performers = await persistence.getTopPerformers(daysNum, limitNum);
+    } catch (e) {
+      console.warn('[ScannerAPI] Could not retrieve top performers for alias /top');
+    }
+
+    res.json({
+      period: `${daysNum} days`,
+      limit: limitNum,
+      performers
+    });
+  } catch (error: any) {
+    console.error('[Scanner API] /top alias error:', error);
+    res.status(500).json({ success: false, error: 'Failed to retrieve top performers' });
+  }
+});

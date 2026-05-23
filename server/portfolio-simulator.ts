@@ -163,27 +163,30 @@ export class EnhancedPortfolioSimulator {
   }
 
   // Enhanced position management
-  openPosition(trade: Omit<Trade, 'quantity'>, stopLoss?: number): boolean {
+  openPosition(trade: Omit<Trade, 'quantity'>, stopLoss?: number, overrideQuantity?: number): boolean {
     const symbol = trade.symbol;
     const existingPositions = this.openPositions.get(symbol) || [];
-    
+
     if (existingPositions.length >= this.maxPositionsPerSymbol) {
       console.warn(`Maximum positions reached for ${symbol}`);
       return false;
     }
 
-    // Calculate position size
-    const quantity = this.calculatePositionSize(symbol, trade.entryPrice, stopLoss);
+    // Determine position size (allow override from caller)
+    const quantity = (overrideQuantity !== undefined && !isNaN(Number(overrideQuantity)))
+      ? Number(overrideQuantity)
+      : this.calculatePositionSize(symbol, trade.entryPrice, stopLoss);
+
     const totalCost = trade.entryPrice * quantity;
-    
+
     // Apply slippage
-    const slippageAdjustedPrice = trade.side === 'BUY' 
+    const slippageAdjustedPrice = trade.side === 'BUY'
       ? trade.entryPrice * (1 + this.slippageRate / 100)
       : trade.entryPrice * (1 - this.slippageRate / 100);
-    
+
     // Calculate commission
     const commission = (totalCost * this.commissionRate) / 100;
-    
+
     if (totalCost + commission > this.currentBalance) {
       console.warn(`Insufficient funds for trade ${trade.id}`);
       return false;

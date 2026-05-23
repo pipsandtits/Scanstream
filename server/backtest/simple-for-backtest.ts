@@ -7,7 +7,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { fileURLToPath } from 'url';
-import FailureOfReversionCalculator from '../services/vfmd/failureOfReversionCalculator.ts';
+import FailureOfReversionCalculator from '../services/vfmd/failureOfReversionCalculator';
 import { MetricsCalculator, type TradeResult } from './metrics-calculator.ts';
 
 const __filename = fileURLToPath(import.meta.url);

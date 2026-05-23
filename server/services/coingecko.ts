@@ -11,6 +11,7 @@
  */
 
 import axios, { AxiosInstance, AxiosError } from 'axios';
+import PQueue from 'p-queue';
 
 const API_BASE = 'https://api.coingecko.com/api/v3';
 const CACHE_DURATION_MS = 180000; // 3 minutes default cache
@@ -25,16 +26,20 @@ interface CacheEntry<T> {
 class CoinGeckoService {
   private client: AxiosInstance;
   private cache: Map<string, CacheEntry<any>>;
+  private queue: PQueue;
 
   constructor() {
     this.client = axios.create({
       baseURL: API_BASE,
       timeout: 10000,
       headers: {
-        'Accept': 'application/json'
+        'Accept': 'application/json',
+        // Allow API key override via environment for demo / higher rate limits
+        'x-cg-demo-api-key': process.env.CG_DEMO_API_KEY || process.env.COINGECKO_API_KEY || ''
       }
     });
     this.cache = new Map();
+    this.queue = new PQueue({ concurrency: 1, interval: 12000, intervalCap: 1 });
     
     console.log('✅ CoinGecko service initialized');
   }
@@ -48,33 +53,34 @@ class CoinGeckoService {
     initialDelay = 1000
   ): Promise<T> {
     let lastError: any;
-    
+
     for (let attempt = 0; attempt < maxRetries; attempt++) {
       try {
-        return await fetcher();
+        // Ensure requests are funneled through the rate-limiting queue
+        return await this.queue.add(() => fetcher());
       } catch (error) {
         lastError = error;
-        
+
         // Check if it's a rate limit error (429)
         if (axios.isAxiosError(error) && error.response?.status === 429) {
           const retryAfter = error.response.headers['retry-after'];
-          const delay = retryAfter 
-            ? parseInt(retryAfter) * 1000 
+          const delay = retryAfter
+            ? parseInt(retryAfter) * 1000
             : initialDelay * Math.pow(2, attempt);
-          
+
           console.warn(`[CoinGecko] Rate limited (429). Retry ${attempt + 1}/${maxRetries} after ${delay}ms`);
-          
+
           if (attempt < maxRetries - 1) {
             await new Promise(resolve => setTimeout(resolve, delay));
             continue;
           }
         }
-        
+
         // For other errors, throw immediately
         throw error;
       }
     }
-    
+
     throw lastError;
   }
 
@@ -82,9 +88,10 @@ class CoinGeckoService {
    * Get cached data or fetch fresh data
    */
   private async getCached<T>(
-    key: string, 
-    fetcher: () => Promise<T>, 
-    ttl: number = CACHE_DURATION_MS
+    key: string,
+    fetcher: () => Promise<T>,
+    ttl: number = CACHE_DURATION_MS,
+    maxRetries?: number
   ): Promise<T> {
     const cached = this.cache.get(key);
     const now = Date.now();
@@ -97,7 +104,7 @@ class CoinGeckoService {
     console.log(`[CoinGecko] Cache miss, fetching: ${key}`);
     
     try {
-      const data = await this.retryWithBackoff(() => fetcher());
+      const data = await this.retryWithBackoff(() => fetcher(), typeof maxRetries === 'number' ? maxRetries : 3);
       this.cache.set(key, { data, timestamp: now });
       return data;
     } catch (error) {
@@ -111,13 +118,20 @@ class CoinGeckoService {
   }
 
   /**
+   * Low-level GET wrapper that funnels requests through the queue.
+   */
+  private async clientGet(path: string, opts?: { params?: any; timeout?: number }) {
+    return this.queue.add(() => this.client.get(path, { params: opts?.params, timeout: opts?.timeout }));
+  }
+
+  /**
    * Get market data for top coins by market cap
    */
   async getMarketData(vsCurrency = 'usd', page = 1, perPage = 100) {
     return this.getCached(
       `markets_${vsCurrency}_${page}_${perPage}`,
       async () => {
-        const response = await this.client.get('/coins/markets', {
+        const response = await this.clientGet('/coins/markets', {
           params: {
             vs_currency: vsCurrency,
             order: 'market_cap_desc',
@@ -137,7 +151,7 @@ class CoinGeckoService {
    */
   async getMarketDataByIds(coinIds: string, vsCurrency = 'usd') {
     // Don't cache IDs queries as they can be different each time
-    const response = await this.client.get('/coins/markets', {
+    const response = await this.clientGet('/coins/markets', {
       params: {
         vs_currency: vsCurrency,
         ids: coinIds,
@@ -157,7 +171,7 @@ class CoinGeckoService {
     return this.getCached(
       'trending',
       async () => {
-        const response = await this.client.get('/search/trending');
+        const response = await this.clientGet('/search/trending');
         return response.data.coins;
       },
       600000 // 10 minutes cache (trending changes slowly)
@@ -167,14 +181,15 @@ class CoinGeckoService {
   /**
    * Get global market overview
    */
-  async getGlobalMarket() {
+  async getGlobalMarket(opts?: { timeout?: number; retries?: number }) {
     return this.getCached(
       'global',
       async () => {
-        const response = await this.client.get('/global');
+        const response = await this.clientGet('/global', { timeout: opts?.timeout });
         return response.data.data;
       },
-      600000 // 10 minutes cache (global market data changes slowly)
+      600000, // 10 minutes cache (global market data changes slowly)
+      opts?.retries
     );
   }
 
@@ -185,7 +200,7 @@ class CoinGeckoService {
     return this.getCached(
       `ohlc_${coinId}_${vsCurrency}_${days}`,
       async () => {
-        const response = await this.client.get(`/coins/${coinId}/ohlc`, {
+        const response = await this.clientGet(`/coins/${coinId}/ohlc`, {
           params: {
             vs_currency: vsCurrency,
             days
@@ -197,13 +212,21 @@ class CoinGeckoService {
   }
 
   /**
+   * Get market chart (prices) for a coin
+   */
+  async getMarketChart(coinId: string, vsCurrency = 'usd', days = 90) {
+    const response = await this.clientGet(`/coins/${coinId}/market_chart`, { params: { vs_currency: vsCurrency, days } });
+    return response.data;
+  }
+
+  /**
    * Get detailed coin information
    */
   async getCoinDetails(coinId: string) {
     return this.getCached(
       `coin_${coinId}`,
       async () => {
-        const response = await this.client.get(`/coins/${coinId}`, {
+        const response = await this.clientGet(`/coins/${coinId}`, {
           params: {
             localization: false,
             tickers: false,
@@ -225,7 +248,7 @@ class CoinGeckoService {
     return this.getCached(
       `search_${query}`,
       async () => {
-        const response = await this.client.get('/search', {
+        const response = await this.clientGet('/search', {
           params: { query }
         });
         return response.data;
@@ -606,11 +629,35 @@ class CoinGeckoService {
     return this.getCached(
       'derivatives',
       async () => {
-        const response = await this.client.get('/derivatives');
+        const response = await this.clientGet('/derivatives');
         return response.data;
       },
       600000 // 10 minutes cache
     );
+  }
+
+  /**
+   * Get exchanges list
+   */
+  async getExchanges(page = 1, perPage = 250) {
+    const response = await this.clientGet('/exchanges', { params: { per_page: perPage, page } });
+    return response.data;
+  }
+
+  /**
+   * Get indices
+   */
+  async getIndices() {
+    const response = await this.clientGet('/indices', { params: { currency: 'usd', order: 'market_cap_desc' } });
+    return response.data;
+  }
+
+  /**
+   * Get coin categories
+   */
+  async getCategories() {
+    const response = await this.clientGet('/coins/categories', { params: { order: 'market_cap_desc' } });
+    return response.data;
   }
 
   /**

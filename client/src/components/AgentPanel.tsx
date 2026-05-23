@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { Activity } from 'lucide-react';
 
 type Agent = { id: string; name: string; status: 'idle'|'active'|'error'; lastSignal?: string };
@@ -8,12 +8,20 @@ export default function AgentPanel(props: { agents?: Agent[]; onToggle?: (id: st
   const [expanded, setExpanded] = useState<string | null>(null);
   const [agentHistory, setAgentHistory] = useState<Record<string, any[]>>({});
   const [loadingHistory, setLoadingHistory] = useState<Record<string, boolean>>({});
+  const controllerRef = useRef<Record<string, AbortController | null>>({});
 
   const fetchHistory = async (id: string) => {
     if (agentHistory[id]) return; // already loaded
     setLoadingHistory(prev => ({ ...prev, [id]: true }));
     try {
-      const res = await fetch(`/api/agents/${encodeURIComponent(id)}/signals`);
+      // Abort any previous request for this agent
+      if (controllerRef.current[id]) {
+        controllerRef.current[id]?.abort();
+      }
+      const controller = new AbortController();
+      controllerRef.current[id] = controller;
+
+      const res = await fetch(`/api/agents/${encodeURIComponent(id)}/signals`, { signal: controller.signal });
       if (!res.ok) {
         setAgentHistory(prev => ({ ...prev, [id]: [] }));
       } else {
@@ -21,11 +29,22 @@ export default function AgentPanel(props: { agents?: Agent[]; onToggle?: (id: st
         setAgentHistory(prev => ({ ...prev, [id]: data }));
       }
     } catch (err) {
+      if ((err as any)?.name === 'AbortError') {
+        // Request was aborted; do not update state
+        return;
+      }
       setAgentHistory(prev => ({ ...prev, [id]: [] }));
     } finally {
       setLoadingHistory(prev => ({ ...prev, [id]: false }));
     }
   };
+
+  useEffect(() => {
+    return () => {
+      // Abort any inflight history requests on unmount
+      Object.values(controllerRef.current).forEach((c) => c?.abort());
+    };
+  }, []);
 
   const toggleAgent = async (id: string) => {
     if (!onToggle) return;

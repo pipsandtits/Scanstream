@@ -58,6 +58,13 @@ export class ExchangeAggregator {
     }
   }
 
+  getExchangeInstances(): Map<string, any> {
+    if (!this.exchangeDataFeed) {
+      return new Map();
+    }
+    return this.exchangeDataFeed.getExchangeInstances();
+  }
+
   /**
    * Get aggregated price from multiple exchanges
    * Returns median price with confidence score
@@ -73,6 +80,29 @@ export class ExchangeAggregator {
 
     if (!this.exchangeDataFeed) {
       throw new Error('ExchangeAggregator not initialized');
+    }
+
+    // Prefer canonical consensus from TruthEngine when available and fresh
+    try {
+      const truth = (global as any).truthEngine as any;
+      if (truth && typeof truth.getConsensus === 'function') {
+        const c = truth.getConsensus(symbol);
+        if (c && typeof c.price === 'number' && c.price > 0) {
+          const result: PriceData = {
+            symbol,
+            price: c.price,
+            confidence: Math.min(100, Math.max(0, Number(c.confidence) || 0)),
+            sources: c.sources || [],
+            deviation: 0,
+            timestamp: new Date(c.timestamp || Date.now())
+          };
+          // Cache the consensus-derived value briefly for callers
+          this.cache.set(cacheKey, result, 30_000);
+          return result;
+        }
+      }
+    } catch (e) {
+      // non-fatal — fall back to exchange scraping
     }
 
     const prices: Array<{ exchange: string; price: number; timestamp: Date }> = [];
@@ -276,7 +306,8 @@ export class ExchangeAggregator {
             close: (f.price as any)?.close || (f as any).close || 0,
             volume: f.volume || 0,
             isFinal: true,
-            source: 'ccxt',
+            source: 'historical',
+            origin: 'ccxt',
             venue: exchange
           }));
 

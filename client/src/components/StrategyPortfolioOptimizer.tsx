@@ -1,13 +1,6 @@
 import { useState, useMemo } from 'react';
 import { X, TrendingUp, AlertCircle, Info, Download, RefreshCw } from 'lucide-react';
 import {
-  BarChart,
-  Bar,
-  LineChart,
-  Line,
-  PieChart,
-  Pie,
-  Cell,
   XAxis,
   YAxis,
   CartesianGrid,
@@ -15,6 +8,8 @@ import {
   Legend,
   ResponsiveContainer,
 } from 'recharts';
+import React, { Suspense, lazy } from 'react';
+const StrategyOptimizerCharts = lazy(() => import('@/components/StrategyOptimizerCharts'));
 
 interface Strategy {
   id: string;
@@ -297,28 +292,11 @@ export default function StrategyPortfolioOptimizer({
 
             {/* Right Column - Charts and Visualizations */}
             <div className="lg:col-span-2 space-y-6">
-              {/* Allocation Chart */}
-              <div className="bg-slate-700/50 rounded-lg p-6 border border-slate-600">
-                <h3 className="text-lg font-semibold text-white mb-4">Portfolio Allocation</h3>
-                <ResponsiveContainer width="100%" height={300}>
-                  <PieChart>
-                    <Pie
-                      data={allocationBreakdown}
-                      cx="50%"
-                      cy="50%"
-                      labelLine={false}
-                      label={({ name, allocation }) => `${name}: ${allocation.toFixed(1)}%`}
-                      outerRadius={100}
-                      fill="#8884d8"
-                      dataKey="allocation"
-                    >
-                      {allocationBreakdown.map((entry, index) => (
-                        <Cell key={`cell-${index}`} fill={entry.color} />
-                      ))}
-                    </Pie>
-                    <Tooltip />
-                  </PieChart>
-                </ResponsiveContainer>
+              {/* Allocation Chart (lazy) */}
+              <div>
+                <Suspense fallback={<div className="h-72 flex items-center justify-center">Loading charts…</div>}>
+                  <StrategyOptimizerCharts allocationBreakdown={allocationBreakdown} scenarioAnalysis={scenarioAnalysis} />
+                </Suspense>
               </div>
 
               {/* Allocation Breakdown Table */}
@@ -366,23 +344,9 @@ export default function StrategyPortfolioOptimizer({
                   </button>
                 </div>
                 {showScenarios && (
-                  <ResponsiveContainer width="100%" height={200}>
-                    <BarChart data={scenarioAnalysis}>
-                      <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-                      <XAxis dataKey="scenario" stroke="#94a3b8" />
-                      <YAxis stroke="#94a3b8" />
-                      <Tooltip
-                        contentStyle={{
-                          backgroundColor: 'rgba(15, 23, 42, 0.95)',
-                          border: '1px solid rgba(100, 116, 139, 0.5)',
-                          borderRadius: '8px',
-                        }}
-                      />
-                      <Legend />
-                      <Bar dataKey="return" fill="#10b981" name="Expected Return (%)" />
-                      <Bar dataKey="volatility" fill="#f59e0b" name="Volatility (%)" />
-                    </BarChart>
-                  </ResponsiveContainer>
+                  <div className="mt-4">
+                    {/* Scenario chart moved into StrategyOptimizerCharts (already lazy-loaded above) */}
+                  </div>
                 )}
               </div>
 

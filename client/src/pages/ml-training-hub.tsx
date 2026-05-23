@@ -2,7 +2,7 @@
 import { useState } from 'react';
 import { useQuery, useMutation } from '@tanstack/react-query';
 import { ArrowLeft, Brain, Play, Download, TrendingUp, Activity, Target, Zap, BarChart3, RefreshCw } from 'lucide-react';
-import { useLocation } from 'wouter';
+import { useNavigate } from 'react-router-dom';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
@@ -27,15 +27,15 @@ interface OptimizationResult {
 }
 
 export default function MLTrainingHub() {
-  const [, setLocation] = useLocation();
+  const navigate = useNavigate();
   const [trainingInProgress, setTrainingInProgress] = useState(false);
   const [optimizationInProgress, setOptimizationInProgress] = useState(false);
 
   // Fetch model performance metrics
   const { data: metrics, refetch: refetchMetrics } = useQuery<ModelMetrics>({
     queryKey: ['model-metrics'],
-    queryFn: async () => {
-      const res = await fetch('/api/model-performance/metrics');
+    queryFn: async ({ signal }: any) => {
+      const res = await fetch('/api/model-performance/metrics', { signal });
       if (!res.ok) throw new Error('Failed to fetch metrics');
       const data = await res.json();
       return data.metrics;
@@ -46,8 +46,8 @@ export default function MLTrainingHub() {
   // Fetch optimization status
   const { data: optimizationStatus } = useQuery({
     queryKey: ['optimization-status'],
-    queryFn: async () => {
-      const res = await fetch('/api/optimize/status');
+    queryFn: async ({ signal }: any) => {
+      const res = await fetch('/api/optimize/status', { signal });
       if (!res.ok) return { initialized: false };
       return res.json();
     },
@@ -57,8 +57,8 @@ export default function MLTrainingHub() {
   // Fetch ML predictions (to show signals)
   const { data: mlSignals } = useQuery({
     queryKey: ['ml-signals'],
-    queryFn: async () => {
-      const res = await fetch('/api/ml-engine/predictions');
+    queryFn: async ({ signal }: any) => {
+      const res = await fetch('/api/ml-engine/predictions', { signal });
       if (!res.ok) return { predictions: [] };
       return res.json();
     },
@@ -69,18 +69,20 @@ export default function MLTrainingHub() {
   const trainModelsMutation = useMutation({
     mutationFn: async () => {
       // Fetch chart data for training
-      const chartRes = await fetch('/api/chart/BTC/USDT?timeframe=1h&limit=500');
+      const chartRes = await fetch('/api/chart/BTC/USDT?timeframe=1h&limit=500', { signal: AbortSignal.timeout(15000) });
       if (!chartRes.ok) throw new Error('Failed to fetch training data');
       const chartData = await chartRes.json();
 
       // Submit training request
+      const controller = new AbortController();
       const res = await fetch('/api/ml-training/train', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ 
           chartData: chartData.candles || chartData,
           modelType: 'all'
-        })
+        }),
+        signal: controller.signal,
       });
 
       if (!res.ok) throw new Error('Training failed');

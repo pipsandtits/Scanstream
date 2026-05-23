@@ -181,8 +181,8 @@ export function UnifiedSignalDisplay() {
   // Fetch signals from all sources
   const { data: scannerSignals } = useQuery<Signal[]>({
     queryKey: ['scanner-signals'],
-    queryFn: async () => {
-      const res = await fetch('/api/scanner/signals');
+    queryFn: async ({ signal }: any) => {
+      const res = await fetch('/api/scanner/signals', { signal });
       if (!res.ok) return [];
       const data = await res.json();
       return (data.signals || []).map((s: any) => ({
@@ -203,8 +203,8 @@ export function UnifiedSignalDisplay() {
 
   const { data: gatewaySignals } = useQuery<Signal[]>({
     queryKey: ['gateway-signals'],
-    queryFn: async () => {
-      const res = await fetch('/api/gateway/signals');
+    queryFn: async ({ signal }: any) => {
+      const res = await fetch('/api/gateway/signals', { signal });
       if (!res.ok) return [];
       const data = await res.json();
       return (data.signals || []).map((s: any) => ({
@@ -229,8 +229,8 @@ export function UnifiedSignalDisplay() {
 
   const { data: mlSignals } = useQuery<Signal[]>({
     queryKey: ['ml-signals'],
-    queryFn: async () => {
-      const res = await fetch('/api/ml-engine/predictions');
+    queryFn: async ({ signal }: any) => {
+      const res = await fetch('/api/ml-engine/predictions', { signal });
       if (!res.ok) return [];
       const data = await res.json();
       return (data.predictions || []).map((p: any) => ({
@@ -248,8 +248,8 @@ export function UnifiedSignalDisplay() {
 
   const { data: strategySignals } = useQuery<Signal[]>({
     queryKey: ['strategy-signals'],
-    queryFn: async () => {
-      const res = await fetch('/api/strategies/signals');
+    queryFn: async ({ signal }: any) => {
+      const res = await fetch('/api/strategies/signals', { signal });
       if (!res.ok) return [];
       const data = await res.json();
       return (data.signals || []).map((s: any) => ({
@@ -272,8 +272,8 @@ export function UnifiedSignalDisplay() {
   // Query signal performance stats
   const { data: performanceStats } = useQuery({
     queryKey: ['signal-performance-stats'],
-    queryFn: async () => {
-      const res = await fetch('/api/gateway/signals/performance/stats');
+    queryFn: async ({ signal }: any) => {
+      const res = await fetch('/api/gateway/signals/performance/stats', { signal });
       if (!res.ok) return null;
       return res.json();
     },
@@ -520,7 +520,7 @@ function SignalCard({ unified, highlighted = false, onTrade }: { unified: any; h
 
   const { data: compositeData } = useQuery<CompositeScore>({
     queryKey: ['composite-score', unified.symbol],
-    queryFn: async () => {
+    queryFn: async ({ signal }: any) => {
       const latestSignal = unified.signals[0];
       const response = await fetch('/api/analytics/composite-score', {
         method: 'POST',
@@ -534,6 +534,7 @@ function SignalCard({ unified, highlighted = false, onTrade }: { unified: any; h
           momentum: 0,
           includeSentiment: true,
         }),
+        signal,
       });
       if (!response.ok) return null; // Handle non-OK responses
       return response.json();
@@ -602,6 +603,7 @@ function SignalCard({ unified, highlighted = false, onTrade }: { unified: any; h
                       onClick={async () => {
                         if (!confirm(`Execute ${unified.consensus} position for ${unified.symbol} at $${unified.price}?`)) return;
                         try {
+                          const controller = new AbortController();
                           const res = await fetch('/api/paper-trading/execute', {
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json' },
@@ -612,7 +614,8 @@ function SignalCard({ unified, highlighted = false, onTrade }: { unified: any; h
                               price: unified.price,
                               stopLoss: unified.signals[0]?.stopLoss || unified.price * (unified.consensus === 'BUY' ? 0.98 : 1.02),
                               takeProfit: unified.signals[0]?.takeProfit || unified.price * (unified.consensus === 'BUY' ? 1.05 : 0.95)
-                            })
+                            }),
+                            signal: controller.signal,
                           });
 
                           if (!res.ok) {
@@ -627,6 +630,7 @@ function SignalCard({ unified, highlighted = false, onTrade }: { unified: any; h
                             throw new Error(data.error || 'Execution failed');
                           }
                         } catch (error: any) {
+                          if (error?.name === 'AbortError') return;
                           console.error('Failed to execute position:', error);
                           alert(`❌ Failed to execute: ${error.message || 'Unknown error'}`);
                         }

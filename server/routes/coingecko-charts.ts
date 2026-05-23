@@ -5,6 +5,7 @@
 
 import { Router, Request, Response } from 'express';
 import axios from 'axios';
+import { coinGeckoService } from '../services/coingecko';
 
 const router = Router();
 
@@ -41,22 +42,8 @@ router.get('/api/coingecko/chart/:coinId', async (req: Request, res: Response) =
     
     console.log(`[CoinGecko Chart] Fetching chart data for ${coinId} (${days} days, extended: ${extended})`);
     
-    // Fetch OHLC data
-    const ohlcResponse = await axios.get(
-      `${COINGECKO_API}/coins/${coinId}/ohlc`,
-      {
-        params: {
-          vs_currency: vsCurrency,
-          days
-        },
-        headers: {
-          'Accept': 'application/json'
-        },
-        timeout: 15000
-      }
-    );
-    
-    const ohlcData = ohlcResponse.data;
+    // Fetch OHLC data via centralized service (queued)
+    const ohlcData = await coinGeckoService.getOHLC(coinId, String(vsCurrency), String(days));
     
     // Fetch market chart for volume and additional data if extended
     let volumeData: any[] = [];
@@ -64,23 +51,9 @@ router.get('/api/coingecko/chart/:coinId', async (req: Request, res: Response) =
     
     if (extended) {
       try {
-        const marketChartResponse = await axios.get(
-          `${COINGECKO_API}/coins/${coinId}/market_chart`,
-          {
-            params: {
-              vs_currency: vsCurrency,
-              days,
-              interval: days === '1' ? 'hourly' : 'daily'
-            },
-            headers: {
-              'Accept': 'application/json'
-            },
-            timeout: 15000
-          }
-        );
-        
-        volumeData = marketChartResponse.data.total_volumes || [];
-        marketCapData = marketChartResponse.data.market_caps || [];
+        const marketChart = await coinGeckoService.getMarketChart(coinId, String(vsCurrency), String(days));
+        volumeData = marketChart.total_volumes || [];
+        marketCapData = marketChart.market_caps || [];
       } catch (volError) {
         console.warn('[CoinGecko Chart] Failed to fetch volume data:', volError);
       }
@@ -247,19 +220,8 @@ router.get('/api/coingecko/chart/:coinId/multi-timeframe', async (req: Request, 
     
     const promises = timeframes.map(async (tf) => {
       try {
-        const ohlcResponse = await axios.get(
-          `${COINGECKO_API}/coins/${coinId}/ohlc`,
-          {
-            params: {
-              vs_currency: vsCurrency,
-              days: tf.days
-            },
-            headers: { 'Accept': 'application/json' },
-            timeout: 15000
-          }
-        );
-        
-        const chartData = ohlcResponse.data.map((candle: number[]) => ({
+        const ohlc = await coinGeckoService.getOHLC(coinId, String(vsCurrency), String(tf.days));
+        const chartData = (ohlc || []).map((candle: number[]) => ({
           timestamp: candle[0],
           open: candle[1],
           high: candle[2],

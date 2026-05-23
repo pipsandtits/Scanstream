@@ -138,14 +138,22 @@ export class MultiExchangeScanner {
     const timestamp = Date.now();
 
     // === STEP 1: Parallel exchange scans ===
-    const exchangeScanPromises = exchangesToScan.map(exchange =>
-      this.scanExchange(symbols, exchange, timeframe, limit, minVolume)
-        .then(results => ({ exchange, results }))
-        .catch(error => {
-          console.error(`[MultiExchangeScanner] Failed to scan ${exchange}:`, error);
-          return { exchange, results: [] };
-        })
-    );
+    const exchangeLatencies = new Map<string, number>();
+
+    const exchangeScanPromises = exchangesToScan.map(async exchange => {
+      const start = Date.now();
+      try {
+        const results = await this.scanExchange(symbols, exchange, timeframe, limit, minVolume);
+        const dur = Date.now() - start;
+        exchangeLatencies.set(exchange, dur);
+        return { exchange, results, durationMs: dur };
+      } catch (error) {
+        const dur = Date.now() - start;
+        exchangeLatencies.set(exchange, dur);
+        console.error(`[MultiExchangeScanner] Failed to scan ${exchange}:`, error);
+        return { exchange, results: [], durationMs: dur };
+      }
+    });
 
     const exchangeResults = await Promise.all(exchangeScanPromises);
 
@@ -153,8 +161,10 @@ export class MultiExchangeScanner {
     const aggregatedResults = new Map<string, ExchangeScanResults>();
     const allResults: ScanResult[] = [];
 
-    for (const { exchange, results } of exchangeResults) {
-      aggregatedResults.set(exchange, this.buildExchangeResult(exchange, results, timestamp));
+    for (const { exchange, results, durationMs } of exchangeResults) {
+      const totalScanned = symbols.length;
+      const errorCount = Math.max(0, totalScanned - results.length);
+      aggregatedResults.set(exchange, this.buildExchangeResult(exchange, results, timestamp, totalScanned, errorCount, durationMs));
       allResults.push(...results);
     }
 
@@ -187,107 +197,119 @@ export class MultiExchangeScanner {
   ): Promise<ScanResult[]> {
     const results: ScanResult[] = [];
 
-    for (const symbol of symbols) {
-      try {
-        // Get OHLCV data
-        const frames = await this.getOHLCVData(symbol, exchange, timeframe, limit);
+    // Batch symbols to avoid overwhelming services and to allow limited parallelism
+    const BATCH_SIZE = 20;
+    for (let i = 0; i < symbols.length; i += BATCH_SIZE) {
+      const batch = symbols.slice(i, i + BATCH_SIZE);
 
-        if (!frames || frames.length === 0) {
-          continue;
-        }
-
-        // Get volume data
-        const volumes = frames.map(f => f.volume || 0);
-        const avgVolume = volumes.reduce((a, b) => a + b, 0) / volumes.length;
-
-        if (avgVolume < minVolume) {
-          continue;
-        }
-
-        // Compute momentum score (includes regime detection)
-        const momentumResult = MomentumScanner.computeScore(frames);
-
-        // === LIVE SCANNER SOURCE: Multi-pattern classification ===
-        const patternClassification = MomentumScanner.classifyPatterns(frames);
-
-        // Try to fetch centralized regime context (best-effort)
-        const regimeSvc = getRegimeService();
-        let armRegime: ArmRegimeContext | undefined;
+      // Process batch in parallel
+      const batchPromises = batch.map(async symbol => {
         try {
-          const tfMinutes = this.timeframeToMinutes(timeframe);
-          const svcCtx = await regimeSvc.computeRegime(symbol, tfMinutes as any);
-          if (svcCtx) {
-            armRegime = {
-              regime: (svcCtx.type as any) ,
-              volatility: svcCtx.volatility === 'low' ? 0.2 : svcCtx.volatility === 'high' ? 0.8 : 0.5,
-              trendStrength: typeof svcCtx.momentum === 'number' ? svcCtx.momentum : 0,
-              regimeConfidence: svcCtx.confidence ?? (svcCtx.score ? Math.min(1, (svcCtx.score as number) / 100) : 0.5)
-            } as ArmRegimeContext;
+          // Get OHLCV data
+          const frames = await this.getOHLCVData(symbol, exchange, timeframe, limit);
+
+          if (!frames || frames.length === 0) {
+            return null;
           }
-        } catch (err) {
-          // best-effort: ignore regime failures
-        }
 
-        // Get base signal classification (pass external regime when available)
-        const baseSignal = SignalClassifier.classifyMomentumSignal(
-          this.calculateMomentum(frames, 1),
-          this.calculateMomentum(frames, 7),
-          this.calculateRSI(frames),
-          this.calculateMACD(frames)
-        );
+          // Get volume data
+          const volumes = frames.map((f: MarketFrame) => f.volume || 0);
+          const avgVolume = volumes.reduce((a, b) => a + b, 0) / volumes.length;
 
-        // Prepare ARM context (needs all technical indicators)
-        const armContext = this.buildSignalContext(frames, momentumResult);
-
-        // Enhance with ARM classification
-        const armResult = ArmSignalClassifier.classifyWithArm(armContext, baseSignal);
-
-        // Build result
-        const result: ScanResult = {
-          symbol,
-          exchange,
-          timestamp: Date.now(),
-          signal: armResult.signal,
-          signalStrength: armResult.strength,
-          confidence: armResult.confidence,
-          armSignal: armResult.armSignal || undefined,
-          armConfidence: armResult.armConfidence,
-          price: frames[frames.length - 1].price.close,
-          volume: avgVolume,
-          change24h: this.calculateChange24h(frames),
-          regime: momentumResult.regime || 'UNKNOWN',
-          regimeConfidence: momentumResult.regimeConfidence,
-          marketState: armResult.marketState,
-          armState: armResult.armState,
-          compositeScore: armResult.compositeScore,
-          stateAlignment: armResult.stateAlignment,
-          // === SCANNER SOURCE for consensus ===
-          scannerSource: {
-            patterns: patternClassification.patterns,
-            primaryPattern: patternClassification.primaryPattern,
-            overallConfidence: patternClassification.overallConfidence,
-            overallStrength: patternClassification.overallStrength,
-            reasoning: patternClassification.reasoning,
-            patternCount: patternClassification.patterns.length,
-            technicalScore: patternClassification.sourceContext?.technicalScore ?? 0,
-            volumeRatio: patternClassification.sourceContext?.volumeRatio ?? 0
+          if (avgVolume < minVolume) {
+            return null;
           }
-        };
 
-        // === QUALITY GATING: Check if signal passes quality threshold ===
-        const gateResult = QualityGating.passesQualityGate(result.confidence, result.signalStrength, symbol);
-        result.passesQualityGate = gateResult.passesGate;
-        result.qualityGateReason = gateResult.rejectionReason || gateResult.reason;
+          // Compute momentum score (includes regime detection)
+          const momentumResult = MomentumScanner.computeScore(frames);
 
-        // Only include if passes quality gate
-        if (gateResult.passesGate) {
-          results.push(result);
-        } else {
-          console.debug(`[MultiExchangeScanner] Filtered ${symbol}: ${gateResult.rejectionReason}`);
+          // === LIVE SCANNER SOURCE: Multi-pattern classification ===
+          const patternClassification = MomentumScanner.classifyPatterns(frames);
+
+          // Try to fetch centralized regime context (best-effort)
+          const regimeSvc = getRegimeService();
+          let armRegime: ArmRegimeContext | undefined;
+          try {
+            const tfMinutes = this.timeframeToMinutes(timeframe);
+            const svcCtx = await regimeSvc.computeRegime(symbol, tfMinutes as any);
+            if (svcCtx) {
+              armRegime = {
+                regime: (svcCtx.type as any),
+                volatility: svcCtx.volatility === 'low' ? 0.2 : svcCtx.volatility === 'high' ? 0.8 : 0.5,
+                trendStrength: typeof svcCtx.momentum === 'number' ? svcCtx.momentum : 0,
+                regimeConfidence: svcCtx.confidence ?? (svcCtx.score ? Math.min(1, (svcCtx.score as number) / 100) : 0.5)
+              } as ArmRegimeContext;
+            }
+          } catch (err) {
+            // best-effort: ignore regime failures
+          }
+
+          // Get base signal classification (pass external regime when available)
+          const baseSignal = SignalClassifier.classifyMomentumSignal(
+            this.calculateMomentum(frames, 1),
+            this.calculateMomentum(frames, 7),
+            this.calculateRSI(frames),
+            this.calculateMACD(frames)
+          );
+
+          // Prepare ARM context (needs all technical indicators)
+          const armContext = this.buildSignalContext(frames, momentumResult);
+
+          // Enhance with ARM classification
+          const armResult = ArmSignalClassifier.classifyWithArm(armContext, baseSignal);
+
+          // Build result
+          const result: ScanResult = {
+            symbol,
+            exchange,
+            timestamp: Date.now(),
+            signal: armResult.signal,
+            signalStrength: armResult.strength,
+            confidence: armResult.confidence,
+            armSignal: armResult.armSignal || undefined,
+            armConfidence: armResult.armConfidence,
+            price: frames[frames.length - 1].price.close,
+            volume: avgVolume,
+            change24h: this.calculateChange24h(frames),
+            regime: momentumResult.regime || 'UNKNOWN',
+            regimeConfidence: momentumResult.regimeConfidence,
+            marketState: armResult.marketState,
+            armState: armResult.armState,
+            compositeScore: armResult.compositeScore,
+            stateAlignment: armResult.stateAlignment,
+            // === SCANNER SOURCE for consensus ===
+            scannerSource: {
+              patterns: patternClassification.patterns,
+              primaryPattern: patternClassification.primaryPattern,
+              overallConfidence: patternClassification.overallConfidence,
+              overallStrength: patternClassification.overallStrength,
+              reasoning: patternClassification.reasoning,
+              patternCount: patternClassification.patterns.length,
+              technicalScore: patternClassification.sourceContext?.technicalScore ?? 0,
+              volumeRatio: patternClassification.sourceContext?.volumeRatio ?? 0
+            }
+          };
+
+          // === QUALITY GATING: Check if signal passes quality threshold ===
+          const gateResult = QualityGating.passesQualityGate(result.confidence, result.signalStrength, symbol);
+          result.passesQualityGate = gateResult.passesGate;
+          result.qualityGateReason = gateResult.rejectionReason || gateResult.reason;
+
+          // Only include if passes quality gate
+          if (gateResult.passesGate) {
+            return result;
+          } else {
+            console.debug(`[MultiExchangeScanner] Filtered ${symbol}: ${gateResult.rejectionReason}`);
+            return null;
+          }
+        } catch (error) {
+          console.error(`[MultiExchangeScanner] Error scanning ${symbol} on ${exchange}:`, error);
+          return null;
         }
-      } catch (error) {
-        console.error(`[MultiExchangeScanner] Error scanning ${symbol} on ${exchange}:`, error);
-      }
+      });
+
+      const batchResults = await Promise.all(batchPromises);
+      for (const r of batchResults) if (r) results.push(r);
     }
 
     return results;
@@ -299,7 +321,10 @@ export class MultiExchangeScanner {
   private buildExchangeResult(
     exchange: string,
     results: ScanResult[],
-    timestamp: number
+    timestamp: number,
+    totalScanned: number,
+    errorCount: number,
+    durationMs?: number
   ): ExchangeScanResults {
     const signalCounts = {
       strongBuy: 0,
@@ -325,15 +350,18 @@ export class MultiExchangeScanner {
       .sort((a, b) => (b.compositeScore || b.signalStrength) - (a.compositeScore || a.signalStrength))
       .slice(0, 10);
 
+    const successCount = results.length;
+    const avgConfidence = successCount > 0 ? totalConfidence / successCount : 0;
+
     return {
       exchange,
       timestamp,
-      totalScanned: results.length,
-      successCount: results.length,
-      errorCount: 0,
+      totalScanned,
+      successCount,
+      errorCount,
       results,
       topAssets,
-      avgConfidence: results.length > 0 ? totalConfidence / results.length : 0,
+      avgConfidence,
       signalDistribution: signalCounts
     };
   }
@@ -372,15 +400,23 @@ export class MultiExchangeScanner {
 
       const avgScore = totalScore / symbolResults.length;
 
-      // === Detect CONSENSUS ===
-      const firstSignal = symbolResults[0].signal;
-      if (symbolResults.every(r => r.signal === firstSignal)) {
+      // Volume-weighted consensus price and confidence
+      const totalVol = symbolResults.reduce((s, r) => s + (r.volume || 0), 0) || 1;
+      const vwap = symbolResults.reduce((s, r) => s + ((r.price || 0) * (r.volume || 0)), 0) / totalVol;
+      const vwConfidence = symbolResults.reduce((s, r) => s + ((r.confidence || 0) * (r.volume || 0)), 0) / totalVol;
+
+      // === Detect CONSENSUS (majority signal) ===
+      const signalCounts = new Map<string, number>();
+      for (const r of symbolResults) signalCounts.set(r.signal, (signalCounts.get(r.signal) || 0) + 1);
+      const majoritySignal = Array.from(signalCounts.entries()).sort((a, b) => b[1] - a[1])[0];
+      const majorityCount = majoritySignal ? majoritySignal[1] : 0;
+      if (majorityCount === symbolResults.length) {
         signals.push({
           symbol,
           type: 'CONSENSUS',
           confidence: Math.min(...symbolResults.map(r => r.confidence)),
           exchanges,
-          description: `All ${exchanges.length} exchanges align on ${firstSignal}`,
+          description: `All ${exchanges.length} exchanges align on ${symbolResults[0].signal}`,
           signals: signals_map,
           avgScore
         });
@@ -403,6 +439,32 @@ export class MultiExchangeScanner {
             avgScore
           });
         }
+      }
+
+      // === Detect ARBITRAGE (price spread across venues) ===
+      try {
+        const prices = symbolResults.map(r => ({ price: r.price || 0, exchange: r.exchange, signal: r.signal, volume: r.volume || 0 }));
+        const min = prices.reduce((a, b) => a.price < b.price ? a : b);
+        const max = prices.reduce((a, b) => a.price > b.price ? a : b);
+        const spreadPct = min.price > 0 ? (max.price - min.price) / min.price : 0;
+        // threshold for meaningful arbitrage (e.g., 0.5%)
+        if (spreadPct >= 0.005) {
+          // require directional signals: buy at low price, sell at high price
+          if (min.signal.includes('Buy') && max.signal.includes('Sell')) {
+            const arbConf = Math.min(...symbolResults.map(r => r.confidence)) * Math.min(1, spreadPct * 100);
+            signals.push({
+              symbol,
+              type: 'ARBITRAGE',
+              confidence: Math.min(1, arbConf),
+              exchanges: [min.exchange, max.exchange],
+              description: `Arbitrage: buy on ${min.exchange} @ ${min.price} sell on ${max.exchange} @ ${max.price} (spread ${(spreadPct*100).toFixed(2)}%)`,
+              signals: signals_map,
+              avgScore
+            });
+          }
+        }
+      } catch (e) {
+        // ignore arbitrage detection failures
       }
 
       // === Detect ACCUMULATION/DISTRIBUTION ===

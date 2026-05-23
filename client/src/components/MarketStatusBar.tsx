@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import { useMarketStatus } from '@/lib/hooks';
 import { Activity, Wifi, WifiOff, Clock, DollarSign, TrendingUp, TrendingDown } from 'lucide-react';
 import type { AttentionItem } from '../lib/attention';
 
@@ -58,14 +59,16 @@ export default function MarketStatusBar({
   const [currentTime, setCurrentTime] = useState(new Date());
   const [marketStatus, setMarketStatus] = useState<'open' | 'closed'>('closed');
   const [timeUntilChange, setTimeUntilChange] = useState('');
+  const marketQ = useMarketStatus();
 
-  // Use live ticker data if provided, otherwise fallback to minimal default
+  // Use live ticker data if provided, otherwise use backend tickers or a minimal default
+  const fetchedTickers = marketQ.data?.data?.tickers || [];
   const [tickerData] = useState<TickerItem[]>(
-    liveTickerData && liveTickerData.length > 0 
-      ? liveTickerData 
-      : [
+    liveTickerData && liveTickerData.length > 0
+      ? liveTickerData
+      : (fetchedTickers.length > 0 ? fetchedTickers : [
           { symbol: 'BTC', price: currentPrice, change: priceChange, changePercent: priceChangePercent },
-        ]
+        ])
   );
 
   // Update time every second
@@ -76,14 +79,19 @@ export default function MarketStatusBar({
     return () => clearInterval(timer);
   }, []);
 
-  // Determine market status (crypto markets are 24/7, but we'll simulate for demo)
+  // Determine market status: prefer backend value when available
   useEffect(() => {
+    if (marketQ.data && typeof marketQ.data.data === 'object') {
+      const isOpen = marketQ.data.data?.exchangeStatus?.isOperational ?? true;
+      setMarketStatus(isOpen ? 'open' : 'closed');
+      setTimeUntilChange('');
+      return;
+    }
+
     const hour = currentTime.getHours();
-    // Simulate market closed between 2 AM - 3 AM UTC for demo
+    // Fallback: simulate market closed between 2 AM - 3 AM UTC
     const isClosed = hour >= 2 && hour < 3;
     setMarketStatus(isClosed ? 'closed' : 'open');
-
-    // Calculate time until market change
     if (isClosed) {
       const minutesUntilOpen = (3 - hour) * 60 - currentTime.getMinutes();
       setTimeUntilChange(`Opens in ${minutesUntilOpen}m`);
@@ -95,7 +103,7 @@ export default function MarketStatusBar({
         setTimeUntilChange('');
       }
     }
-  }, [currentTime]);
+  }, [currentTime, marketQ.data]);
 
   const formatCurrency = (value: number) => {
     return new Intl.NumberFormat('en-US', {
@@ -178,9 +186,9 @@ export default function MarketStatusBar({
               <>
                 <Wifi className="w-3 h-3 text-green-400" />
                 <span className="text-green-400 font-medium">Connected</span>
-                {exchangeStatus && (
+                { (marketQ.data?.data?.exchangeStatus || exchangeStatus) && (
                   <span className="text-slate-500">
-                    • {exchangeStatus.latency}ms
+                    • {(marketQ.data?.data?.exchangeStatus?.latency ?? exchangeStatus?.latency) || 0}ms
                   </span>
                 )}
               </>
@@ -194,20 +202,20 @@ export default function MarketStatusBar({
 
             {/* Feed (MarketDataLayer) Status */}
             <div className="flex items-center space-x-2 px-3 py-1.5 bg-slate-800/50 rounded-lg border border-slate-700/50">
-              {mdlConnected ? (
+              { (marketQ.data?.data?.mdlConnected ?? mdlConnected) ? (
                 <>
                   <Activity className="w-3 h-3 text-green-400" />
                   <span className="text-green-400 font-medium">Feed</span>
-                  {mdlRetryInfo && (
-                    <span className="text-slate-500">• retry #{mdlRetryInfo.attempt}</span>
+                  {marketQ.data?.data?.mdlRetryInfo && (
+                    <span className="text-slate-500">• retry #{marketQ.data.data.mdlRetryInfo.attempt}</span>
                   )}
                 </>
               ) : (
                 <>
                   <Activity className="w-3 h-3 text-yellow-400" />
                   <span className="text-yellow-400 font-medium">Feed Unavailable</span>
-                  {mdlRetryInfo && (
-                    <span className="text-slate-500">• retrying in {mdlRetryInfo.delay}ms</span>
+                  {marketQ.data?.data?.mdlRetryInfo && (
+                    <span className="text-slate-500">• retrying in {marketQ.data.data.mdlRetryInfo.delay}ms</span>
                   )}
                 </>
               )}

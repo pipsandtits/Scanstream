@@ -16,6 +16,7 @@
  */
 
 import type { Candle, ValidatedCandle } from '../../types/market-data';
+import type { CCXTMarketDataAdapter } from './ccxt-adapter';
 
 export interface Gap {
   symbol: string;
@@ -67,6 +68,10 @@ export class CandleIntegrityLayer {
   private readonly symbol: string;
   private readonly timeframe: number; // in seconds
   private timeframeMs: number;
+  private readonly MAX_DRIFT_RATIO = 0.15; // max acceptable snap drift as ratio of timeframe
+  private readonly VOLUME_SPIKE_MULTIPLIER = 100; // flag volumes > median * this
+  private readonly MAX_PRICE_JUMP_RATIO = 0.5; // 50% jump between consecutive closes
+  private readonly MAX_ROC_RATIO = 0.5; // 50% open->close move
   
   // Metrics tracking
   private metrics: {
@@ -106,7 +111,7 @@ export class CandleIntegrityLayer {
     // Step 2: Sort by timestamp (ascending)
     const sorted = this.sort(deduped);
 
-    // Step 3: Validate OHLC structure
+    // Step 3: Validate OHLC structure (includes anomaly detection)
     const { valid: ohlcValid, rejected: ohlcRejected } = this.validateOHLC(sorted);
 
     // Step 4: Check timestamp alignment
@@ -152,9 +157,9 @@ export class CandleIntegrityLayer {
 
       valid: finalCandles,
       gaps,
-      rejected: ohlcRejected.map(c => ({
-        candle: c,
-        reason: this.getOHLCRejectionReason(c)
+      rejected: ohlcRejected.map(r => ({
+        candle: r.candle,
+        reason: r.reason
       })),
 
       alignment: alignmentReport,
@@ -171,6 +176,59 @@ export class CandleIntegrityLayer {
     );
 
     return report;
+  }
+
+  /**
+   * Async variant: validate, and optionally attempt gap healing using a provided
+   * fetcher or a CCXT adapter. Returns the final CandleIntegrityReport after
+   * attempted healing (which may include newly recovered candles).
+   *
+   * options:
+   *  - heal: boolean (default false)
+   *  - fetcher: (symbol, timeframeSeconds, fromMs, toMs) => Promise<Candle[]>
+   *  - ccxtAdapter: CCXTMarketDataAdapter (optional)
+   */
+  async validateAndNormalizeAsync(
+    candles: Candle[],
+    options?: {
+      heal?: boolean;
+      fetcher?: (symbol: string, timeframe: number, from: number, to: number) => Promise<Candle[]>;
+      ccxtAdapter?: CCXTMarketDataAdapter;
+    }
+  ): Promise<CandleIntegrityReport> {
+    const initialReport = this.validateAndNormalize(candles);
+
+    if (!options?.heal || initialReport.gaps.length === 0) {
+      return initialReport;
+    }
+
+    // Determine fetcher to use
+    const fetcher = options.fetcher ?? (async (symbol: string, timeframe: number, from: number, to: number) => {
+      if (!options?.ccxtAdapter) return [];
+      // ccxt.fetchOHLCV(since) returns candles starting at `since`; we may need to fetch extra and then filter
+      try {
+        const fetched = await options.ccxtAdapter.fetchOHLCV(symbol, timeframe, from, undefined);
+        return fetched.filter(c => c.ts >= from && c.ts <= to);
+      } catch (e) {
+        return [];
+      }
+    });
+
+    // Attempt to heal gaps
+    const recovered = await this.healGaps(initialReport.gaps, fetcher);
+
+    if (recovered.length === 0) {
+      console.log(`[CIL] No candles recovered for ${this.symbol}`);
+      return initialReport;
+    }
+
+    // Merge recovered with original input and re-run validation flow
+    const merged = this.sort(this.deduplicate([...candles, ...recovered]));
+    const finalReport = this.validateAndNormalize(merged);
+
+    console.log(`[CIL] After healing: ${finalReport.validCount}/${finalReport.inputCount} valid, ${finalReport.gaps.length} gaps remain`);
+
+    return finalReport;
   }
 
   /**
@@ -202,17 +260,50 @@ export class CandleIntegrityLayer {
    */
   private validateOHLC(candles: Candle[]): {
     valid: Candle[];
-    rejected: Candle[];
+    rejected: Array<{ candle: Candle; reason: string }>;
   } {
     const valid: Candle[] = [];
-    const rejected: Candle[] = [];
+    const rejected: Array<{ candle: Candle; reason: string }> = [];
 
-    for (const c of candles) {
-      if (this.isValidOHLC(c)) {
-        valid.push(c);
-      } else {
-        rejected.push(c);
+    // Compute median volume for the batch to detect extreme spikes
+    const volumes = candles.map(c => Math.max(0, c.volume || 0)).sort((a, b) => a - b);
+    const medianVolume = volumes.length === 0 ? 0 : volumes[Math.floor(volumes.length / 2)];
+
+    for (let i = 0; i < candles.length; i++) {
+      const c = candles[i];
+
+      // Basic OHLC validity
+      if (!this.isValidOHLC(c)) {
+        rejected.push({ candle: c, reason: this.getOHLCRejectionReason(c) });
+        continue;
       }
+
+      // Volume sanity: extreme spikes relative to batch median
+      if (medianVolume > 0 && c.volume > medianVolume * this.VOLUME_SPIKE_MULTIPLIER) {
+        rejected.push({ candle: c, reason: `extreme volume spike: ${c.volume} > median*${this.VOLUME_SPIKE_MULTIPLIER}` });
+        continue;
+      }
+
+      // Price continuity: compare with previous candle close
+      if (i > 0) {
+        const prev = candles[i - 1];
+        const prevClose = prev.close || 1;
+        const jump = Math.abs((c.close - prevClose) / prevClose);
+        if (jump > this.MAX_PRICE_JUMP_RATIO) {
+          rejected.push({ candle: c, reason: `sudden price jump: ${(jump * 100).toFixed(1)}% > ${(this.MAX_PRICE_JUMP_RATIO * 100).toFixed(0)}%` });
+          continue;
+        }
+      }
+
+      // Rate-of-change anomaly within candle (open -> close)
+      const openVal = c.open || 1;
+      const roc = Math.abs((c.close - openVal) / openVal);
+      if (roc > this.MAX_ROC_RATIO) {
+        rejected.push({ candle: c, reason: `rate-of-change anomaly: ${(roc * 100).toFixed(1)}% > ${(this.MAX_ROC_RATIO * 100).toFixed(0)}%` });
+        continue;
+      }
+
+      valid.push(c);
     }
 
     return { valid, rejected };
@@ -300,8 +391,15 @@ export class CandleIntegrityLayer {
         // Try to snap to nearest boundary
         const snapped = Math.round(c.ts / this.timeframeMs) * this.timeframeMs;
         const snapDrift = Math.abs(snapped - c.ts);
-        
-        if (snapDrift < this.timeframeMs / 10) {
+        // Compute acceptable drift: prefer a strict absolute cap for short timeframes
+        const maxAcceptableFromRatio = Math.floor(this.timeframeMs * this.MAX_DRIFT_RATIO);
+        let maxAcceptableDrift = Math.max(1, maxAcceptableFromRatio);
+        // For timeframes <= 60s, cap drift to 5s to avoid large snaps on short candles
+        if (this.timeframeMs <= 60_000) {
+          maxAcceptableDrift = Math.min(maxAcceptableDrift, 5000);
+        }
+
+        if (snapDrift <= maxAcceptableDrift) {
           // Close enough to snap (< 10% drift)
           aligned.push({ ...c, ts: snapped });
         } else {
@@ -419,6 +517,41 @@ export class CandleIntegrityLayer {
       valid: candles,
       gaps,
     };
+  }
+
+  /**
+   * Optional: Attempt to heal small gaps by fetching missing candles.
+   * Caller provides a fetcher function with signature
+   *   (symbol, timeframeSeconds, fromMs, toMs) => Promise<Candle[]>
+   * Returns array of recovered candles (may be empty).
+   */
+  async healGaps(
+    gaps: Gap[],
+    fetcher?: (symbol: string, timeframe: number, from: number, to: number) => Promise<Candle[]>
+  ): Promise<Candle[]> {
+    if (!fetcher || !gaps || gaps.length === 0) return [];
+
+    const recovered: Candle[] = [];
+
+    for (const g of gaps) {
+      try {
+        const from = g.from;
+        const to = g.to;
+        const fetched = await fetcher(this.symbol, this.timeframe, from, to);
+        if (Array.isArray(fetched) && fetched.length > 0) {
+          recovered.push(...fetched);
+          console.log(`[CIL] Healed gap for ${this.symbol} ${this.timeframe}s: fetched ${fetched.length} candles`);
+        }
+      } catch (e) {
+        console.warn(`[CIL] Gap healing failed for ${this.symbol}: ${String(e)}`);
+      }
+    }
+
+    // Deduplicate and sort recovered candles
+    const deduped = this.deduplicate(recovered);
+    const sorted = this.sort(deduped);
+
+    return sorted;
   }
 
   /**

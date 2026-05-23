@@ -63,8 +63,8 @@ export default function PortfolioPage() {
   // Fetch portfolio data from API
   const { data: portfolioData, isLoading, error, refetch } = useQuery<PortfolioData>({
     queryKey: ['portfolio-data'],
-    queryFn: async () => {
-      const response = await fetch('/api/portfolio/data');
+    queryFn: async ({ signal }: any) => {
+      const response = await fetch('/api/portfolio/data', { signal });
       if (!response.ok) {
         throw new Error('Failed to fetch portfolio data');
       }
@@ -99,7 +99,7 @@ export default function PortfolioPage() {
 
   const handleExport = async () => {
     try {
-      const response = await fetch('/api/portfolio/export');
+      const response = await fetch('/api/portfolio/export', { signal: AbortSignal.timeout(10000) });
       const data = await response.json();
       
       // Create download link

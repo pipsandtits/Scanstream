@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useRef } from 'react';
 import { TrendingUp, Zap, AlertCircle, CheckCircle, Clock, TrendingDown } from 'lucide-react';
 
 interface BounceSignal {
@@ -30,15 +30,21 @@ export default function BounceStrategyCard({
   const [signal, setSignal] = useState<BounceSignal | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const controllerRef = useRef<AbortController | null>(null);
 
   const executeStrategy = async () => {
     setIsLoading(true);
     setError(null);
     try {
+      controllerRef.current?.abort();
+      const controller = new AbortController();
+      controllerRef.current = controller;
+
       const response = await fetch('/api/strategies/enhanced-bounce/execute', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ symbol, timeframe, riskProfile: 'moderate' }),
+        signal: controller.signal,
       });
 
       const data = await response.json();
@@ -49,9 +55,11 @@ export default function BounceStrategyCard({
         setError(data.error || 'Failed to execute strategy');
       }
     } catch (err) {
+      if ((err as any)?.name === 'AbortError') return;
       setError(err instanceof Error ? err.message : 'Unknown error');
     } finally {
       setIsLoading(false);
+      controllerRef.current = null;
     }
   };
 

@@ -1,5 +1,5 @@
 import React, { useState, useCallback, useEffect } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { useActiveCombos } from '@/lib/hooks';
 import { AlertCircle, Zap, X, Clock, Users, TrendingUp } from 'lucide-react';
 
 export interface ComboNotification {
@@ -212,21 +212,9 @@ export const ComboNotificationContainer: React.FC<ComboNotificationContainerProp
 }) => {
   const [toasts, setToasts] = useState<ComboNotification[]>([]);
 
-  // Fetch active combos
-  const { data: combosData } = useQuery({
-    queryKey: ['active-combos'],
-    queryFn: async () => {
-      try {
-        const response = await fetch('/api/agents/combos');
-        if (!response.ok) return [];
-        const result = await response.json();
-        return result.data || [];
-      } catch {
-        return [];
-      }
-    },
-    refetchInterval: 10000,
-  });
+  // Fetch active combos from backend
+  const combosQ = useActiveCombos();
+  const combosData = combosQ.data?.data || [];
 
   // Add new combo notification
   const addComboNotification = useCallback((combo: ComboNotification) => {
@@ -238,26 +226,16 @@ export const ComboNotificationContainer: React.FC<ComboNotificationContainerProp
     setToasts(prev => prev.filter(t => t.id !== id));
   };
 
-  // Demo: Periodically generate random combos (remove in production)
+  // Inject active combos from backend into toast list
   useEffect(() => {
-    const demoTimer = setTimeout(() => {
-      if (combosData && combosData.length === 0 && Math.random() > 0.7) {
-        const randomCombo = COMBO_DATABASE[Math.floor(Math.random() * COMBO_DATABASE.length)];
-        addComboNotification({
-          id: `combo-${Date.now()}`,
-          timestamp: new Date().toISOString(),
-          comboName: randomCombo.name,
-          agents: randomCombo.agents,
-          bonusMultiplier: randomCombo.bonusMultiplier,
-          description: randomCombo.description,
-          impact: Math.floor(Math.random() * 100),
-          duration: randomCombo.bonusMultiplier > 2 ? 30 : 20,
-        });
-      }
-    }, 8000);
-
-    return () => clearTimeout(demoTimer);
-  }, [combosData, addComboNotification]);
+    if (!combosData || combosData.length === 0) return;
+    // append any new combos not already in toasts
+    setToasts(prev => {
+      const existing = new Set(prev.map((t) => t.id));
+      const incoming = combosData.filter((c: any) => !existing.has(c.id));
+      return [...prev, ...incoming];
+    });
+  }, [combosData]);
 
   const positionClasses = {
     'top-right': 'top-6 right-6',

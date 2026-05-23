@@ -1,10 +1,11 @@
 
-import { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo, useCallback, Suspense } from 'react';
 import { ArrowLeft, Play, Pause, RotateCcw, TrendingUp, TrendingDown, DollarSign, Settings, Download, X, RefreshCw } from 'lucide-react';
-import { useLocation } from 'wouter';
+import { useNavigate } from 'react-router-dom';
 import { useSymbolUniverse } from '../hooks/useSymbolUniverse';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { LineChart, Line, AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
+// Lazy-load chart core to keep recharts out of the initial bundle
+const AreaChartCore = React.lazy(() => import('../components/charts/AreaChartCore'));
 
 interface PaperTrade {
   id: string;
@@ -23,6 +24,67 @@ interface PaperTrade {
   pnlPercent?: number;
   source: 'ML' | 'RL' | 'GATEWAY' | 'MANUAL';
 }
+
+// Memoized row for active trades
+const TradeRow: React.FC<{ trade: PaperTrade; onRequestClose: (tradeId: string) => void }> = ({ trade, onRequestClose }) => {
+  return (
+    <div className="p-4 bg-slate-900/50 rounded-lg border border-slate-700/30">
+      <div className="flex justify-between items-start">
+        <div className="flex-1">
+          <div className="flex items-center gap-2 mb-2">
+            <div className="font-semibold text-white">{trade.symbol}</div>
+            <span className={`px-2 py-1 rounded text-xs ${trade.side === 'BUY' ? 'bg-green-600/20 text-green-400' : 'bg-red-600/20 text-red-400'}`}>
+              {trade.side}
+            </span>
+            <span className="px-2 py-1 bg-blue-600/20 text-blue-400 rounded text-xs">
+              {trade.source}
+            </span>
+          </div>
+          <div className="text-sm text-slate-400">
+            Entry: ${trade.entryPrice.toFixed(2)} | Size: {trade.quantity.toFixed(4)}
+          </div>
+          <div className="text-xs text-slate-500 mt-1">
+            SL: ${trade.stopLoss.toFixed(2)} | TP: ${trade.takeProfit.toFixed(2)}
+          </div>
+        </div>
+        <div className="flex items-center gap-2">
+          <div className="text-right mr-2">
+            <div className="text-sm text-slate-400">{new Date(trade.entryTime).toLocaleTimeString()}</div>
+          </div>
+          <button onClick={() => onRequestClose(trade.id)} className="px-3 py-1 bg-red-600 rounded text-sm hover:bg-red-700">Close</button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+const MemoizedTradeRow = React.memo(TradeRow);
+
+// Memoized row for recent trades
+const RecentTradeRow: React.FC<{ trade: PaperTrade }> = ({ trade }) => {
+  return (
+    <div className="p-4 bg-slate-900/50 rounded-lg border border-slate-700/30">
+      <div className="flex justify-between items-center">
+        <div>
+          <div className="flex items-center gap-2">
+            <div className="font-semibold text-white">{trade.symbol}</div>
+            <span className={`px-2 py-1 rounded text-xs ${trade.side === 'BUY' ? 'bg-green-600/20 text-green-400' : 'bg-red-600/20 text-red-400'}`}>
+              {trade.side}
+            </span>
+            <span className="px-2 py-1 bg-slate-600/20 text-slate-400 rounded text-xs">{trade.exitReason}</span>
+          </div>
+          <div className="text-sm text-slate-400 mt-1">${trade.entryPrice.toFixed(2)} → ${trade.exitPrice?.toFixed(2)}</div>
+        </div>
+        <div className="text-right">
+          <div className={`text-lg font-semibold ${(trade.pnl || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>{(trade.pnl || 0) >= 0 ? '+' : ''}${trade.pnl?.toFixed(2)}</div>
+          <div className={`text-sm ${(trade.pnlPercent || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>{(trade.pnlPercent || 0) >= 0 ? '+' : ''}{trade.pnlPercent?.toFixed(2)}%</div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+const MemoizedRecentRow = React.memo(RecentTradeRow);
 
 interface PaperTradingStatus {
   isRunning: boolean;
@@ -58,7 +120,7 @@ interface PaperTradingStatus {
 }
 
 export default function PaperTradingPage() {
-  const [, setLocation] = useLocation();
+  const navigate = useNavigate();
   const [showSettings, setShowSettings] = useState(false);
   const [showManualTrade, setShowManualTrade] = useState(false);
   const [manualTrade, setManualTrade] = useState({
@@ -81,8 +143,8 @@ export default function PaperTradingPage() {
   // Fetch paper trading status
   const { data: status, isLoading } = useQuery<PaperTradingStatus>({
     queryKey: ['paperTradingStatus'],
-    queryFn: async () => {
-      const res = await fetch('/api/paper-trading/status');
+    queryFn: async ({ signal }: any) => {
+      const res = await fetch('/api/paper-trading/status', { signal });
       if (!res.ok) throw new Error('Failed to fetch status');
       return res.json();
     },
@@ -93,7 +155,7 @@ export default function PaperTradingPage() {
   const { data: exportData } = useQuery({
     queryKey: ['paperTradingExport'],
     queryFn: async () => {
-      const res = await fetch('/api/paper-trading/export');
+      const res = await fetch('/api/paper-trading/export', { signal: AbortSignal.timeout(10000) });
       if (!res.ok) throw new Error('Failed to fetch export');
       const json = await res.json();
       return json.data;
@@ -103,10 +165,14 @@ export default function PaperTradingPage() {
 
   const equityCurve = exportData?.equityCurve || [];
 
+  // Memoize commonly used derived arrays to avoid new references on each poll
+  const memoEquityCurve = useMemo(() => equityCurve, [exportData]);
+
   // Start/Stop mutations
   const startMutation = useMutation({
     mutationFn: async () => {
-      const res = await fetch('/api/paper-trading/start', { method: 'POST' });
+      const controller = new AbortController();
+      const res = await fetch('/api/paper-trading/start', { method: 'POST', signal: controller.signal });
       if (!res.ok) throw new Error('Failed to start');
       return res.json();
     },
@@ -115,7 +181,8 @@ export default function PaperTradingPage() {
 
   const stopMutation = useMutation({
     mutationFn: async () => {
-      const res = await fetch('/api/paper-trading/stop', { method: 'POST' });
+      const controller = new AbortController();
+      const res = await fetch('/api/paper-trading/stop', { method: 'POST', signal: controller.signal });
       if (!res.ok) throw new Error('Failed to stop');
       return res.json();
     },
@@ -124,10 +191,12 @@ export default function PaperTradingPage() {
 
   const resetMutation = useMutation({
     mutationFn: async () => {
+      const controller = new AbortController();
       const res = await fetch('/api/paper-trading/reset', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ initialBalance: 10000 })
+        body: JSON.stringify({ initialBalance: 10000 }),
+        signal: controller.signal,
       });
       if (!res.ok) throw new Error('Failed to reset');
       return res.json();
@@ -140,6 +209,7 @@ export default function PaperTradingPage() {
 
   const manualTradeMutation = useMutation({
     mutationFn: async () => {
+      const controller = new AbortController();
       const res = await fetch('/api/paper-trading/trade', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -149,7 +219,8 @@ export default function PaperTradingPage() {
           price: parseFloat(manualTrade.price),
           stopLoss: manualTrade.stopLoss ? parseFloat(manualTrade.stopLoss) : undefined,
           takeProfit: manualTrade.takeProfit ? parseFloat(manualTrade.takeProfit) : undefined
-        })
+        }),
+        signal: controller.signal,
       });
       if (!res.ok) throw new Error('Failed to execute trade');
       return res.json();
@@ -163,16 +234,26 @@ export default function PaperTradingPage() {
 
   const closeTradeMutation = useMutation({
     mutationFn: async ({ tradeId, exitPrice }: { tradeId: string; exitPrice: number }) => {
+      const controller = new AbortController();
       const res = await fetch(`/api/paper-trading/close/${tradeId}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ exitPrice })
+        body: JSON.stringify({ exitPrice }),
+        signal: controller.signal,
       });
       if (!res.ok) throw new Error('Failed to close trade');
       return res.json();
     },
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['paperTradingStatus'] })
   });
+
+  // Stable handler for closing trades (memoized)
+  const handleRequestClose = useCallback((tradeId: string) => {
+    const currentPrice = prompt('Enter exit price:');
+    if (currentPrice) {
+      closeTradeMutation.mutate({ tradeId, exitPrice: parseFloat(currentPrice) });
+    }
+  }, [closeTradeMutation]);
 
   const handleToggle = () => {
     if (status?.isRunning) {
@@ -190,7 +271,7 @@ export default function PaperTradingPage() {
 
   const handleExport = async () => {
     try {
-      const res = await fetch('/api/paper-trading/export');
+      const res = await fetch('/api/paper-trading/export', { signal: AbortSignal.timeout(10000) });
       const data = await res.json();
       const blob = new Blob([JSON.stringify(data.data, null, 2)], { type: 'application/json' });
       const url = URL.createObjectURL(blob);
@@ -294,24 +375,17 @@ export default function PaperTradingPage() {
         {/* Equity Curve Chart */}
         <div className="bg-slate-800/40 p-6 rounded-xl border border-slate-700/50 mb-6">
           <h2 className="text-lg font-semibold text-white mb-4">Equity Curve</h2>
-          <ResponsiveContainer width="100%" height={300}>
-            <AreaChart data={equityCurve}>
-              <defs>
-                <linearGradient id="equityGradient" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="5%" stopColor="#3b82f6" stopOpacity={0.3}/>
-                  <stop offset="95%" stopColor="#3b82f6" stopOpacity={0}/>
-                </linearGradient>
-              </defs>
-              <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-              <XAxis dataKey="timestamp" stroke="#94a3b8" tick={{ fontSize: 12 }} />
-              <YAxis stroke="#94a3b8" tick={{ fontSize: 12 }} />
-              <Tooltip
-                contentStyle={{ backgroundColor: '#1e293b', border: '1px solid #334155', borderRadius: '8px' }}
-                labelStyle={{ color: '#94a3b8' }}
-              />
-              <Area type="monotone" dataKey="balance" stroke="#3b82f6" fill="url(#equityGradient)" strokeWidth={2} />
-            </AreaChart>
-          </ResponsiveContainer>
+          <Suspense fallback={<div className="h-72 flex items-center justify-center">Loading chart…</div>}>
+            <AreaChartCore
+              data={memoEquityCurve}
+            dataKey="balance"
+            height={300}
+            gradientId="equityGradient"
+            stroke="#3b82f6"
+            fill="#3b82f6"
+            xFormatter={(t: any) => new Date(t).toLocaleDateString()}
+          />
+          </Suspense>
         </div>
 
         {/* Settings Panel */}
@@ -438,52 +512,11 @@ export default function PaperTradingPage() {
           {status.activeTrades.length === 0 ? (
             <div className="text-center text-slate-400 py-8">No open positions</div>
           ) : (
-            <div className="space-y-3">
-              {status.activeTrades.map((trade) => (
-                <div key={trade.id} className="p-4 bg-slate-900/50 rounded-lg border border-slate-700/30">
-                  <div className="flex justify-between items-start">
-                    <div className="flex-1">
-                      <div className="flex items-center gap-2 mb-2">
-                        <div className="font-semibold text-white">{trade.symbol}</div>
-                        <span className={`px-2 py-1 rounded text-xs ${trade.side === 'BUY' ? 'bg-green-600/20 text-green-400' : 'bg-red-600/20 text-red-400'}`}>
-                          {trade.side}
-                        </span>
-                        <span className="px-2 py-1 bg-blue-600/20 text-blue-400 rounded text-xs">
-                          {trade.source}
-                        </span>
-                      </div>
-                      <div className="text-sm text-slate-400">
-                        Entry: ${trade.entryPrice.toFixed(2)} | Size: {trade.quantity.toFixed(4)}
-                      </div>
-                      <div className="text-xs text-slate-500 mt-1">
-                        SL: ${trade.stopLoss.toFixed(2)} | TP: ${trade.takeProfit.toFixed(2)}
-                      </div>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <div className="text-right mr-2">
-                        <div className="text-sm text-slate-400">
-                          {new Date(trade.entryTime).toLocaleTimeString()}
-                        </div>
-                      </div>
-                      <button
-                        onClick={() => {
-                          const currentPrice = prompt('Enter exit price:');
-                          if (currentPrice) {
-                            closeTradeMutation.mutate({
-                              tradeId: trade.id,
-                              exitPrice: parseFloat(currentPrice)
-                            });
-                          }
-                        }}
-                        className="px-3 py-1 bg-red-600 rounded text-sm hover:bg-red-700"
-                      >
-                        Close
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              ))}
-            </div>
+              <div className="space-y-3">
+                {status.activeTrades.map((trade) => (
+                  <MemoizedTradeRow key={trade.id} trade={trade} onRequestClose={handleRequestClose} />
+                ))}
+              </div>
           )}
         </div>
 
@@ -495,32 +528,7 @@ export default function PaperTradingPage() {
           ) : (
             <div className="space-y-3">
               {status.recentTrades.map((trade) => (
-                <div key={trade.id} className="p-4 bg-slate-900/50 rounded-lg border border-slate-700/30">
-                  <div className="flex justify-between items-center">
-                    <div>
-                      <div className="flex items-center gap-2">
-                        <div className="font-semibold text-white">{trade.symbol}</div>
-                        <span className={`px-2 py-1 rounded text-xs ${trade.side === 'BUY' ? 'bg-green-600/20 text-green-400' : 'bg-red-600/20 text-red-400'}`}>
-                          {trade.side}
-                        </span>
-                        <span className="px-2 py-1 bg-slate-600/20 text-slate-400 rounded text-xs">
-                          {trade.exitReason}
-                        </span>
-                      </div>
-                      <div className="text-sm text-slate-400 mt-1">
-                        ${trade.entryPrice.toFixed(2)} → ${trade.exitPrice?.toFixed(2)}
-                      </div>
-                    </div>
-                    <div className="text-right">
-                      <div className={`text-lg font-semibold ${(trade.pnl || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                        {(trade.pnl || 0) >= 0 ? '+' : ''}${trade.pnl?.toFixed(2)}
-                      </div>
-                      <div className={`text-sm ${(trade.pnlPercent || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                        {(trade.pnlPercent || 0) >= 0 ? '+' : ''}{trade.pnlPercent?.toFixed(2)}%
-                      </div>
-                    </div>
-                  </div>
-                </div>
+                <MemoizedRecentRow key={trade.id} trade={trade} />
               ))}
             </div>
           )}

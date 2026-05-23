@@ -66,7 +66,7 @@ export default function SymbolUniversePage() {
   // Fetch symbols data (legacy Symbol Universe)
   const { data: symbolsData } = useQuery({
     queryKey: ['symbols', filters, searchQuery],
-    queryFn: async () => {
+    queryFn: async ({ signal }: any) => {
       try {
         const params = new URLSearchParams({
           search: searchQuery,
@@ -78,8 +78,7 @@ export default function SymbolUniversePage() {
           minVolatility: filters.volatilityRange.min.toString(),
           maxVolatility: filters.volatilityRange.max.toString(),
         });
-
-        const response = await fetch(`/api/symbols?${params}`);
+        const response = await fetch(`/api/symbols?${params}`, { signal });
         if (!response.ok) throw new Error('Failed to fetch symbols');
         return response.json();
       } catch (error) {
@@ -98,21 +97,24 @@ export default function SymbolUniversePage() {
 
   // Fetch watchlists
   useEffect(() => {
+    const controller = new AbortController();
     const fetchWatchlists = async () => {
       try {
-        const response = await fetch('/api/watchlists');
+        const response = await fetch('/api/watchlists', { signal: controller.signal });
         if (response.ok) {
           const data = await response.json();
-          setWatchlists(data.data || []);
+          if (!controller.signal.aborted) setWatchlists(data.data || []);
         }
-      } catch (error) {
+      } catch (error: any) {
+        if (error?.name === 'AbortError') return;
         console.error('Watchlist fetch error:', error);
       } finally {
-        setLoading(false);
+        if (!controller.signal.aborted) setLoading(false);
       }
     };
 
     fetchWatchlists();
+    return () => { controller.abort(); };
   }, []);
 
   // WebSocket for real-time updates

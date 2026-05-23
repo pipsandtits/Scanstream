@@ -1,5 +1,5 @@
 {
-  "include": ["client/**/*", "shared/**/*", "server/**/*"],
+  "include": ["client/**/*", "shared/**/*", "server/**/*", "tests/**/*", "tools/**/*"],
   "exclude": ["node_modules", "build", "dist", "**/*.test.ts", "server/backtest/**/*", "server/scripts/**/*"],
   "compilerOptions": {
     "incremental": true,
@@ -11,8 +11,9 @@
     "jsx": "preserve",
     "esModuleInterop": true,
     "skipLibCheck": true,
+    "ignoreDeprecations": "6.0",
     "allowImportingTsExtensions": true,
-    "moduleResolution": "bundler",
+    "moduleResolution": "node",
     "baseUrl": ".",
     "types": ["node", "vite/client"],
     "target": "es2020",

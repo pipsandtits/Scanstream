@@ -4,7 +4,8 @@
  * Ensures only high-quality signals are presented to users
  */
 
-import { PrismaClient } from '@prisma/client';
+import pkg from '@prisma/client';
+const { PrismaClient } = pkg as any;
 import { SignalAccuracyEngine } from './signal-accuracy';
 
 const prisma = new PrismaClient();
@@ -51,7 +52,10 @@ export class SignalQualityEngine {
   /**
    * Calculate comprehensive quality score for a signal
    */
-  async calculateQualityScore(signal: SignalMetrics, relatedSignals: SignalMetrics[] = []): Promise<QualityScore> {
+  async calculateQualityScore(signal: SignalMetrics, relatedSignals: SignalMetrics[] = [], preloadedAccuracy?: Map<string, number>): Promise<QualityScore> {
+    // Deprecated: callers should prefer passing a preloaded accuracy map via
+    // the optional third parameter in future refactors. Backwards compatible
+    // signature kept for internal calls.
     const reasons: string[] = [];
     let scores = {
       strength: 0,
@@ -120,7 +124,14 @@ export class SignalQualityEngine {
       }
     } else {
       // Fallback to signal type accuracy
-      const accuracy = await this.getHistoricalAccuracy(signal.type, signal.symbol);
+      const cacheKey = `${signal.type}:${signal.symbol}`;
+      let accuracy = 0.5;
+      if (preloadedAccuracy && preloadedAccuracy.has(cacheKey)) {
+        accuracy = preloadedAccuracy.get(cacheKey)!;
+      } else {
+        accuracy = await this.getHistoricalAccuracy(signal.type, signal.symbol);
+      }
+
       if (accuracy >= 0.70) {
         scores.accuracy = 15;
         reasons.push(`Signal type has ${(accuracy * 100).toFixed(1)}% historical accuracy`);
@@ -226,7 +237,7 @@ export class SignalQualityEngine {
       let wins = 0;
       let losses = 0;
 
-      signals.forEach(signal => {
+      signals.forEach((signal: any) => {
         const reasoning = signal.reasoning as Record<string, any>;
         if (reasoning?.outcome === 'win') wins++;
         else if (reasoning?.outcome === 'loss') losses++;
@@ -244,12 +255,73 @@ export class SignalQualityEngine {
   }
 
   /**
+   * Preload historical accuracy for a batch of signals (avoid N+1 DB calls).
+   * Returns a Map keyed by `${type}:${symbol}` -> accuracy (0-1).
+   */
+  async preloadHistoricalAccuracy(signals: SignalMetrics[]): Promise<Map<string, number>> {
+    const prismaAny = prisma as any;
+    const pairs = new Map<string, { type: string; symbol: string }>();
+    for (const s of signals) {
+      const key = `${s.type}:${s.symbol}`;
+      if (!pairs.has(key)) pairs.set(key, { type: s.type, symbol: s.symbol });
+    }
+
+    const keys = Array.from(pairs.values());
+    const result = new Map<string, number>();
+    if (keys.length === 0) return result;
+
+    // Build a VALUES list for parameterized query
+    const vals: string[] = [];
+    const params: any[] = [];
+    let idx = 1;
+    for (const k of keys) {
+      vals.push(`($${idx}, $${idx + 1})`);
+      params.push(k.type, k.symbol);
+      idx += 2;
+    }
+
+    const sql = `
+      WITH pairs(type, symbol) AS (VALUES ${vals.join(',')}),
+      ranked AS (
+        SELECT s.type, s.symbol, s.outcome,
+          ROW_NUMBER() OVER (PARTITION BY s.type, s.symbol ORDER BY s.timestamp DESC) as rn
+        FROM signal s
+        JOIN pairs p ON p.type = s.type AND p.symbol = s.symbol
+      )
+      SELECT type, symbol,
+        SUM(CASE WHEN outcome = 'WIN' THEN 1 ELSE 0 END) AS wins,
+        SUM(CASE WHEN outcome = 'LOSS' THEN 1 ELSE 0 END) AS losses
+      FROM ranked
+      WHERE rn <= 100
+      GROUP BY type, symbol
+    `;
+
+    try {
+      // prisma.$queryRawUnsafe used because dynamic parameter count
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-call
+      const rows: any[] = await prismaAny.$queryRawUnsafe(sql, ...params);
+      for (const r of rows) {
+        const tot = (Number(r.wins) || 0) + (Number(r.losses) || 0);
+        const acc = tot > 0 ? (Number(r.wins) || 0) / tot : 0.5;
+        result.set(`${r.type}:${r.symbol}`, acc);
+      }
+    } catch (err) {
+      // On error, leave map empty; callers will fall back to individual queries
+      console.warn('[SignalQuality] preloadHistoricalAccuracy failed:', err);
+    }
+
+    return result;
+  }
+
+  /**
    * Filter signals by quality threshold
    */
   async filterByQuality(signals: SignalMetrics[], minQualityScore: number = 60): Promise<SignalMetrics[]> {
+    // Preload accuracies to avoid per-signal DB calls
+    const accuracyMap = await this.preloadHistoricalAccuracy(signals);
     const qualityResults = await Promise.all(
-      signals.map(async (signal) => {
-        const quality = await this.calculateQualityScore(signal, signals);
+      signals.map(async (signal: SignalMetrics) => {
+        const quality = await this.calculateQualityScore(signal, signals, accuracyMap);
         return { signal, quality };
       })
     );
@@ -267,7 +339,7 @@ export class SignalQualityEngine {
 
     // Group by symbol
     const bySymbol = new Map<string, SignalMetrics[]>();
-    signals.forEach(signal => {
+    signals.forEach((signal: SignalMetrics) => {
       if (!bySymbol.has(signal.symbol)) {
         bySymbol.set(signal.symbol, []);
       }
@@ -275,12 +347,16 @@ export class SignalQualityEngine {
     });
 
     // For each symbol, pick the best signal
+    // Preload accuracy map for all signals to avoid N+1
+    const allSignals = Array.from(bySymbol.values()).flat();
+    const accuracyMap = await this.preloadHistoricalAccuracy(allSignals);
+
     for (const [symbol, symbolSignals] of bySymbol.entries()) {
       let bestSignal = symbolSignals[0];
-      let bestQuality = await this.calculateQualityScore(bestSignal, symbolSignals);
+      let bestQuality = await this.calculateQualityScore(bestSignal, symbolSignals, accuracyMap);
 
       for (const signal of symbolSignals.slice(1)) {
-        const quality = await this.calculateQualityScore(signal, symbolSignals);
+        const quality = await this.calculateQualityScore(signal, symbolSignals, accuracyMap);
         if (quality.overallScore > bestQuality.overallScore) {
           bestSignal = signal;
           bestQuality = quality;
@@ -298,7 +374,7 @@ export class SignalQualityEngine {
    */
   async rankSignals(signals: SignalMetrics[]): Promise<Array<{ signal: SignalMetrics; quality: QualityScore; rank: number }>> {
     const withQuality = await Promise.all(
-      signals.map(async (signal) => ({
+      signals.map(async (signal: SignalMetrics) => ({
         signal,
         quality: await this.calculateQualityScore(signal, signals)
       }))

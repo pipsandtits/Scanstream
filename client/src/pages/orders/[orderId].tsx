@@ -1,13 +1,12 @@
 import React from 'react';
-import { useParams } from 'wouter';
-import { useLocation } from 'wouter';
+import { useParams, useNavigate } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
 import { ArrowLeft } from 'lucide-react';
 
 export default function OrderPage() {
   const params = useParams();
   const orderId = (params as any)?.orderId;
-  const [, setLocation] = useLocation();
+  const navigate = useNavigate();
 
   const { data, isLoading, error } = useQuery({
     queryKey: ['order', orderId],

@@ -83,16 +83,25 @@ export default function WatchlistPage() {
 
   // Fetch prices
   useEffect(() => {
+    const controllerRef = { current: null as AbortController | null };
+
     const fetchPrices = async () => {
       if (!watchlist?.length) return;
 
       try {
+        // Abort any previous inflight request
+        if (controllerRef.current) controllerRef.current.abort();
+        const controller = new AbortController();
+        controllerRef.current = controller;
+
         const symbols = watchlist.map(w => w.symbol.toLowerCase()).join(',');
         const response = await fetch(
-          `https://api.coingecko.com/api/v3/simple/price?ids=${symbols}&vs_currencies=usd`
+          `https://api.coingecko.com/api/v3/simple/price?ids=${symbols}&vs_currencies=usd`,
+          { signal: controller.signal }
         );
+        if (!response.ok) return;
         const data = await response.json();
-        
+
         const newPrices: Record<string, number> = {};
         watchlist.forEach(item => {
           const key = item.symbol.toLowerCase();
@@ -100,15 +109,20 @@ export default function WatchlistPage() {
             newPrices[item.symbol] = data[key].usd;
           }
         });
-        setPrices(newPrices);
-      } catch (error) {
+        // Only update state if not aborted
+        if (!controller.signal.aborted) setPrices(newPrices);
+      } catch (error: any) {
+        if (error?.name === 'AbortError') return;
         console.error('Failed to fetch prices:', error);
       }
     };
 
     fetchPrices();
     const interval = setInterval(fetchPrices, 30000);
-    return () => clearInterval(interval);
+    return () => {
+      clearInterval(interval);
+      try { controllerRef.current?.abort(); } catch (e) {}
+    };
   }, [watchlist]);
 
   const getFilteredAssets = () => {

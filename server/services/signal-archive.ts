@@ -1,5 +1,7 @@
 
-import { PrismaClient } from '@prisma/client';
+import pkg from '@prisma/client';
+const { PrismaClient } = pkg as any;
+import type { PrismaClient as PrismaClientType } from '@prisma/client';
 
 interface ArchivedSignal {
   id: string;
@@ -27,11 +29,27 @@ interface ArchivedSignal {
 }
 
 export class SignalArchiveService {
-  private prisma: PrismaClient;
+  private prisma: PrismaClientType | null;
   private maxArchiveSize = 50000; // Keep last 50k signals
 
-  constructor() {
-    this.prisma = new PrismaClient();
+  constructor(prisma?: PrismaClientType) {
+    this.prisma = prisma ?? null;
+  }
+
+  /**
+   * Inject a PrismaClient at runtime. Call this during app bootstrap.
+   */
+  setPrismaClient(prisma: PrismaClientType) {
+    this.prisma = prisma;
+  }
+
+  private get prismaClient(): PrismaClientType {
+    if (!this.prisma) {
+      throw new Error(
+        'SignalArchiveService: Prisma client not injected. Call setPrismaClient(prisma) or pass PrismaClient to the constructor.'
+      );
+    }
+    return this.prisma;
   }
 
   /**
@@ -41,27 +59,27 @@ export class SignalArchiveService {
   async archiveSignal(signal: Omit<ArchivedSignal, 'id' | 'timestamp' | 'outcome'>): Promise<string> {
     try {
       // Check archive size before adding new signal
-      const currentCount = await this.prisma.signal.count();
+      const currentCount = await this.prismaClient.signal.count();
       
       if (currentCount >= this.maxArchiveSize) {
         // Delete oldest signals to make room (delete 10% to reduce churn)
         const toDelete = Math.ceil(this.maxArchiveSize * 0.1);
-        const oldest = await this.prisma.signal.findMany({
+        const oldest = await this.prismaClient.signal.findMany({
           orderBy: { timestamp: 'asc' },
           take: toDelete,
         });
 
         if (oldest.length > 0) {
-          await this.prisma.signal.deleteMany({
+          await this.prismaClient.signal.deleteMany({
             where: {
-              id: { in: oldest.map(s => s.id) }
+              id: { in: oldest.map((s: any) => s.id) }
             }
           });
           console.log(`[SignalArchive] Pruned ${oldest.length} oldest signals (total: ${currentCount} → ${currentCount - oldest.length})`);
         }
       }
 
-      const archived = await this.prisma.signal.create({
+      const archived = await this.prismaClient.signal.create({
         data: {
           symbol: signal.symbol,
           type: signal.signalType,
@@ -91,7 +109,7 @@ export class SignalArchiveService {
    */
   async markExecuted(signalId: string, executionPrice: number): Promise<void> {
     try {
-      await this.prisma.signal.update({
+      await this.prismaClient.signal.update({
         where: { id: signalId },
         data: {
           price: executionPrice,
@@ -114,7 +132,7 @@ export class SignalArchiveService {
     hitTakeProfit?: boolean;
   }): Promise<void> {
     try {
-      const signal = await this.prisma.signal.findUnique({ where: { id: signalId } });
+      const signal = await this.prismaClient.signal.findUnique({ where: { id: signalId } });
       if (!signal) {
         console.warn(`[SignalArchive] Signal ${signalId} not found`);
         return;
@@ -142,7 +160,7 @@ export class SignalArchiveService {
         }
       };
 
-      await this.prisma.signal.update({
+      await this.prismaClient.signal.update({
         where: { id: signalId },
         data: { reasoning: updatedReasoning }
       });
@@ -167,7 +185,7 @@ export class SignalArchiveService {
   }) {
     const { symbol, startDate, endDate, minStrength, limit = 100 } = filters;
 
-    const signals = await this.prisma.signal.findMany({
+    const signals = await this.prismaClient.signal.findMany({
       where: {
         ...(symbol && { symbol }),
         ...(startDate && { timestamp: { gte: startDate } }),
@@ -194,13 +212,13 @@ export class SignalArchiveService {
       limit: 10000,
     });
 
-    const withOutcomes = signals.filter(s => (s.reasoning as any)?.outcome);
+    const withOutcomes = signals.filter((s: any) => (s.reasoning as any)?.outcome);
     
-    const wins = withOutcomes.filter(s => (s.reasoning as any).outcome.type === 'WIN').length;
-    const losses = withOutcomes.filter(s => (s.reasoning as any).outcome.type === 'LOSS').length;
-    const breakevens = withOutcomes.filter(s => (s.reasoning as any).outcome.type === 'BREAKEVEN').length;
+    const wins = withOutcomes.filter((s: any) => (s.reasoning as any).outcome.type === 'WIN').length;
+    const losses = withOutcomes.filter((s: any) => (s.reasoning as any).outcome.type === 'LOSS').length;
+    const breakevens = withOutcomes.filter((s: any) => (s.reasoning as any).outcome.type === 'BREAKEVEN').length;
 
-    const totalPnl = withOutcomes.reduce((sum, s) => sum + ((s.reasoning as any).outcome.pnl || 0), 0);
+    const totalPnl = withOutcomes.reduce((sum: number, s: any) => sum + ((s.reasoning as any).outcome.pnl || 0), 0);
     const avgPnl = withOutcomes.length > 0 ? totalPnl / withOutcomes.length : 0;
 
     return {
@@ -212,7 +230,7 @@ export class SignalArchiveService {
       winRate: withOutcomes.length > 0 ? (wins / withOutcomes.length) * 100 : 0,
       totalPnl,
       avgPnl,
-      avgPnlPercent: withOutcomes.reduce((sum, s) => sum + ((s.reasoning as any).outcome.pnlPercent || 0), 0) / (withOutcomes.length || 1),
+      avgPnlPercent: withOutcomes.reduce((sum: number, s: any) => sum + ((s.reasoning as any).outcome.pnlPercent || 0), 0) / (withOutcomes.length || 1),
     };
   }
 
@@ -222,7 +240,7 @@ export class SignalArchiveService {
   async pruneOldSignals(daysToKeep: number = 90): Promise<number> {
     const cutoffDate = new Date(Date.now() - daysToKeep * 24 * 60 * 60 * 1000);
     
-    const deleted = await this.prisma.signal.deleteMany({
+    const deleted = await this.prismaClient.signal.deleteMany({
       where: {
         timestamp: { lt: cutoffDate }
       }
@@ -233,9 +251,16 @@ export class SignalArchiveService {
   }
 
   async disconnect() {
-    await this.prisma.$disconnect();
+    if (this.prisma) await this.prisma.$disconnect();
   }
 }
 
 // Singleton instance
 export const signalArchive = new SignalArchiveService();
+
+/**
+ * Convenience initializer to inject a PrismaClient at runtime.
+ */
+export function initSignalArchive(prisma: PrismaClientType) {
+  signalArchive.setPrismaClient(prisma);
+}

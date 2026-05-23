@@ -9,7 +9,9 @@
  */
 
 import type { ScanResult, ExchangeScanResults, CrossExchangeSignal, MultiExchangeScanResults } from './multi-exchange-scanner';
-import { PrismaClient } from '@prisma/client';
+import pkg from '@prisma/client';
+const { PrismaClient } = pkg as any;
+import type { PrismaClient as PrismaClientType } from '@prisma/client';
 
 export interface StoredScanResult {
   id?: string;
@@ -77,9 +79,9 @@ export interface StoredScanSession {
  * - Computing statistics
  */
 export class ScannerPersistenceService {
-  private db: PrismaClient;
+  private db: PrismaClientType;
 
-  constructor(prismaClient: PrismaClient) {
+  constructor(prismaClient: PrismaClientType) {
     this.db = prismaClient;
   }
 
@@ -173,7 +175,7 @@ export class ScannerPersistenceService {
         )
       );
 
-      return stored.map(s => ({
+      return stored.map((s: any) => ({
         id: s.id,
         symbol: s.symbol,
         exchange: s.exchange,
@@ -206,7 +208,7 @@ export class ScannerPersistenceService {
   ): Promise<void> {
     try {
       await Promise.all(
-        signals.map(signal =>
+        signals.map((signal: any) =>
           this.db.crossExchangeSignal.create({
             data: {
               sessionId,
@@ -249,7 +251,7 @@ export class ScannerPersistenceService {
         take: 100
       });
 
-      return results.map(r => ({
+      return results.map((r: any) => ({
         id: r.id,
         symbol: r.symbol,
         exchange: r.exchange,
@@ -289,7 +291,7 @@ export class ScannerPersistenceService {
         take: 100
       });
 
-      return signals.map(s => ({
+      return signals.map((s: any) => ({
         id: s.id,
         symbol: s.symbol,
         type: s.signalType,
@@ -336,7 +338,7 @@ export class ScannerPersistenceService {
       let totalConfidence = 0;
       const exchanges = new Map<string, number>();
 
-      results.forEach(r => {
+      results.forEach((r: any) => {
         signalCounts[r.signal] = (signalCounts[r.signal] || 0) + 1;
         totalConfidence += r.confidence;
         exchanges.set(r.exchange, (exchanges.get(r.exchange) || 0) + 1);
@@ -378,7 +380,7 @@ export class ScannerPersistenceService {
         take: limit
       });
 
-      return results.map(r => ({
+      return results.map((r: any) => ({
         symbol: r.symbol,
         avgScore: +(r._avg.compositeScore || 0).toFixed(4),
         scanCount: r._count

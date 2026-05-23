@@ -1,4 +1,10 @@
-import { PrismaClient } from '@prisma/client';
+import pkg from '@prisma/client';
+const { PrismaClient } = pkg as any;
+
+// ORM guidance: when using Prisma in application code prefer `select` to
+// limit hydrated fields, avoid per-row queries that touch relations
+// (use single `findMany` with `include`), and add simple timing/logging
+// around queries to detect N+1 / repeated patterns early.
 
 const prisma = new PrismaClient();
 
@@ -100,11 +106,24 @@ async function seed() {
 
   try {
     console.log('Seeding strategies...');
-    for (const strategy of STRATEGIES) {
-      await prisma.strategy.create({
-        data: strategy
-      });
-      console.log(`Created strategy: ${strategy.name}`);
+    // Use bulk insert to avoid many round-trips. If per-item processing
+    // or logging is required, process in chunks to balance visibility and
+    // performance. `createMany` is much faster for larger datasets.
+      if (STRATEGIES.length > 0) {
+        const CHUNK_SIZE = 500;
+        try {
+          for (let i = 0; i < STRATEGIES.length; i += CHUNK_SIZE) {
+            const chunk = STRATEGIES.slice(i, i + CHUNK_SIZE);
+            await prisma.strategy.createMany({ data: chunk, skipDuplicates: true });
+            console.log(`Inserted strategies ${i + 1}..${i + chunk.length}`);
+          }
+        } catch (err) {
+          console.warn('Bulk insert failed, falling back to per-item create:', err);
+          for (const strategy of STRATEGIES) {
+            await prisma.strategy.create({ data: strategy });
+            console.log(`Created strategy: ${strategy.name}`);
+          }
+        }
     }
 
     console.log('Seeding market sentiment...');

@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { useLocation } from 'wouter';
+import { useNavigate } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
 import {
   ArrowLeft,
@@ -71,7 +71,7 @@ interface ConsensusResult {
 }
 
 export default function StrategiesPage() {
-  const [, setLocation] = useLocation();
+  const navigate = useNavigate();
   const [selectedStrategy, setSelectedStrategy] = useState<string | null>(null);
   const [consensusSymbol, setConsensusSymbol] = useState('BTC/USDT');
   const [showConsensus, setShowConsensus] = useState(false);
@@ -86,8 +86,8 @@ export default function StrategiesPage() {
   // Fetch strategies
   const { data: strategiesData, isLoading, error } = useQuery<{ success: boolean; strategies: Strategy[]; total: number }>({
     queryKey: ['strategies'],
-    queryFn: async () => {
-      const response = await fetch('/api/strategies');
+    queryFn: async ({ signal }: any) => {
+      const response = await fetch('/api/strategies', { signal });
       if (!response.ok) throw new Error('Failed to fetch strategies');
       return response.json();
     }
@@ -96,7 +96,7 @@ export default function StrategiesPage() {
   // Fetch consensus
   const { data: consensusData, refetch: refetchConsensus, isFetching: isConsensusLoading } = useQuery<{ success: boolean; consensus: ConsensusResult }>({
     queryKey: ['consensus', consensusSymbol],
-    queryFn: async () => {
+    queryFn: async ({ signal }: any) => {
       const response = await fetch('/api/strategies/consensus', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -104,7 +104,8 @@ export default function StrategiesPage() {
           symbol: consensusSymbol,
           timeframes: ['D1', 'H4', 'H1', 'M15'],
           equity: 10000
-        })
+        }),
+        signal,
       });
       if (!response.ok) throw new Error('Failed to fetch consensus');
       return response.json();
@@ -207,20 +208,24 @@ export default function StrategiesPage() {
             <div className="flex items-center space-x-2">
               <button
                 onClick={async () => {
+                  // run execute-all with abort support for the request
                   try {
+                    const controller = new AbortController();
                     const res = await fetch('/api/strategies/execute-all', {
                       method: 'POST',
                       headers: { 'Content-Type': 'application/json' },
                       body: JSON.stringify({
                         symbols: (universeSymbols && universeSymbols.length ? universeSymbols.map(s => s.symbol).slice(0,5) : ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'AVAX/USDT', 'ADA/USDT']),
                         timeframe: '1h'
-                      })
+                      }),
+                      signal: controller.signal,
                     });
                     const data = await res.json();
                     if (data.success) {
                       alert(`Generated ${data.totalSignals} signals from ${data.results.length} strategy executions!`);
                     }
-                  } catch (error) {
+                  } catch (error: any) {
+                    if (error?.name === 'AbortError') return;
                     console.error('Failed to execute strategies:', error);
                     alert('Failed to execute strategies');
                   }

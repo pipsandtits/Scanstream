@@ -1,10 +1,18 @@
 import express, { type Request, type Response } from 'express';
 import { RLPositionAgent } from '../rl-position-agent';
+import { getRLAgent } from '../../src/agents/rl-agent.singleton';
 import { storage } from '../storage';
 import type { MarketFrame } from '@shared/schema';
+import { apiRegistry } from '../services/api-registry';
 
 const router = express.Router();
-const rlAgent = new RLPositionAgent();
+const rlAgent = getRLAgent();
+const ADMIN_SECRET = process.env.ADMIN_SECRET || '';
+function checkAdminAuth(req: express.Request) {
+  if (!ADMIN_SECRET) return true;
+  const header = req.header('x-admin-secret') || '';
+  return header === ADMIN_SECRET;
+}
 
 /**
  * GET /api/rl-agent/signals
@@ -79,11 +87,16 @@ router.get('/signals', async (_req: Request, res: Response) => {
           const baseSize = 1000; // Base position size in USD
           const atr = currentFrame.indicators?.atr || 0.02 * currentFrame.close;
           
+          // If RL agent has no trained Q-table yet, allow exploratory actions so it can produce signals
+          const stats = (typeof rlAgent.getStats === 'function') ? rlAgent.getStats() : null;
+          const shouldExplore = !stats || (stats.qTableSize === 0);
+
           const positionParams = rlAgent.getPositionParameters(
             state,
             baseSize,
             atr,
-            currentFrame.close
+            currentFrame.close,
+            shouldExplore
           );
 
           // Determine signal type based on position size
@@ -212,6 +225,25 @@ router.get('/signals', async (_req: Request, res: Response) => {
   }
 });
 
+// Register with API registry
+try {
+  apiRegistry.registerEndpoint({
+    method: 'GET',
+    path: '/api/rl-agent/signals',
+    category: 'AGENT',
+    name: 'RL Agent Signals',
+    description: 'Reinforcement learning agent signals (position sizing)',
+    version: '1.0.0',
+    tags: ['rl','signals','agent'],
+    isDeprecated: false,
+    authentication: 'NONE',
+    cacheable: false,
+    isActive: true
+  });
+} catch (e) {
+  console.warn('[APIRegistry] Failed to register /api/rl-agent/signals', e);
+}
+
 /**
  * GET /api/rl-agent/stats
  * Get RL agent statistics
@@ -231,3 +263,39 @@ router.get('/stats', (_req: Request, res: Response) => {
 });
 
 export default router;
+
+// Admin endpoints to view/update RL presets
+router.get('/presets', (_req: Request, res: Response) => {
+  try {
+    const presets = rlAgent.getSourceWeightPresets();
+    res.json({ success: true, presets });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message || String(err) });
+  }
+});
+
+router.post('/presets', (req: Request, res: Response) => {
+  if (!checkAdminAuth(req)) return res.status(401).json({ error: 'unauthorized' });
+  const { presets } = req.body || {};
+  if (!Array.isArray(presets)) return res.status(400).json({ error: 'presets must be an array' });
+
+  // Basic validation of each preset
+  for (const p of presets) {
+    const sc = Number(p?.scannerWeight);
+    const ml = Number(p?.mlWeight);
+    const rl = Number(p?.rlWeight);
+    if (![sc, ml, rl].every(n => isFinite(n) && n >= 0)) {
+      return res.status(400).json({ error: 'each preset must contain non-negative numeric scannerWeight, mlWeight and rlWeight' });
+    }
+    if (sc + ml + rl <= 0) {
+      return res.status(400).json({ error: 'each preset must sum to a positive value' });
+    }
+  }
+
+  try {
+    rlAgent.setSourceWeightPresets(presets);
+    res.json({ success: true, presets: rlAgent.getSourceWeightPresets() });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message || String(err) });
+  }
+});

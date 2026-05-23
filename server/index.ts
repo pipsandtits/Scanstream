@@ -22,6 +22,7 @@ import missingApiEndpointsRouter from './routes/missing-api-endpoints';
 import featureFlagsRouter from './routes/feature-flags';
 import agentAbilitiesRouter from './routes/agent-abilities';
 import gatewayRouter, { getGatewayServices } from './routes/gateway';
+import metricsRouter from './routes/metrics';
 // import logsRouter from './routes/logs'; // TODO: Debug route error
 // Removed fastScanner service import
 
@@ -39,6 +40,9 @@ import { DailyBriefingSystem } from './services/rpg-agents/DailyBriefingSystem';
 import { BayesianBeliefUpdater } from './services/bayesian-belief-updater';
 import { LearningSystemIntegration } from './services/learning-system-integration';
 import { RLPositionAgent } from './rl-position-agent';
+import { getRLAgent } from '../src/agents/rl-agent.singleton';
+import { adaptiveController } from './services/adaptive-controller';
+import { dataQualityDetector } from './services/data-quality-detector';
 
 // Cross-exchange aggregator & agents
 import { CrossExchangeAggregator } from './services/aggregator/cross-exchange-aggregator';
@@ -53,13 +57,13 @@ process.env.DEBUG = 'express:*,server:*';
 setupConsoleLogging();
 const sessionId = getSessionId();
 console.log(`\n${'='.repeat(70)}`);
-console.log('🚀 SERVER STARTUP - Enhanced Logging System Active');
+console.log(' SERVER STARTUP - Enhanced Logging System Active');
 console.log(`${'='.repeat(70)}`);
-console.log(`📁 Session ID:   ${sessionId}`);
-console.log(`📂 Logs Dir:     ${getLogPath()}`);
-console.log(`📊 API Endpoint: /api/logs/stats - View current session logs`);
-console.log(`🔍 Search:      /api/logs/search?pattern=ERROR - Search logs`);
-console.log(`📖 Features:    Auto-chunking (10MB), Automatic rotation, Full history`);
+console.log(` Session ID:   ${sessionId}`);
+console.log(` Logs Dir:     ${getLogPath()}`);
+console.log(`API Endpoint: /api/logs/stats - View current session logs`);
+console.log(` Search:      /api/logs/search?pattern=ERROR - Search logs`);
+console.log(` Features:    Auto-chunking (10MB), Automatic rotation, Full history`);
 console.log(`${'='.repeat(70)}\n`);
 
 // Global learning system instance
@@ -78,6 +82,39 @@ export function getMarketDataLayer(): any {
 
 const app = express();
 app.set('x-powered-by', false); // Disable X-Powered-By header
+
+// Diagnostic wrapper: detect accidental full-URL route registrations (e.g., "https://...")
+// This prevents path-to-regexp from throwing and logs the offending value for debugging.
+const origUse = app.use.bind(app) as any;
+app.use = function (pathOrMiddleware: any, ...args: any[]) {
+  try {
+    if (typeof pathOrMiddleware === 'string') {
+      const p = pathOrMiddleware as string;
+      if (p.includes('://') || p.startsWith('http')) {
+        console.warn('[DIAGNOSTIC] Skipping registration of invalid route path (looks like URL):', p);
+        return app; // skip registering this invalid route
+      }
+    }
+  } catch (e) {
+    console.warn('[DIAGNOSTIC] Error in route wrapper check', e);
+  }
+  return origUse(pathOrMiddleware, ...args);
+};
+
+// Also wrap top-level HTTP method registrations to catch non-string paths
+['get','post','put','delete','patch','all'].forEach((method) => {
+  const orig = (app as any)[method];
+  (app as any)[method] = function (pathOrHandler: any, ...rest: any[]) {
+    if (typeof pathOrHandler === 'string') {
+      const p = pathOrHandler as string;
+      if (p.includes('://') || p.startsWith('http')) {
+        console.warn(`[DIAGNOSTIC] Skipping ${method.toUpperCase()} registration of invalid route path:`, p);
+        return app;
+      }
+    }
+    return orig.call(this, pathOrHandler, ...rest);
+  };
+});
 
 // Install API tracking middleware EARLY - before any route handlers
 try {
@@ -103,10 +140,17 @@ app.set('trust proxy', 1);
 
 // Global debug logging for all route registrations (with types) - disabled to reduce noise
 const origAppUse = app.use;
+// Prevent accidental duplicate route mounts by tracking mounted base paths
+const _mountedPaths = new Set<string>();
 app.use = function (path: any, ...args: any[]): any {
-  // Only log routes, not middleware
-  if (typeof path === "string" && path.startsWith('/')) {
-    // Disabled: console.log("[DEBUG] app.use path:", path);
+  // Only handle string route mounts (ignore middleware functions)
+  if (typeof path === 'string' && path.startsWith('/')) {
+    if (_mountedPaths.has(path)) {
+      console.warn(`[DIAGNOSTIC] Duplicate mount detected for ${path} — skipping duplicate registration.`);
+      return app;
+    }
+    _mountedPaths.add(path);
+    console.log('[DEBUG] app.use path:', path);
   }
   return (origAppUse as any).apply(this, [path, ...args]);
 };
@@ -126,7 +170,42 @@ app.get('/config/frontend-config.json', (req, res) => {
   res.sendFile(path.join(process.cwd(), 'config', 'frontend-config.json'));
 });
 
+// Prometheus metrics endpoint (aggregates available module registries)
+try {
+  app.use('/metrics', metricsRouter);
+  console.log('[express] Metrics endpoint registered at /metrics');
+} catch (e) {
+  console.warn('[express] Failed to register metrics endpoint', e);
+}
+
 // Register Documentation API (after tracking middleware but before other routes)
+// Wrap imported routers to detect accidental full-URL registrations on Router instances
+function wrapRouter(router: any, name = 'router') {
+  if (!router || typeof router !== 'object') return;
+  ['use','get','post','put','delete','patch','all'].forEach((method) => {
+    if (!router[method]) return;
+    const orig = router[method].bind(router);
+    router[method] = function (pathOrHandler: any, ...args: any[]) {
+      if (typeof pathOrHandler === 'string') {
+        const p = pathOrHandler as string;
+        if (p.includes('://') || p.startsWith('http')) {
+          console.warn(`[DIAGNOSTIC] Skipping ${name}.${method} registration of invalid route path:`, p);
+          return router;
+        }
+      }
+      return orig(pathOrHandler, ...args);
+    };
+  });
+}
+
+// Apply wrapper to main routers imported above
+[
+  apiDocsRouter, featureFlagsRouter, agentAbilitiesRouter, flowFieldRouter,
+  flowFieldBacktestRouter, enhancedAnalyticsRouter, mlPredictionsRouter,
+  mlTrainingRouter, analyticsRouter, mlSignalsRouter, rlSignalsRouter,
+  paperTradingRouter, scannerRouter, scannerAnalysisRouter, coinGeckoRouter
+].forEach((r: any) => wrapRouter(r));
+
 app.use('/api/docs', apiDocsRouter);
 console.log('[express] API Documentation registered at /api/docs');
 console.log('[express]   - GET /api/docs/endpoints - List all endpoints');
@@ -168,9 +247,9 @@ app.use('/api/analytics', enhancedAnalyticsRouter);
 
 // Register Scanner routes
 app.use('/api/scanner', scannerRouter);
-app.use('/api/scanner', scannerAnalysisRouter);
+app.use('/api/scanner/analysis', scannerAnalysisRouter);
 console.log('[express] Scanner API registered at /api/scanner');
-console.log('[express] Scanner Analysis API registered at /api/scanner');
+console.log('[express] Scanner Analysis API registered at /api/scanner/analysis');
 
 // Register CoinGecko sentiment & market data routes
 app.use('/api/coingecko', coinGeckoRouter);
@@ -435,6 +514,8 @@ import { initializeMarketDataFetcher } from './services/market-data-fetcher';
 import { SignalPipeline } from './services/gateway/signal-pipeline';
 import { SignalEngine, defaultTradingConfig } from './trading-engine';
 import { initializeWebsocketBridge } from './websocket-bridge';
+import { getBridgeHealth } from './websocket-bridge';
+import executionMetrics from './metrics-execution';
 
 app.use((req, res, next) => {
   const start = Date.now();
@@ -536,7 +617,7 @@ app.use((req, res, next) => {
   // Initialize Learning System
   try {
     const bayesianUpdater = new BayesianBeliefUpdater();
-    const rlAgent = new RLPositionAgent();
+    const rlAgent = getRLAgent();
     
     // Initialize strategies with prior beliefs
     bayesianUpdater.initialize_strategy('ml-direction-model', 0.55);
@@ -563,6 +644,18 @@ app.use((req, res, next) => {
     const adapters = CCXTAdapterFactory.createMultiple(exchanges);
     
     globalMarketDataLayer = initializeMarketDataLayer(adapters, exchanges);
+    // Update popularity scores from market data: use recent hourly volume to set popularity
+    globalMarketDataLayer.on('world.tick', async (tick: any) => {
+      try {
+        const frames = await globalMarketDataLayer.getSnapshot(tick.symbol, 3600, 24);
+        const totalVol = frames.reduce((acc: number, c: any) => acc + (c.volume || 0), 0);
+        const avgVol = frames.length ? Math.round(totalVol / frames.length) : 0;
+        // setPopularity will bound the value
+        try { (await import('./services/symbol-manager')).symbolManager.setPopularity(tick.symbol, avgVol); } catch (e) { /* ignore */ }
+      } catch (err) {
+        // non-fatal
+      }
+    });
     
     // Initialize Phase 2: Candle Integrity Layer
     const integrityGate = initializeIntegrityGate();
@@ -587,6 +680,15 @@ app.use((req, res, next) => {
     try {
       const crossAggregator = new CrossExchangeAggregator(integrityGate, 90_000);
 
+      // Register CCXT adapters with the aggregator so it can track venue health
+      for (const [venue, adapter] of adapters.entries()) {
+        try {
+          crossAggregator.registerAdapter(adapter as any, venue);
+        } catch (e) {
+          console.warn(`[CrossExchange] failed to register adapter for ${venue}: ${String(e)}`);
+        }
+      }
+
       // Minimal observability bridge
       crossAggregator.on('aggregated.updated', ({ symbol, aggregated }: any) => {
         console.debug('[Aggregator] aggregated.updated', symbol, 'spread=', aggregated.spread, 'confidence=', aggregated.confidence);
@@ -600,6 +702,8 @@ app.use((req, res, next) => {
       // Initialize TruthEngine (multi-source arbitration / one-truth)
       const { TruthEngine } = await import('./services/aggregator/truth-engine');
       const truthEngine = new TruthEngine(integrityGate, crossAggregator);
+      // Expose TruthEngine globally so agents and engines can access canonical consensus
+      try { (global as any).truthEngine = truthEngine; console.log('[TruthEngine] registered globally'); } catch (e) { /* ignore */ }
 
       // Healing service for forward-fill / interpolation
       const { HealingService } = await import('./services/aggregator/healing-service');
@@ -770,6 +874,26 @@ app.use((req, res, next) => {
   signalPriceMonitor.start(5000);
   console.log('[SignalMonitor] Price monitoring started');
 
+  // Start AdaptiveController service (meta-adaptive policy)
+  try {
+    if (adaptiveController && typeof adaptiveController.start === 'function') {
+      adaptiveController.start();
+      console.log('[AdaptiveController] started');
+    }
+  } catch (err) {
+    console.warn('[AdaptiveController] failed to start', err);
+  }
+
+  // Start DataQualityDetector service for world.tick monitoring
+  try {
+    if (dataQualityDetector && typeof dataQualityDetector.start === 'function') {
+      dataQualityDetector.start(globalMarketDataLayer);
+      console.log('[DataQualityDetector] started');
+    }
+  } catch (err) {
+    console.warn('[DataQualityDetector] failed to start', err);
+  }
+
   // Initialize and start market data fetcher (auto-fetches BTC, ETH, SOL, etc)
   const { aggregator, cacheManager, rateLimiter } = getGatewayServices();
 
@@ -807,6 +931,22 @@ app.use((req, res, next) => {
     }
   });
   console.log('[express] API Dashboard registered at /admin/api-docs');
+
+  // Lightweight websocket health endpoint (root-level)
+  app.get('/health/ws', (req, res) => {
+    try {
+      const bridge = getBridgeHealth();
+      const exec = executionMetrics.getExecutionStats();
+      res.json({
+        status: 'ok',
+        websocket: bridge,
+        execution: exec,
+        timestamp: new Date().toISOString()
+      });
+    } catch (err: any) {
+      res.status(503).json({ status: 'unavailable', error: err.message });
+    }
+  });
 
   // importantly only setup vite in development and after
   // setting up all the other routes so the catch-all route
@@ -848,4 +988,68 @@ app.use((req, res, next) => {
     console.log('[Server] ✅ Environment:', process.env.NODE_ENV || 'development');
     console.log('[Server] ✅ Database URL:', process.env.DATABASE_URL ? 'configured' : 'missing');
   });
+  // Global unhandled rejection and uncaught exception handlers
+  process.on('unhandledRejection', (reason, promise) => {
+    try { require('./services/scanner/scanner-metrics').incUnhandledRejection(); } catch (e) {}
+    console.error('[process] UnhandledRejection:', reason);
+  });
+
+  process.on('uncaughtException', (err) => {
+    console.error('[process] UncaughtException:', err);
+    // attempt graceful shutdown
+    const graceful = async () => {
+      try {
+        console.log('[process] Attempting graceful shutdown due to uncaughtException');
+        // try to stop known global services
+        const globals: any = global as any;
+        const maybeStop = async (o: any) => {
+          if (!o) return;
+          try { if (typeof o.shutdown === 'function') await o.shutdown(); } catch (e) {}
+          try { if (typeof o.stop === 'function') await o.stop(); } catch (e) {}
+          try { if (typeof o.close === 'function') await o.close(); } catch (e) {}
+        };
+        await maybeStop(globalMarketDataLayer);
+        await maybeStop((global as any).crossExchangeAggregator);
+        await maybeStop((global as any).executionEngine);
+        await maybeStop((global as any).truthEngine);
+      } catch (e) {
+        console.error('[process] Error during graceful shutdown:', e);
+      } finally {
+        process.exit(1);
+      }
+    };
+    void graceful();
+  });
+
+  // SIGINT/SIGTERM handlers
+  const shutdownHandler = (signal: string) => {
+    console.log(`[process] Received ${signal}, shutting down...`);
+    (async () => {
+      try {
+        const globals: any = global as any;
+        const maybeStop = async (o: any) => {
+          if (!o) return;
+          try { if (typeof o.shutdown === 'function') await o.shutdown(); } catch (e) {}
+          try { if (typeof o.stop === 'function') await o.stop(); } catch (e) {}
+          try { if (typeof o.close === 'function') await o.close(); } catch (e) {}
+        };
+        await maybeStop(globalMarketDataLayer);
+        await maybeStop((global as any).crossExchangeAggregator);
+        await maybeStop((global as any).executionEngine);
+        await maybeStop((global as any).truthEngine);
+        server.close(() => {
+          console.log('[process] HTTP server closed');
+          process.exit(0);
+        });
+        // Fallback exit if server.close doesn't finish
+        setTimeout(() => { console.warn('[process] Forcing exit'); process.exit(0); }, 5000);
+      } catch (e) {
+        console.error('[process] Error during shutdown:', e);
+        process.exit(1);
+      }
+    })();
+  };
+
+  process.on('SIGINT', () => shutdownHandler('SIGINT'));
+  process.on('SIGTERM', () => shutdownHandler('SIGTERM'));
 })();

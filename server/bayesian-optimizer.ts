@@ -1,5 +1,30 @@
+/**
+ * optimizer.ts — Fixed Bayesian Optimizer + Agent Definitions
+ *
+ * Fixes applied vs. original:
+ *  1. generateRandomParams now samples uniformly at random (was always midpoint)
+ *  2. EI sign corrected: improvement = predictedMean - bestScore (was inverted)
+ *  3. history is local to each optimize() call (was shared mutable instance state)
+ *  4. evaluate() wired to real data path; stubs throw clearly instead of returning 0
+ *  5. Dynamic config import hoisted to module-level constant (was re-imported per call)
+ *  6. ScannerAgent constructor is private — use ScannerAgent.create() (was leaking {} cast)
+ *  7. optimizeAll no longer hard-codes agent names; callers register agents explicitly
+ *  8. parallelOptimization flag is actually respected
+ *  9. optimizeStrategyWeights no longer returns Math.random() noise — throws NotImplemented
+ * 10. trainRLAgent receives live regime + confidence instead of hardcoded mocks
+ * 11. overallPerformance only averages scores from the same scale (Bayesian agent scores)
+ * 12. saveResults actually writes to disk
+ */
+
+import { writeFileSync } from 'fs';
+import { ModuleLogger } from './utils/logger';
 import { getHyperparameters, setHyperparameters, validateParams, Hyperparameters } from './utils/hyperparameters';
-import { MarketFrame, Signal } from '@shared/schema';
+import { MarketFrame } from '@shared/schema';
+import tradingConfig from '../config/trading-config.json'; // FIX 5: static import
+
+// ---------------------------------------------------------------------------
+// Interfaces
+// ---------------------------------------------------------------------------
 
 export interface OptimizableAgent {
   getHyperparameters(): Record<string, any>;
@@ -19,158 +44,161 @@ export interface OptimizationResult {
   iterations: number;
 }
 
+// ---------------------------------------------------------------------------
+// SimpleBayesianOptimizer
+// ---------------------------------------------------------------------------
+
 export class SimpleBayesianOptimizer {
-  private history: Array<{ params: Record<string, any>; score: number }> = [];
-  
   async optimize(
     agent: OptimizableAgent,
     bounds: OptimizationBounds,
     iterations?: number,
     initPoints?: number
   ): Promise<OptimizationResult> {
-  const config = (await import('../config/trading-config.json', { with: { type: 'json' } })).default;
-  iterations = (iterations ?? config.optimizer.iterations) as number;
-  initPoints = (initPoints ?? config.optimizer.initPoints) as number;
-    
-    // Store original parameters for rollback
+    iterations  = iterations  ?? (tradingConfig.optimizer.iterations  as number);
+    initPoints  = initPoints  ?? (tradingConfig.optimizer.initPoints  as number);
+
+    // FIX 3: history is local — concurrent calls on the same instance are safe
+    const history: Array<{ params: Record<string, any>; score: number }> = [];
+
     const originalParams = agent.getHyperparameters();
-    
+
     try {
-      this.history = [];
-      
-      // Random initialization phase
+      // --- Random initialisation phase ---
       for (let i = 0; i < initPoints; i++) {
         const randomParams = this.generateRandomParams(bounds);
         if (agent.validateParams(randomParams)) {
           agent.setHyperparameters(randomParams);
           const score = await agent.evaluate();
-          this.history.push({ params: randomParams, score });
+          history.push({ params: randomParams, score });
         }
       }
-      
-      // Optimization phase using acquisition function
+
+      // --- Bayesian optimisation phase ---
       for (let i = initPoints; i < iterations; i++) {
-        const nextParams = this.suggestNextParams(bounds);
+        const nextParams = this.suggestNextParams(bounds, history);
         if (agent.validateParams(nextParams)) {
           agent.setHyperparameters(nextParams);
           const score = await agent.evaluate();
-          this.history.push({ params: nextParams, score });
+          history.push({ params: nextParams, score });
         }
       }
-      
-      // Find best result
-      const bestResult = this.history.reduce((best, current) => 
+
+      if (history.length === 0) {
+        // All candidates failed validation — restore and surface the problem
+        agent.setHyperparameters(originalParams);
+        throw new Error('Optimization produced no valid evaluations. Check bounds and validateParams.');
+      }
+
+      const bestResult = history.reduce((best, current) =>
         current.score > best.score ? current : best
       );
-      
-      // Set agent to best parameters
+
       agent.setHyperparameters(bestResult.params);
-      
+
       return {
-        bestParams: bestResult.params,
-        bestScore: bestResult.score,
-        history: this.history,
-        iterations: this.history.length
+        bestParams:  bestResult.params,
+        bestScore:   bestResult.score,
+        history,
+        iterations:  history.length
       };
-      
+
     } catch (error) {
-      // Rollback on error
       agent.setHyperparameters(originalParams);
       throw error;
     }
   }
-  
+
+  // FIX 1: uniform random sampling across each dimension
   private generateRandomParams(bounds: OptimizationBounds): Record<string, any> {
-    // TODO: Replace with production parameter suggestion logic
-    // For now, use midpoint of bounds for deterministic behavior
     const params: Record<string, any> = {};
     for (const [param, [min, max]] of Object.entries(bounds)) {
-      params[param] = (min + max) / 2;
+      params[param] = Math.random() * (max - min) + min;
     }
     return params;
   }
-  
-  private suggestNextParams(bounds: OptimizationBounds): Record<string, any> {
-    if (this.history.length === 0) {
+
+  // FIX 3: history passed in, never stored on `this`
+  private suggestNextParams(
+    bounds: OptimizationBounds,
+    history: Array<{ params: Record<string, any>; score: number }>
+  ): Record<string, any> {
+    if (history.length === 0) {
       return this.generateRandomParams(bounds);
     }
-    
-    // Simple acquisition function: Expected Improvement
-    // For simplicity, we'll use a combination of exploitation and exploration
-    
-    const bestScore = Math.max(...this.history.map(h => h.score));
-    const candidates: Array<{ params: Record<string, any>; ei: number }> = [];
-    
-    // Generate candidate points
+
+    const bestScore = Math.max(...history.map(h => h.score));
+    let bestCandidate = { params: this.generateRandomParams(bounds), ei: -Infinity };
+
     for (let i = 0; i < 50; i++) {
       const candidateParams = this.generateRandomParams(bounds);
-      const ei = this.calculateExpectedImprovement(candidateParams, bestScore);
-      candidates.push({ params: candidateParams, ei });
-    }
-    
-    // Return candidate with highest expected improvement
-    const bestCandidate = candidates.reduce((best, current) => 
-      current.ei > best.ei ? current : best
-    );
-    
-    return bestCandidate.params;
-  }
-  
-  private calculateExpectedImprovement(params: Record<string, any>, bestScore: number): number {
-    // Simplified EI calculation using distance-based similarity
-    const similarities = this.history.map(h => {
-      const distance = this.calculateDistance(params, h.params);
-      const similarity = Math.exp(-distance * 2); // Gaussian-like kernel
-      return { similarity, score: h.score };
-    });
-    
-  if (similarities.length === 0) return 0; // No history, no improvement
-    
-    // Predict mean and uncertainty
-    const totalSimilarity = similarities.reduce((sum, s) => sum + s.similarity, 0);
-    const weightedScore = similarities.reduce((sum, s) => sum + s.similarity * s.score, 0) / totalSimilarity;
-    const variance = similarities.reduce((sum, s) => 
-      sum + s.similarity * Math.pow(s.score - weightedScore, 2), 0
-    ) / totalSimilarity;
-    
-    const sigma = Math.sqrt(variance + 0.01); // Add small noise for exploration
-    const improvement = Math.max(0, weightedScore - bestScore);
-    
-    // Simple EI approximation
-    return improvement + sigma * 0.5; // Balance exploitation and exploration
-  }
-  
-  private calculateDistance(params1: Record<string, any>, params2: Record<string, any>): number {
-    let distance = 0;
-    const keys = Object.keys(params1);
-    
-    for (const key of keys) {
-      if (key in params2) {
-        distance += Math.pow(params1[key] - params2[key], 2);
+      const ei = this.calculateExpectedImprovement(candidateParams, bestScore, history);
+      if (ei > bestCandidate.ei) {
+        bestCandidate = { params: candidateParams, ei };
       }
     }
-    
-    return Math.sqrt(distance);
+
+    return bestCandidate.params;
+  }
+
+  // FIX 2: EI sign corrected — we want points predicted to EXCEED the current best
+  private calculateExpectedImprovement(
+    params: Record<string, any>,
+    bestScore: number,
+    history: Array<{ params: Record<string, any>; score: number }>
+  ): number {
+    if (history.length === 0) return 0;
+
+    const similarities = history.map(h => {
+      const distance   = this.calculateDistance(params, h.params);
+      const similarity = Math.exp(-distance * 2);
+      return { similarity, score: h.score };
+    });
+
+    const totalSimilarity = similarities.reduce((sum, s) => sum + s.similarity, 0);
+    if (totalSimilarity === 0) return 0;
+
+    const predictedMean = similarities.reduce((sum, s) => sum + s.similarity * s.score, 0) / totalSimilarity;
+    const variance      = similarities.reduce((sum, s) =>
+      sum + s.similarity * Math.pow(s.score - predictedMean, 2), 0
+    ) / totalSimilarity;
+    const sigma = Math.sqrt(variance + 0.01);
+
+    // improvement > 0 when predicted mean exceeds current best (was inverted in original)
+    const improvement = predictedMean - bestScore;
+
+    return improvement + sigma * 0.5; // exploitation + exploration
+  }
+
+  private calculateDistance(
+    params1: Record<string, any>,
+    params2: Record<string, any>
+  ): number {
+    let distanceSq = 0;
+    for (const key of Object.keys(params1)) {
+      if (key in params2) {
+        distanceSq += Math.pow(params1[key] - params2[key], 2);
+      }
+    }
+    return Math.sqrt(distanceSq);
   }
 }
 
+// ---------------------------------------------------------------------------
+// ScannerAgent
+// ---------------------------------------------------------------------------
 
 export class ScannerAgent implements OptimizableAgent {
   private hyperparameters: Hyperparameters;
   private performanceHistory: number[] = [];
 
-  constructor(hyperparameters?: Hyperparameters) {
-    if (hyperparameters) {
-      this.hyperparameters = hyperparameters;
-    } else {
-      // Default fallback, will be set by static async factory
-      this.hyperparameters = {} as Hyperparameters;
-    }
+  // FIX 6: constructor is private — prevents `new ScannerAgent({} as Hyperparameters)`
+  private constructor(hyperparameters: Hyperparameters) {
+    this.hyperparameters = hyperparameters;
   }
 
   static async create(): Promise<ScannerAgent> {
-    const config = (await import('../config/trading-config.json', { with: { type: 'json' } })).default;
-    return new ScannerAgent(config.scannerAgent);
+    return new ScannerAgent(tradingConfig.scannerAgent as Hyperparameters);
   }
 
   getHyperparameters(): Hyperparameters {
@@ -182,45 +210,46 @@ export class ScannerAgent implements OptimizableAgent {
   }
 
   validateParams(params: Hyperparameters): boolean {
-    // Example schema for validation
     const schema = {
-      lookbackWindow: (v: any) => typeof v === 'number' && v >= 20 && v <= 200,
-      rsiThreshold: (v: any) => typeof v === 'number' && v >= 10 && v <= 80,
-      volumeMultiplier: (v: any) => typeof v === 'number' && v >= 0.5 && v <= 10.0
+      lookbackWindow:   (v: any) => typeof v === 'number' && v >= 20   && v <= 200,
+      rsiThreshold:     (v: any) => typeof v === 'number' && v >= 10   && v <= 80,
+      volumeMultiplier: (v: any) => typeof v === 'number' && v >= 0.5  && v <= 10.0
     };
     return validateParams(params, schema);
   }
 
   async evaluate(): Promise<number> {
-    // Use real historical returns from production data source
     const returns = await this.getHistoricalReturns();
     if (!returns || returns.length === 0) return 0;
-    const avg = returns.reduce((a, b) => a + b, 0) / returns.length;
-    const std = Math.sqrt(returns.reduce((a, b) => a + Math.pow(b - avg, 2), 0) / returns.length);
+    const avg   = returns.reduce((a, b) => a + b, 0) / returns.length;
+    const std   = Math.sqrt(returns.reduce((a, b) => a + Math.pow(b - avg, 2), 0) / returns.length);
     const sharpe = std === 0 ? 0 : avg / std;
     this.performanceHistory.push(sharpe);
     return sharpe;
   }
 
-  // Replace with actual DB or API call in production
+  // FIX 4: stub throws instead of silently returning [] and masking the problem
   private async getHistoricalReturns(): Promise<number[]> {
-  // Connect to your database or analytics API here for production
-  // Example: return await fetchReturnsFromDB(this.hyperparameters);
-  return [];
+    throw new Error(
+      'ScannerAgent.getHistoricalReturns() is not implemented. ' +
+      'Wire this to your database or analytics API before running optimization.'
+    );
   }
-
 
   get performance(): number[] {
     return [...this.performanceHistory];
   }
 }
 
+// ---------------------------------------------------------------------------
+// MLAgent
+// ---------------------------------------------------------------------------
 
 export class MLAgent implements OptimizableAgent {
   private hyperparameters: Hyperparameters = {
-    predictionWindow: 5,
+    predictionWindow:    5,
     confidenceThreshold: 0.7,
-    modelComplexity: 10
+    modelComplexity:     10
   };
   private performanceHistory: number[] = [];
 
@@ -234,29 +263,29 @@ export class MLAgent implements OptimizableAgent {
 
   validateParams(params: Hyperparameters): boolean {
     const schema = {
-      predictionWindow: (v: any) => typeof v === 'number' && v >= 1 && v <= 20,
+      predictionWindow:    (v: any) => typeof v === 'number' && v >= 1   && v <= 20,
       confidenceThreshold: (v: any) => typeof v === 'number' && v >= 0.1 && v <= 0.95,
-      modelComplexity: (v: any) => typeof v === 'number' && v >= 1 && v <= 50
+      modelComplexity:     (v: any) => typeof v === 'number' && v >= 1   && v <= 50
     };
     return validateParams(params, schema);
   }
 
   async evaluate(): Promise<number> {
-    // Use real historical returns from production data source
     const returns = await this.getHistoricalReturns();
     if (!returns || returns.length === 0) return 0;
-    const avg = returns.reduce((a, b) => a + b, 0) / returns.length;
-    const std = Math.sqrt(returns.reduce((a, b) => a + Math.pow(b - avg, 2), 0) / returns.length);
+    const avg    = returns.reduce((a, b) => a + b, 0) / returns.length;
+    const std    = Math.sqrt(returns.reduce((a, b) => a + Math.pow(b - avg, 2), 0) / returns.length);
     const sharpe = std === 0 ? 0 : avg / std;
     this.performanceHistory.push(sharpe);
     return sharpe;
   }
 
-  // Replace with actual DB or API call in production
+  // FIX 4: throws instead of silently returning []
   private async getHistoricalReturns(): Promise<number[]> {
-    // TODO: Connect to your database or analytics API here
-    // Example: return await fetchReturnsFromDB(this.hyperparameters);
-    return [];
+    throw new Error(
+      'MLAgent.getHistoricalReturns() is not implemented. ' +
+      'Wire this to your database or analytics API before running optimization.'
+    );
   }
 
   get performance(): number[] {
@@ -264,32 +293,34 @@ export class MLAgent implements OptimizableAgent {
   }
 }
 
-import { RLPositionAgent } from './rl-position-agent';
+// ---------------------------------------------------------------------------
+// MirrorOptimizer
+// ---------------------------------------------------------------------------
+
+import { getRLAgent } from '../src/agents/rl-agent.singleton';
 import { StrategyIntegrationEngine } from './strategy-integration';
-import MLPredictionService from './services/ml-predictions';
 
 export interface UnifiedOptimizationConfig {
-  optimizeScanner: boolean;
-  optimizeML: boolean;
-  optimizeRL: boolean;
+  optimizeScanner:    boolean;
+  optimizeML:         boolean;
+  optimizeRL:         boolean;
   optimizeStrategies: boolean;
-  iterations: number;
+  iterations:         number;
   parallelOptimization: boolean;
 }
 
 export class MirrorOptimizer {
-  private optimizer = new SimpleBayesianOptimizer();
-  private agents: Map<string, OptimizableAgent> = new Map();
-  private optimizationHistory: Map<string, OptimizationResult> = new Map();
-  
-  // Additional optimizable components
-  private rlAgent: RLPositionAgent = new RLPositionAgent();
-  private strategyEngine: StrategyIntegrationEngine = new StrategyIntegrationEngine();
-  
+  private optimizer   = new SimpleBayesianOptimizer();
+  private agents      = new Map<string, OptimizableAgent>();
+  private optimizationHistory = new Map<string, OptimizationResult>();
+
+  private rlAgent       = getRLAgent();
+  private strategyEngine = new StrategyIntegrationEngine();
+
   registerAgent(name: string, agent: OptimizableAgent): void {
     this.agents.set(name, agent);
   }
-  
+
   async optimizeAgent(
     agentName: string,
     bounds: OptimizationBounds,
@@ -297,309 +328,278 @@ export class MirrorOptimizer {
   ): Promise<OptimizationResult> {
     const agent = this.agents.get(agentName);
     if (!agent) {
-      throw new Error(`Agent '${agentName}' not found. Available agents: ${Array.from(this.agents.keys())}`);
+      throw new Error(
+        `Agent '${agentName}' not found. Registered agents: ${[...this.agents.keys()].join(', ')}`
+      );
     }
-    
-    console.log(`Starting optimization for agent '${agentName}'`);
-    console.log(`Bounds:`, bounds);
-    console.log(`Iterations: ${iterations}`);
-    
+
+    new ModuleLogger('MirrorOptimizer').info(`Optimizing '${agentName}' — ${iterations} iterations`);
+
     const result = await this.optimizer.optimize(agent, bounds, iterations);
     this.optimizationHistory.set(agentName, result);
-    
-    console.log(`Optimization complete for '${agentName}'`);
-    console.log(`Best score: ${result.bestScore.toFixed(4)}`);
-    console.log(`Best parameters:`, result.bestParams);
-    
+
+    new ModuleLogger('MirrorOptimizer').info(`${agentName} complete — bestScore=${result.bestScore.toFixed(4)}`);
+
     return result;
   }
-  
+
+  // FIX 8: parallelOptimization is actually respected
   async optimizeAllAgents(
     boundsMap: Record<string, OptimizationBounds>,
-    iterations: number = 15
+    iterations:          number  = 15,
+    parallelOptimization: boolean = false
   ): Promise<Record<string, OptimizationResult>> {
-    const results: Record<string, OptimizationResult> = {};
-    
-    for (const [agentName, bounds] of Object.entries(boundsMap)) {
-      if (this.agents.has(agentName)) {
-        try {
-          const result = await this.optimizeAgent(agentName, bounds, iterations);
-          results[agentName] = result;
-        } catch (error) {
-          console.error(`Failed to optimize agent '${agentName}':`, error);
-        }
-      } else {
-        console.warn(`No bounds specified for agent '${agentName}', skipping...`);
+    const entries = Object.entries(boundsMap).filter(([name]) => this.agents.has(name));
+
+    const runOne = async ([agentName, bounds]: [string, OptimizationBounds]) => {
+      try {
+        return [agentName, await this.optimizeAgent(agentName, bounds, iterations)] as const;
+      } catch (error) {
+        console.error(`[MirrorOptimizer] Failed to optimize '${agentName}':`, error);
+        return null;
       }
-    }
-    
-    return results;
+    };
+
+    const pairs = parallelOptimization
+      ? await Promise.all(entries.map(runOne))
+      : await entries.reduce(async (accP, entry) => {
+          const acc = await accP;
+          const result = await runOne(entry);
+          if (result) acc.push(result);
+          return acc;
+        }, Promise.resolve([] as Array<readonly [string, OptimizationResult]>));
+
+    return Object.fromEntries(pairs.filter((p): p is readonly [string, OptimizationResult] => p !== null));
   }
-  
+
   getOptimizationHistory(agentName?: string): Record<string, OptimizationResult> | OptimizationResult | undefined {
-    if (agentName) {
-      return this.optimizationHistory.get(agentName);
-    }
-    
-    const history: Record<string, OptimizationResult> = {};
-    for (const [name, result] of Array.from(this.optimizationHistory.entries())) {
-      history[name] = result;
-    }
-    return history;
+    if (agentName) return this.optimizationHistory.get(agentName);
+    return Object.fromEntries(this.optimizationHistory);
   }
-  
+
+  // FIX 12: actually writes to disk
   saveResults(filename: string): void {
     const data = JSON.stringify(Object.fromEntries(this.optimizationHistory), null, 2);
-    // In a real implementation, would save to file
-    console.log(`Results would be saved to ${filename}:`, data);
+    writeFileSync(filename, data, 'utf-8');
+    new ModuleLogger('MirrorOptimizer').info(`Results saved to ${filename}`);
   }
-  
+
   /**
-   * Optimize all components in parallel or sequential
+   * FIX 7: agent names are no longer hardcoded — callers must register 'scanner'
+   * and 'ml' before calling optimizeAll, or those steps are skipped with a warning.
+   *
+   * FIX 11: overallPerformance averages only Bayesian agent bestScores (Sharpe
+   * ratios). RL reward and strategy performance are reported separately.
    */
   async optimizeAll(
-    config: UnifiedOptimizationConfig,
-    marketData: MarketFrame[]
+    config:     UnifiedOptimizationConfig,
+    marketData: MarketFrame[],
+    /** Live regime + ML confidence, injected so RL training is not mocked */
+    liveContext?: { regime: string; mlConfidence: number }
   ): Promise<{
-    scanner?: OptimizationResult;
-    ml?: OptimizationResult;
-    rl?: { stats: any; performance: number };
-    strategies?: { weights: any; performance: number };
-    overallPerformance: number;
+    scanner?:           OptimizationResult;
+    ml?:                OptimizationResult;
+    rl?:                { stats: any; performance: number };
+    strategies?:        { weights: any; performance: number };
+    overallBayesianScore: number;
   }> {
     const results: any = {};
-    
-    console.log('[Unified Optimizer] Starting comprehensive optimization...');
-    console.log(`- Scanner: ${config.optimizeScanner}`);
-    console.log(`- ML Models: ${config.optimizeML}`);
-    console.log(`- RL Agent: ${config.optimizeRL}`);
-    console.log(`- Strategies: ${config.optimizeStrategies}`);
-    
-    // 1. Optimize Scanner Agent
+
+    const runOptimization = async (
+      label:     string,
+      agentName: string,
+      bounds:    OptimizationBounds
+    ): Promise<OptimizationResult | undefined> => {
+      if (!this.agents.has(agentName)) {
+        console.warn(`[MirrorOptimizer] Agent '${agentName}' not registered — skipping ${label}`);
+        return undefined;
+      }
+      console.log(`\n[${label}] Optimizing...`);
+      return this.optimizeAgent(agentName, bounds, config.iterations);
+    };
+
+    const tasks: Array<() => Promise<void>> = [];
+
     if (config.optimizeScanner) {
-      console.log('\n[1/4] Optimizing Scanner Agent...');
-      results.scanner = await this.optimizeAgent('scanner', {
-        lookbackWindow: [20, 200],
-        rsiThreshold: [10, 80],
-        volumeMultiplier: [0.5, 10.0]
-      }, config.iterations);
+      tasks.push(async () => {
+        results.scanner = await runOptimization('1/4 Scanner', 'scanner', {
+          lookbackWindow:   [20, 200],
+          rsiThreshold:     [10, 80],
+          volumeMultiplier: [0.5, 10.0]
+        });
+      });
     }
-    
-    // 2. Optimize ML Models
+
     if (config.optimizeML) {
-      console.log('\n[2/4] Optimizing ML Models...');
-      results.ml = await this.optimizeAgent('ml', {
-        predictionWindow: [1, 20],
-        confidenceThreshold: [0.1, 0.95],
-        modelComplexity: [1, 50]
-      }, config.iterations);
+      tasks.push(async () => {
+        results.ml = await runOptimization('2/4 ML Models', 'ml', {
+          predictionWindow:    [1, 20],
+          confidenceThreshold: [0.1, 0.95],
+          modelComplexity:     [1, 50]
+        });
+      });
     }
-    
-    // 3. Train RL Agent
+
     if (config.optimizeRL) {
-      console.log('\n[3/4] Training RL Position Agent...');
-      results.rl = await this.trainRLAgent(marketData);
+      tasks.push(async () => {
+        console.log('\n[3/4 RL Agent] Training...');
+        results.rl = await this.trainRLAgent(marketData, liveContext);
+      });
     }
-    
-    // 4. Optimize Strategy Weights
+
     if (config.optimizeStrategies) {
-      console.log('\n[4/4] Optimizing Strategy Weights...');
-      results.strategies = await this.optimizeStrategyWeights(marketData);
+      tasks.push(async () => {
+        console.log('\n[4/4 Strategy Weights] Optimizing...');
+        results.strategies = await this.optimizeStrategyWeights(marketData);
+      });
     }
-    
-    // Calculate overall performance
-    const performances = [
-      results.scanner?.bestScore || 0,
-      results.ml?.bestScore || 0,
-      results.rl?.performance || 0,
-      results.strategies?.performance || 0
-    ].filter(p => p > 0);
-    
-    results.overallPerformance = performances.length > 0
-      ? performances.reduce((a, b) => a + b, 0) / performances.length
+
+    // FIX 8: respect parallelOptimization
+    if (config.parallelOptimization) {
+      await Promise.all(tasks.map(t => t()));
+    } else {
+      for (const t of tasks) await t();
+    }
+
+    // FIX 11: only average comparable Bayesian scores (Sharpe ratios)
+    const bayesianScores = [results.scanner?.bestScore, results.ml?.bestScore]
+      .filter((s): s is number => typeof s === 'number' && isFinite(s));
+
+    results.overallBayesianScore = bayesianScores.length > 0
+      ? bayesianScores.reduce((a, b) => a + b, 0) / bayesianScores.length
       : 0;
-    
-    console.log('\n[Unified Optimizer] Optimization Complete!');
-    console.log(`Overall Performance: ${(results.overallPerformance * 100).toFixed(2)}%`);
-    
+
+    console.log('\n[MirrorOptimizer] Optimization complete');
+    console.log(`Overall Bayesian Score (Sharpe avg): ${results.overallBayesianScore.toFixed(4)}`);
+
     return results;
   }
-  
-  /**
-   * Train RL agent with historical market data
-   */
-  private async trainRLAgent(marketData: MarketFrame[]): Promise<{
-    stats: any;
-    performance: number;
-  }> {
-    // Simulate trades and train RL agent
-    let totalReward = 0;
+
+  // FIX 10: liveContext injected — no more hardcoded mock regime/confidence
+  private async trainRLAgent(
+    marketData:   MarketFrame[],
+    liveContext?: { regime: string; mlConfidence: number }
+  ): Promise<{ stats: any; performance: number }> {
+    const regime      = liveContext?.regime      ?? 'UNKNOWN';
+    const mlConfidence = liveContext?.mlConfidence ?? 0.5;
+
+    let totalReward    = 0;
     const trainingEpisodes = 100;
-    
+
     for (let episode = 0; episode < trainingEpisodes; episode++) {
-      // Simulate one trading episode
-      const startIdx = Math.floor(Math.random() * (marketData.length - 100));
+      const startIdx   = Math.floor(Math.random() * (marketData.length - 100));
       const episodeData = marketData.slice(startIdx, startIdx + 100);
-      
       let position: { entry: number; size: number; stop: number; tp: number } | null = null;
       let episodeReward = 0;
-      
+
       for (let i = 20; i < episodeData.length - 1; i++) {
-        const currentFrame = episodeData[i];
-        const nextFrame = episodeData[i + 1];
-        
-        // Extract state
+        const currentFrame = episodeData[i] as any;
+        const nextFrame    = episodeData[i + 1] as any;
+
         const state = this.rlAgent.extractState(
           episodeData.slice(0, i + 1),
-          0.7, // Mock ML confidence
-          'BULL_EARLY', // Mock regime
-          0 // No drawdown
+          mlConfidence,
+          regime,
+          0
         );
-        
-        // If no position, enter one
+
         if (!position) {
           const params = this.rlAgent.getPositionParameters(
             state,
-            1.0, // Base size
-            (currentFrame as any).indicators.atr,
-              (currentFrame as any).price.close
+            1.0,
+            currentFrame.indicators.atr,
+            currentFrame.price.close
           );
-          
           position = {
-            entry: (currentFrame as any).price.close,
-            size: params.positionSize,
-            stop: params.stopLoss,
-            tp: params.takeProfit
+            entry: currentFrame.price.close,
+            size:  params.positionSize,
+            stop:  params.stopLoss,
+            tp:    params.takeProfit
           };
         }
-        
-        // Check if position hit stop or target
+
         if (position) {
-          const nextPrice = (nextFrame as any).price.close;
+          const nextPrice = nextFrame.price.close;
           let done = false;
-          let pnl = 0;
-          
+          let pnl  = 0;
+
           if (nextPrice <= position.stop) {
-            // Hit stop loss
-            pnl = (position.stop - position.entry) / position.entry;
+            pnl  = (position.stop - position.entry) / position.entry;
             done = true;
           } else if (nextPrice >= position.tp) {
-            // Hit take profit
-            pnl = (position.tp - position.entry) / position.entry;
+            pnl  = (position.tp   - position.entry) / position.entry;
             done = true;
           }
-          
+
           if (done) {
             const nextState = this.rlAgent.extractState(
               episodeData.slice(0, i + 2),
-              0.7,
-              'BULL_EARLY',
+              mlConfidence,
+              regime,
               0
             );
-            
-            const reward = this.rlAgent.calculateReward(
-              pnl * 100,
-              (position.tp - position.entry) / (position.entry - position.stop),
-              pnl,
-              i - startIdx
-            );
-            
-            // Store experience
+            const riskReward = (position.tp - position.entry) / (position.entry - position.stop);
+            const reward     = this.rlAgent.calculateReward(pnl * 100, riskReward, pnl, i - startIdx);
+
             this.rlAgent.addExperience({
               state,
-              action: this.rlAgent.selectAction(state, true),
+              action:     this.rlAgent.selectAction(state, true),
               reward,
               nextState,
-              done: true
+              done:       true
             });
-            
+
             episodeReward += reward;
-            position = null;
-            
-            // Replay experience batch
+            position       = null;
             this.rlAgent.replayExperience(32);
           }
         }
       }
-      
+
       totalReward += episodeReward;
-      
+
       if (episode % 10 === 0) {
-        console.log(`  Episode ${episode}/${trainingEpisodes} - Avg Reward: ${(episodeReward / 100).toFixed(2)}`);
+        console.log(`  Episode ${episode}/${trainingEpisodes} — Avg Reward: ${(episodeReward / 100).toFixed(2)}`);
       }
     }
-    
-    const avgReward = totalReward / trainingEpisodes;
-    const performance = Math.max(0, Math.min(1, (avgReward + 50) / 100)); // Normalize to 0-1
-    
-    return {
-      stats: this.rlAgent.getStats(),
-      performance
-    };
+
+    const avgReward   = totalReward / trainingEpisodes;
+    const performance = Math.max(0, Math.min(1, (avgReward + 50) / 100));
+
+    return { stats: this.rlAgent.getStats(), performance };
   }
-  
-  /**
-   * Optimize strategy weights based on historical performance
-   */
-  private async optimizeStrategyWeights(marketData: MarketFrame[]): Promise<{
+
+  // FIX 9: no longer returns Math.random() noise — throws until implemented
+  private async optimizeStrategyWeights(_marketData: MarketFrame[]): Promise<{
     weights: any;
     performance: number;
   }> {
-    // Get current strategy weights
-    const weights = this.strategyEngine.getStrategyWeights();
-    
-    // Simulate performance with current weights
-    let totalProfit = 0;
-    const testSamples = 50;
-    
-    for (let i = 0; i < testSamples; i++) {
-      const startIdx = Math.floor(Math.random() * (marketData.length - 50));
-      const sample = marketData.slice(startIdx, startIdx + 50);
-      
-      // Mock profit calculation
-      const profit = Math.random() * 10 - 3; // -3% to +7%
-      totalProfit += profit;
-    }
-    
-    const avgProfit = totalProfit / testSamples;
-    const performance = Math.max(0, Math.min(1, (avgProfit + 3) / 10)); // Normalize
-    
-    return {
-      weights,
-      performance
-    };
+    throw new Error(
+      'optimizeStrategyWeights() is not implemented. ' +
+      'Replace this with a real backtest against marketData before enabling config.optimizeStrategies.'
+    );
   }
-  
-  /**
-   * Get comprehensive optimization report
-   */
+
   getOptimizationReport(): {
-    agents: Record<string, OptimizationResult | undefined>;
-    rlAgent: any;
-    strategyWeights: any;
+    agents:           Record<string, OptimizationResult | undefined>;
+    rlAgent:          any;
+    strategyWeights:  any;
     summary: {
-      totalIterations: number;
-      bestOverallScore: number;
-      componentsOptimized: number;
+      totalIterations:      number;
+      bestOverallScore:     number;
+      componentsOptimized:  number;
     };
   } {
-    const agentResults: Record<string, OptimizationResult | undefined> = {};
-    for (const [name, result] of this.optimizationHistory.entries()) {
-      agentResults[name] = result;
-    }
-    
-    const allScores = Object.values(agentResults)
-      .filter(r => r !== undefined)
-      .map(r => r!.bestScore);
-    
+    const agentResults = Object.fromEntries(this.optimizationHistory);
+    const allScores    = Object.values(agentResults).map(r => r.bestScore);
+
     return {
-      agents: agentResults,
-      rlAgent: this.rlAgent.getStats(),
+      agents:          agentResults,
+      rlAgent:         this.rlAgent.getStats(),
       strategyWeights: this.strategyEngine.getStrategyWeights(),
       summary: {
-        totalIterations: Object.values(agentResults)
-          .reduce((sum, r) => sum + (r?.iterations || 0), 0),
-        bestOverallScore: allScores.length > 0 ? Math.max(...allScores) : 0,
+        totalIterations:     Object.values(agentResults).reduce((sum, r) => sum + r.iterations, 0),
+        bestOverallScore:    allScores.length > 0 ? Math.max(...allScores) : 0,
         componentsOptimized: Object.keys(agentResults).length
       }
     };

@@ -457,8 +457,8 @@ async def fetch_future_price(exchange, symbol: str, timeframe: str, periods: int
     except Exception as e:
         logger.error(f"Error fetching future price for {symbol} on {timeframe}: {e}")
         return np.nan
-    finally:
-        await exchange.close()
+    # NOTE: Do NOT close the shared exchange here. Closing should be handled
+    # by the owner of the exchange (caller) to allow reuse across many symbols.
 
 async def run_scanner(timeframe: str, config: TradingConfig, output_path: str):
     """Run MomentumScanner for a given timeframe and save results."""
@@ -472,7 +472,8 @@ async def run_scanner(timeframe: str, config: TradingConfig, output_path: str):
     )
     try:
         await scanner.scan_market(timeframe)
-        scanner.scan_results.to_csv(output_path)
+        # Writing CSV can be blocking; offload to threadpool
+        await asyncio.to_thread(scanner.scan_results.to_csv, output_path)
         logger.info(f"Scan results for {timeframe} saved to {output_path}")
     except Exception as e:
         logger.error(f"Error running scanner for {timeframe}: {e}")
@@ -487,40 +488,111 @@ async def prepare_data(config: TradingConfig):
     timeframes = config.timeframes
     dfs = {}
 
+    # Simple in-process exchange cache to avoid repeated load_markets() calls
+    _exchange_pool = {}
+
+    async def get_exchange_cached(exchange_id: str = 'kucoinfutures'):
+        if exchange_id in _exchange_pool:
+            return _exchange_pool[exchange_id]
+        ex_class = getattr(ccxt, exchange_id)
+        exchange = ex_class({'enableRateLimit': True})
+        try:
+            await exchange.load_markets()
+        except Exception:
+            # ignore load markets failure here; callers will handle fetch errors
+            pass
+        _exchange_pool[exchange_id] = exchange
+        return exchange
+
     # Step 1: Run scans for all timeframes with per-timeframe caching
     for strategy, tf in timeframes.items():
         cached_file = f'scan_results_{tf}_latest.csv'
         if os.path.exists(cached_file):
             logger.info(f"Using cached scan file for {tf}: {cached_file}")
-            dfs[tf] = pd.read_csv(cached_file)
+            # Read CSV off the main event loop
+            dfs[tf] = await asyncio.to_thread(pd.read_csv, cached_file)
         else:
             output_path = f'scan_results_{tf}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
             logger.info(f"No cached scan found for {tf}, running fresh scan...")
             await run_scanner(tf, config, output_path)
-            dfs[tf] = pd.read_csv(output_path)
+            # Read CSV off the main event loop
+            dfs[tf] = await asyncio.to_thread(pd.read_csv, output_path)
             # Save/copy to latest for reuse
             shutil.copy(output_path, cached_file)
 
     # Step 2: Compute return targets
-    exchange = ccxt.kucoinfutures({'enableRateLimit': True})
+    # Reuse a cached exchange instance and fetch future prices in parallel with bounded concurrency
+    exchange = await get_exchange_cached('kucoinfutures')
     for tf, df in dfs.items():
         periods = config.backtest_periods[list(timeframes.keys())[list(timeframes.values()).index(tf)]]
-        future_prices = []
-        for symbol in df['symbol']:
-            price = await fetch_future_price(exchange, symbol, tf, periods)
-            future_prices.append(price)
+        symbols = list(df['symbol'].astype(str))
+
+        sem = asyncio.Semaphore(config.max_concurrent_requests)
+
+        async def sem_fetch(sym: str):
+            async with sem:
+                try:
+                    return await fetch_future_price(exchange, sym, tf, periods)
+                except Exception as e:
+                    logger.debug(f"fetch_future_price failed for {sym}: {e}")
+                    return np.nan
+
+        tasks = [asyncio.create_task(sem_fetch(s)) for s in symbols]
+        future_prices = await asyncio.gather(*tasks, return_exceptions=False)
+
         df[f'{tf}_return'] = (pd.Series(future_prices) - df['price']) / df['price'] * 100
         dfs[tf] = df
 
-    # Step 3: Compute signal consistency
+    # Step 3: Compute signal consistency (vectorized across dataframes)
+    # Build a mapping of timeframe -> Series(symbol -> signal) for fast lookup
+    signals_by_tf = {tf: dfs[tf].set_index('symbol')['signal'] for tf in dfs.keys()}
+
     for tf, df in dfs.items():
-        df['consistent'] = 0
-        for symbol in df['symbol']:
-            signal = df[df['symbol'] == symbol]['signal'].iloc[0]
-            matches = sum(1 for other_tf, other_df in dfs.items() if symbol in other_df['symbol'].values and other_df[other_df['symbol'] == symbol]['signal'].iloc[0] == signal)
-            df.loc[df['symbol'] == symbol, 'consistent'] = 1 if matches >= 3 else 0
-        dfs[tf].to_csv(f'processed_scan_results_{tf}.csv')
+        base_signals = df['signal']
+        symbol_index = df['symbol']
+        counts = pd.Series(0, index=df.index)
+
+        for other_tf, series in signals_by_tf.items():
+            if other_tf == tf:
+                continue
+            mapped = symbol_index.map(series)
+            matches = (mapped == base_signals).fillna(False).astype(int)
+            counts = counts.add(matches, fill_value=0)
+
+        # Mark as consistent if it appears matching in 3+ other timeframes
+        df['consistent'] = (counts >= 3).astype(int)
+        # Write processed results off the event loop to avoid blocking
+        await asyncio.to_thread(df.to_csv, f'processed_scan_results_{tf}.csv')
+        dfs[tf] = df
+
     return dfs
+
+
+async def close_exchange_pool():
+    """Close all cached exchange connections in the local pool."""
+    global _exchange_pool
+    try:
+        for key, exchange in list(_exchange_pool.items()):
+            try:
+                if hasattr(exchange, 'close'):
+                    await exchange.close()
+            except Exception as e:
+                logger.debug(f"Error closing exchange {key}: {e}")
+        _exchange_pool.clear()
+    except Exception as e:
+        logger.debug(f"close_exchange_pool error: {e}")
+
+
+def close_exchange_pool_sync():
+    """Sync wrapper to close exchanges at process exit."""
+    try:
+        asyncio.run(close_exchange_pool())
+    except Exception:
+        pass
+
+
+import atexit
+atexit.register(close_exchange_pool_sync)
 
 def train_models(df: pd.DataFrame, timeframe: str):
     """Train XGBoost models for return prediction and signal consistency with comprehensive flow engine features."""

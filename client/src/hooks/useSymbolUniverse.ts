@@ -192,19 +192,20 @@ export function useSymbolUniverse(
   const [listeners, setListeners] = useState<Map<string, (event: any) => void>>(new Map());
 
   // Load universe state
-  const loadUniverse = useCallback(async () => {
+  const loadUniverse = useCallback(async (signal?: AbortSignal) => {
     try {
       setLoading(true);
       setError(null);
 
-      const response = await fetch('/api/symbol-universe/state');
+      const response = await fetch('/api/symbol-universe/state', { signal });
       if (!response.ok) {
         throw new Error(`Failed to load symbol universe: ${response.statusText}`);
       }
 
       const data = await response.json();
       setState(data);
-    } catch (err) {
+    } catch (err: any) {
+      if (err && err.name === 'AbortError') return;
       const error = err instanceof Error ? err : new Error(String(err));
       setError(error);
       console.error('[useSymbolUniverse] Error loading universe:', error);
@@ -216,7 +217,9 @@ export function useSymbolUniverse(
   // Auto-load on mount
   useEffect(() => {
     if (autoLoad) {
-      loadUniverse();
+      const controller = new AbortController();
+      loadUniverse(controller.signal);
+      return () => controller.abort();
     }
   }, [autoLoad, loadUniverse]);
 
@@ -410,12 +413,13 @@ export function useSymbolUniverse(
 
   // Normalize symbol format
   const normalizeSymbol = useCallback(
-    async (format: string, venue: string) => {
+    async (format: string, venue: string, signal?: AbortSignal) => {
       try {
         const response = await fetch('/api/symbol-universe/normalize', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ format, venue }),
+          signal,
         });
 
         if (!response.ok) {
@@ -426,7 +430,8 @@ export function useSymbolUniverse(
         }
 
         return await response.json();
-      } catch (err) {
+      } catch (err: any) {
+        if (err && err.name === 'AbortError') return { success: false, error: 'aborted' };
         return {
           success: false,
           error: String(err),
@@ -462,12 +467,13 @@ export function useSymbolUniverse(
 
   // Get runtime state for a symbol
   const getRuntimeState = useCallback(
-    async (canonical: string): Promise<SymbolRuntimeState | null> => {
+    async (canonical: string, signal?: AbortSignal): Promise<SymbolRuntimeState | null> => {
       try {
-        const response = await fetch(`/api/symbol-universe/runtime/${canonical}`);
+        const response = await fetch(`/api/symbol-universe/runtime/${canonical}`, { signal });
         if (!response.ok) return null;
         return await response.json();
-      } catch (err) {
+      } catch (err: any) {
+        if (err && err.name === 'AbortError') return null;
         console.error('[useSymbolUniverse] Error fetching runtime state:', err);
         return null;
       }

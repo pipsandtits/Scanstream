@@ -14,6 +14,7 @@
 
 import { assetCorrelationAnalyzer } from './asset-correlation-analyzer';
 import { dynamicPositionSizer } from './dynamic-position-sizer';
+import { systemKillSwitch } from './system-kill-switch';
 
 interface PortfolioPosition {
   symbol: string;
@@ -61,6 +62,7 @@ interface PositionSizingConsensus {
 
 export class PortfolioRiskManager {
   private positions: Map<string, PortfolioPosition> = new Map();
+  private reservations: Map<string, { amount: number; correlationId?: string; timestamp: number }> = new Map();
   private peakValue: number = 0;
   private dailyStartValue: number = 0;
   private lastResetTime: Date = new Date();
@@ -76,6 +78,34 @@ export class PortfolioRiskManager {
   constructor(initialValue: number = 10000) {
     this.peakValue = initialValue;
     this.dailyStartValue = initialValue;
+  }
+
+  /**
+   * Reserve capital for a pending order. Returns a reservation token.
+   * Throws if reservation cannot be made (exceeds exposure or limits).
+   */
+  reserveCapital(amountUsd: number, correlationId?: string): string {
+    const token = `resv-${Date.now()}-${Math.random().toString(36).slice(2,9)}`;
+    const metrics = this.getPortfolioMetrics(this.peakValue);
+    const reservedTotal = Array.from(this.reservations.values()).reduce((s, r) => s + r.amount, 0);
+    const effectiveExposure = metrics.totalExposure + reservedTotal + amountUsd;
+    const maxExposureUsd = metrics.totalValue * (this.limits.maxTotalExposure / 100);
+    if (effectiveExposure > maxExposureUsd) {
+      throw new Error(`Reservation exceeds max exposure: ${effectiveExposure} > ${maxExposureUsd}`);
+    }
+    this.reservations.set(token, { amount: amountUsd, correlationId, timestamp: Date.now() });
+    return token;
+  }
+
+  releaseReservation(token: string): void {
+    if (this.reservations.has(token)) {
+      this.reservations.delete(token);
+    }
+  }
+
+  commitReservation(token: string): void {
+    // Committing simply releases the reservation; actual position is added via addPosition by caller
+    this.releaseReservation(token);
   }
 
   /**
@@ -137,6 +167,23 @@ export class PortfolioRiskManager {
     // 6. Daily loss limit check
     if (portfolioMetrics.dailyPnlPercent < -this.limits.maxDailyLoss) {
       reasoning.push(`⛔ Daily loss limit reached (${portfolioMetrics.dailyPnlPercent.toFixed(2)}%)`);
+      return {
+        symbol,
+        signalConfidence,
+        kellySize,
+        rlSize,
+        portfolioSize,
+        correlationSize,
+        finalSize: 0,
+        reasoning,
+        approved: false
+      };
+    }
+
+    // 7. Global kill-switch: if set, reject any new positions and surface reasoning
+    if (systemKillSwitch.isKilled()) {
+      const ks = systemKillSwitch.getState();
+      reasoning.push(`⛔ System kill-switch active: ${ks.reason || 'unspecified'} (setBy=${ks.setBy})`);
       return {
         symbol,
         signalConfidence,

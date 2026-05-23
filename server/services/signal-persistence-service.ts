@@ -10,7 +10,8 @@
  * Enables feedback loop: actual signal effectiveness → dynamic accuracy adjustment
  */
 
-import { PrismaClient } from '@prisma/client';
+import pkg from '@prisma/client';
+const { PrismaClient } = pkg as any;
 
 const prisma = new PrismaClient();
 

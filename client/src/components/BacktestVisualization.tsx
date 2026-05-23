@@ -1,9 +1,6 @@
-import React, { useMemo } from 'react';
-import {
-  LineChart, Line, AreaChart, Area, BarChart, Bar, ScatterChart, Scatter,
-  XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer,
-  ComposedChart, Cell
-} from 'recharts';
+import React, { useMemo, Suspense, lazy } from 'react';
+const BacktestCharts = lazy(() => import('@/components/BacktestCharts'));
+import AreaChartCore from './charts/AreaChartCore';
 import { TrendingUp, TrendingDown, Activity, Calendar, AlertCircle } from 'lucide-react';
 
 interface Trade {
@@ -183,35 +180,16 @@ export default function BacktestVisualization({
           Equity Curve
         </h3>
         {equityCurve && equityCurve.length > 0 ? (
-          <ResponsiveContainer width="100%" height={300}>
-            <AreaChart data={equityCurve}>
-              <defs>
-                <linearGradient id="colorEquity" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="5%" stopColor="#3b82f6" stopOpacity={0.8} />
-                  <stop offset="95%" stopColor="#3b82f6" stopOpacity={0} />
-                </linearGradient>
-              </defs>
-              <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-              <XAxis dataKey="timestamp" stroke="#94a3b8" style={{ fontSize: '12px' }} />
-              <YAxis stroke="#94a3b8" style={{ fontSize: '12px' }} />
-              <Tooltip
-                contentStyle={{
-                  backgroundColor: '#1e293b',
-                  border: '1px solid #475569',
-                  borderRadius: '8px'
-                }}
-                labelStyle={{ color: '#e2e8f0' }}
-                formatter={(value: any) => formatCurrency(value)}
-              />
-              <Area
-                type="monotone"
-                dataKey="value"
-                stroke="#3b82f6"
-                fillOpacity={1}
-                fill="url(#colorEquity)"
-              />
-            </AreaChart>
-          </ResponsiveContainer>
+          <AreaChartCore
+            data={equityCurve}
+            dataKey="value"
+            height={300}
+            gradientId="colorEquity"
+            stroke="#3b82f6"
+            fill="#3b82f6"
+            xFormatter={(t: any) => new Date(t).toLocaleDateString()}
+            yFormatter={(v: any) => `$${v.toFixed(2)}`}
+          />
         ) : (
           <div className="h-80 flex items-center justify-center text-slate-500">
             No equity curve data available
@@ -242,35 +220,16 @@ export default function BacktestVisualization({
           Drawdown Over Time
         </h3>
         {drawdownCurve && drawdownCurve.length > 0 ? (
-          <ResponsiveContainer width="100%" height={250}>
-            <AreaChart data={drawdownCurve}>
-              <defs>
-                <linearGradient id="colorDrawdown" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="5%" stopColor="#ef4444" stopOpacity={0.8} />
-                  <stop offset="95%" stopColor="#ef4444" stopOpacity={0} />
-                </linearGradient>
-              </defs>
-              <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-              <XAxis dataKey="timestamp" stroke="#94a3b8" style={{ fontSize: '12px' }} />
-              <YAxis stroke="#94a3b8" style={{ fontSize: '12px' }} label={{ value: '%', angle: -90, position: 'insideLeft' }} />
-              <Tooltip
-                contentStyle={{
-                  backgroundColor: '#1e293b',
-                  border: '1px solid #475569',
-                  borderRadius: '8px'
-                }}
-                labelStyle={{ color: '#e2e8f0' }}
-                formatter={(value: any) => `${value.toFixed(2)}%`}
-              />
-              <Area
-                type="monotone"
-                dataKey="drawdown"
-                stroke="#ef4444"
-                fillOpacity={1}
-                fill="url(#colorDrawdown)"
-              />
-            </AreaChart>
-          </ResponsiveContainer>
+          <AreaChartCore
+            data={drawdownCurve}
+            dataKey="drawdown"
+            height={250}
+            gradientId="colorDrawdown"
+            stroke="#ef4444"
+            fill="#ef4444"
+            xFormatter={(t: any) => new Date(t).toLocaleDateString()}
+            yFormatter={(v: any) => `${v.toFixed(2)}%`}
+          />
         ) : (
           <div className="h-64 flex items-center justify-center text-slate-500">
             No drawdown data available
@@ -278,108 +237,10 @@ export default function BacktestVisualization({
         )}
       </div>
 
-      {/* Monthly Returns Heatmap */}
-      <div className="bg-slate-800/30 border border-slate-700/30 rounded-lg p-4">
-        <h3 className="text-sm font-semibold text-slate-300 mb-4 flex items-center">
-          <Calendar className="w-4 h-4 mr-2 text-purple-400" />
-          Monthly Returns
-        </h3>
-        {monthlyHeatmapData && monthlyHeatmapData.length > 0 ? (
-          <ResponsiveContainer width="100%" height={200}>
-            <BarChart
-              data={monthlyHeatmapData}
-              layout="vertical"
-              margin={{ top: 5, right: 30, left: 100, bottom: 5 }}
-            >
-              <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-              <XAxis type="number" stroke="#94a3b8" style={{ fontSize: '12px' }} />
-              <YAxis dataKey="month" type="category" stroke="#94a3b8" style={{ fontSize: '12px' }} width={90} />
-              <Tooltip
-                contentStyle={{
-                  backgroundColor: '#1e293b',
-                  border: '1px solid #475569',
-                  borderRadius: '8px'
-                }}
-                labelStyle={{ color: '#e2e8f0' }}
-                formatter={(value: any) => `${value.toFixed(2)}%`}
-              />
-              <Bar dataKey="return" fill="#3b82f6" radius={[0, 8, 8, 0]}>
-                {monthlyHeatmapData.map((entry, index) => (
-                  <Cell key={`cell-${index}`} fill={entry.fill} />
-                ))}
-              </Bar>
-            </BarChart>
-          </ResponsiveContainer>
-        ) : (
-          <div className="h-48 flex items-center justify-center text-slate-500">
-            No monthly returns data available
-          </div>
-        )}
-      </div>
-
-      {/* Trade Distribution */}
-      <div className="bg-slate-800/30 border border-slate-700/30 rounded-lg p-4">
-        <h3 className="text-sm font-semibold text-slate-300 mb-4 flex items-center">
-          <Activity className="w-4 h-4 mr-2 text-green-400" />
-          Trade P&L Distribution
-        </h3>
-        {tradeScatterData && tradeScatterData.length > 0 ? (
-          <ResponsiveContainer width="100%" height={250}>
-            <ScatterChart margin={{ top: 20, right: 20, bottom: 20, left: 20 }}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-              <XAxis
-                type="number"
-                dataKey="x"
-                stroke="#94a3b8"
-                style={{ fontSize: '12px' }}
-                label={{ value: 'Trade #', position: 'insideBottomRight', offset: -10 }}
-              />
-              <YAxis
-                type="number"
-                dataKey="y"
-                stroke="#94a3b8"
-                style={{ fontSize: '12px' }}
-                label={{ value: 'P&L %', angle: -90, position: 'insideLeft' }}
-              />
-              <Tooltip
-                contentStyle={{
-                  backgroundColor: '#1e293b',
-                  border: '1px solid #475569',
-                  borderRadius: '8px'
-                }}
-                labelStyle={{ color: '#e2e8f0' }}
-                cursor={{ fill: 'rgba(59, 130, 246, 0.1)' }}
-                formatter={(value: any) => `${value.toFixed(2)}%`}
-              />
-              <Scatter name="Wins" data={tradeScatterData.filter(t => t.pnl >= 0)} fill="#10b981" />
-              <Scatter name="Losses" data={tradeScatterData.filter(t => t.pnl < 0)} fill="#ef4444" />
-            </ScatterChart>
-          </ResponsiveContainer>
-        ) : (
-          <div className="h-64 flex items-center justify-center text-slate-500">
-            No trade data available
-          </div>
-        )}
-        <div className="mt-4 grid grid-cols-3 gap-4 text-sm">
-          <div>
-            <p className="text-slate-500">Winning Trades</p>
-            <p className="font-bold text-green-400">
-              {tradeScatterData.filter(t => t.pnl >= 0).length}
-            </p>
-          </div>
-          <div>
-            <p className="text-slate-500">Losing Trades</p>
-            <p className="font-bold text-red-400">
-              {tradeScatterData.filter(t => t.pnl < 0).length}
-            </p>
-          </div>
-          <div>
-            <p className="text-slate-500">Avg Win</p>
-            <p className="font-bold text-blue-400">
-              {formatPercent(metrics.avgWin)}
-            </p>
-          </div>
-        </div>
+      <div>
+        <Suspense fallback={<div className="h-64 flex items-center justify-center">Loading charts…</div>}>
+          <BacktestCharts monthlyHeatmapData={monthlyHeatmapData} tradeScatterData={tradeScatterData} />
+        </Suspense>
       </div>
 
       {/* Statistics Table */}

@@ -4,6 +4,72 @@ import type { MarketFrame } from './trading-engine';
 import { SignalEngine, TechnicalIndicators } from './trading-engine';
 import { storage } from './storage';
 
+// Configurable constants to avoid magic numbers
+const DEFAULT_RAW_FETCH_LIMIT = 1000;
+const MAX_SAMPLED_POINTS = 500;
+const DEFAULT_LOOKBACK_PIVOT = 5;
+const MIN_FRAMES_FOR_SIGNAL = 50;
+
+function toTimestampNumber(ts: any): number {
+  if (typeof ts === 'number') return ts;
+  if (ts instanceof Date) return ts.getTime();
+  if (typeof ts === 'string') return new Date(ts).getTime();
+  return Date.now();
+}
+
+function normalizeRawFrame(f: any): MarketFrame {
+  const timestamp = toTimestampNumber(f?.timestamp);
+  const p = f?.price ?? {};
+  const price = {
+    open: Number(p.open ?? 0),
+    high: Number(p.high ?? 0),
+    low: Number(p.low ?? 0),
+    close: Number(p.close ?? 0)
+  };
+
+  return {
+    symbol: typeof f.symbol === 'string' ? f.symbol : (f?.symbol ?? ''),
+    id: typeof f.id === 'string' ? f.id : (f?.id ?? ''),
+    timestamp: new Date(timestamp),
+    price,
+    volume: Number(f?.volume ?? 0),
+    indicators: {
+      rsi: Number(f?.indicators?.rsi ?? 0),
+      macd: f?.indicators?.macd ?? { macd: 0, signal: 0, histogram: 0 },
+      bb: f?.indicators?.bb ?? { upper: 0, middle: 0, lower: 0 },
+      ema20: Number(f?.indicators?.ema20 ?? 0),
+      ema50: Number(f?.indicators?.ema50 ?? 0),
+      ema200: Number(f?.indicators?.ema200 ?? 0),
+      multiEMA: f?.indicators?.multiEMA ?? {},
+      stoch_k: Number(f?.indicators?.stoch_k ?? 0),
+      stoch_d: Number(f?.indicators?.stoch_d ?? 0),
+      adx: Number(f?.indicators?.adx ?? 0),
+      vwap: Number(f?.indicators?.vwap ?? 0),
+      atr: Number(f?.indicators?.atr ?? 0),
+      momentumShort: Number(f?.indicators?.momentumShort ?? 0),
+      momentumLong: Number(f?.indicators?.momentumLong ?? 0),
+      bbPos: Number(f?.indicators?.bbPos ?? 0),
+      volumeRatio: Number(f?.indicators?.volumeRatio ?? 0),
+      mom7d: Number(f?.indicators?.mom7d ?? 0),
+      mom30d: Number(f?.indicators?.mom30d ?? 0),
+      ichimoku_bullish: Boolean(f?.indicators?.ichimoku_bullish ?? false)
+    },
+    orderFlow: {
+      bidVolume: Number(f?.orderFlow?.bidVolume ?? 0),
+      askVolume: Number(f?.orderFlow?.askVolume ?? 0),
+      netFlow: Number(f?.orderFlow?.netFlow ?? 0),
+      largeOrders: Number(f?.orderFlow?.largeOrders ?? 0),
+      smallOrders: Number(f?.orderFlow?.smallOrders ?? 0)
+    },
+    marketMicrostructure: {
+      spread: Number(f?.marketMicrostructure?.spread ?? 0),
+      depth: Number(f?.marketMicrostructure?.depth ?? 0),
+      imbalance: Number(f?.marketMicrostructure?.imbalance ?? 0),
+      toxicity: Number(f?.marketMicrostructure?.toxicity ?? 0)
+    }
+  } as MarketFrame;
+}
+
 export interface EMACross {
   timestamp: number;
   direction: 'GOLDEN' | 'DEATH'; // Golden cross (fast > slow), Death cross (fast < slow)
@@ -113,6 +179,22 @@ export interface EnhancedMultiTimeframeSignal extends Signal {
 export class EnhancedMultiTimeframeAnalyzer {
   private readonly timeframes = ['1m', '5m', '15m', '1h', '4h', '1d'];
   private readonly signalEngine: SignalEngine;
+  // Simple in-memory cache keyed by "length_lastTs" to avoid recomputing indicators
+  private indicatorCache: Map<string, {
+    ema?: Record<string, number[]>;
+    rsi?: number[] | number;
+    macd?: Array<{ macd: number; signal: number; histogram: number }>;
+    stochastic?: Array<{ k: number; d: number }>;
+  }> = new Map();
+  private readonly config = {
+    stopLossBase: 0.02,
+    takeProfitBase: 0.04,
+    minConfluence: 0.5,
+    strongConfluence: 0.7,
+    pivotLookback: DEFAULT_LOOKBACK_PIVOT,
+    volumeWeightWindow: 8
+  } as const;
+  private logger: { log: Function; warn: Function; error: Function } = console;
   private readonly minDataPoints = {
     '1m': 200,
     '5m': 150,
@@ -131,8 +213,50 @@ export class EnhancedMultiTimeframeAnalyzer {
     '1d': 0.20
   };
   
-  constructor(signalEngine: SignalEngine) {
+  constructor(signalEngine: SignalEngine, opts?: { logger?: any; config?: Partial<any> }) {
     this.signalEngine = signalEngine;
+    if (opts?.logger) this.logger = opts.logger;
+    if (opts?.config) Object.assign((this as any).config, opts.config);
+  }
+
+  private getIndicatorCacheKey(frames: MarketFrame[], timeframe?: string): string {
+    if (!frames || frames.length === 0) return 'empty';
+    const last = frames[frames.length - 1];
+    const ts = toTimestampNumber(last.timestamp);
+    const sym = (frames[0] && (frames[0].symbol || '')) as string;
+    return `${sym}_${timeframe ?? 'tf'}_${frames.length}_${ts}`;
+  }
+
+  private getCachedIndicators(frames: MarketFrame[], timeframe?: string) {
+    const key = this.getIndicatorCacheKey(frames, timeframe);
+    const existing = this.indicatorCache.get(key);
+    if (existing) return existing;
+
+    const prices = frames.map(f => f.price.close);
+    const highs = frames.map(f => f.price.high);
+    const lows = frames.map(f => f.price.low);
+
+    const ema: Record<string, number[]> = {};
+    ema['5'] = TechnicalIndicators.calculateEMA(prices, 5);
+    ema['9'] = TechnicalIndicators.calculateEMA(prices, 9);
+    ema['12'] = TechnicalIndicators.calculateEMA(prices, 12);
+    ema['13'] = TechnicalIndicators.calculateEMA(prices, 13);
+    ema['21'] = TechnicalIndicators.calculateEMA(prices, 21);
+    ema['26'] = TechnicalIndicators.calculateEMA(prices, 26);
+    ema['20'] = TechnicalIndicators.calculateEMA(prices, 20);
+    ema['50'] = TechnicalIndicators.calculateEMA(prices, 50);
+    ema['200'] = TechnicalIndicators.calculateEMA(prices, Math.min(200, prices.length));
+
+    // Normalize MACD to an array form
+    const macdRaw = TechnicalIndicators.calculateMACD(prices);
+    const macdArr = Array.isArray(macdRaw) ? macdRaw : [macdRaw];
+
+    const rsiArr = TechnicalIndicators.calculateRSI(prices, 14);
+    const stochArr = TechnicalIndicators.calculateStochastic(highs, lows, prices, 14, 3);
+
+    const computed = { ema, rsi: rsiArr, macd: macdArr, stochastic: stochArr };
+    try { this.indicatorCache.set(key, computed); } catch (e) { /* ignore cache failures */ }
+    return computed;
   }
   
   async analyzeMultiTimeframe(symbol: string): Promise<EnhancedMultiTimeframeSignal | null> {
@@ -175,13 +299,7 @@ export class EnhancedMultiTimeframeAnalyzer {
   
   private async getFramesForTimeframe(symbol: string, timeframe: string): Promise<MarketFrame[]> {
     // In production, this would interface with your data provider
-    // For now, simulating different timeframes by sampling intervals
-    const allFrames = await storage.getMarketFrames(symbol, 1000);
-    
-    if (!allFrames || allFrames.length === 0) {
-      throw new Error(`No market data available for ${symbol}`);
-    }
-    
+    // Request only the raw frames we actually need to sample MAX_SAMPLED_POINTS
     const intervalMap: Record<string, number> = {
       '1m': 1,
       '5m': 5,
@@ -190,86 +308,41 @@ export class EnhancedMultiTimeframeAnalyzer {
       '4h': 240,
       '1d': 1440
     };
-    
     const interval = intervalMap[timeframe];
-    if (!interval) {
-      throw new Error(`Unsupported timeframe: ${timeframe}`);
-    }
-    
-    // Sample frames at the specified interval
-    const sampledFrames = allFrames
-      .filter((_, index) => index % interval === 0)
-      .slice(-500); // Keep last 500 data points
-    
-    // Ensure frames are sorted by timestamp
-  return sampledFrames.map(f => ({
-    symbol: typeof f.symbol === 'string' ? f.symbol : '',
-    id: typeof f.id === 'string' ? f.id : '',
-    timestamp: typeof f.timestamp === 'string' ? new Date(f.timestamp) : (f.timestamp instanceof Date ? f.timestamp : new Date()),
-    price: (typeof f.price === 'object' && f.price !== null && typeof (f.price as any).open === 'number' && typeof (f.price as any).high === 'number' && typeof (f.price as any).low === 'number' && typeof (f.price as any).close === 'number')
-      ? {
-          open: Number((f.price as any).open ?? 0),
-          high: Number((f.price as any).high ?? 0),
-          low: Number((f.price as any).low ?? 0),
-          close: Number((f.price as any).close ?? 0)
-        }
-      : { open: 0, high: 0, low: 0, close: 0 },
-    volume: typeof f.volume === 'number' ? f.volume : 0,
-    indicators: {
-      rsi: Number((f.indicators as any)?.rsi ?? 0),
-      macd: (f.indicators as any)?.macd ?? { macd: 0, signal: 0, histogram: 0 },
-      bb: (f.indicators as any)?.bb ?? { upper: 0, middle: 0, lower: 0 },
-      ema20: Number((f.indicators as any)?.ema20 ?? 0),
-      ema50: Number((f.indicators as any)?.ema50 ?? 0),
-      ema200: Number((f.indicators as any)?.ema200 ?? 0),
-      multiEMA: (f.indicators as any)?.multiEMA ?? {},
-      stoch_k: Number((f.indicators as any)?.stoch_k ?? 0),
-      stoch_d: Number((f.indicators as any)?.stoch_d ?? 0),
-      adx: Number((f.indicators as any)?.adx ?? 0),
-      vwap: Number((f.indicators as any)?.vwap ?? 0),
-      atr: Number((f.indicators as any)?.atr ?? 0),
-      momentumShort: Number((f.indicators as any)?.momentumShort ?? 0),
-      momentumLong: Number((f.indicators as any)?.momentumLong ?? 0),
-      bbPos: Number((f.indicators as any)?.bbPos ?? 0),
-      volumeRatio: Number((f.indicators as any)?.volumeRatio ?? 0),
-      mom7d: Number((f.indicators as any)?.mom7d ?? 0),
-      mom30d: Number((f.indicators as any)?.mom30d ?? 0),
-      ichimoku_bullish: Boolean((f.indicators as any)?.ichimoku_bullish ?? false)
-    },
-    orderFlow: {
-      bidVolume: Number((f.orderFlow as any)?.bidVolume ?? 0),
-      askVolume: Number((f.orderFlow as any)?.askVolume ?? 0),
-      netFlow: Number((f.orderFlow as any)?.netFlow ?? 0),
-      largeOrders: Number((f.orderFlow as any)?.largeOrders ?? 0),
-      smallOrders: Number((f.orderFlow as any)?.smallOrders ?? 0)
-    },
-    marketMicrostructure: {
-      spread: Number((f.marketMicrostructure as any)?.spread ?? 0),
-      depth: Number((f.marketMicrostructure as any)?.depth ?? 0),
-      imbalance: Number((f.marketMicrostructure as any)?.imbalance ?? 0),
-      toxicity: Number((f.marketMicrostructure as any)?.toxicity ?? 0)
-    }
-  })).sort((a, b) => Number(a.timestamp) - Number(b.timestamp));
+    if (!interval) throw new Error(`Unsupported timeframe: ${timeframe}`);
+
+    // compute a sensible raw fetch limit: interval * MAX_SAMPLED_POINTS but bounded
+    const neededRaw = Math.min(DEFAULT_RAW_FETCH_LIMIT, interval * MAX_SAMPLED_POINTS);
+    const raw = await storage.getMarketFrames(symbol, neededRaw);
+    if (!raw || raw.length === 0) throw new Error(`No market data available for ${symbol}`);
+
+    // Sample frames at the specified interval and keep at most MAX_SAMPLED_POINTS
+    const sampled = raw.filter((_: any, idx: number) => idx % interval === 0).slice(-MAX_SAMPLED_POINTS);
+
+    // Normalize raw frames into typed MarketFrame objects once
+    const normalized = sampled.map(normalizeRawFrame);
+    normalized.sort((a, b) => toTimestampNumber(a.timestamp) - toTimestampNumber(b.timestamp));
+    return normalized;
   }
   
   private async analyzeTimeframe(frames: MarketFrame[], timeframe: string): Promise<EnhancedTimeframeAnalysis | null> {
-    if (frames.length < 50) return null;
-    
-  const prices = frames.map(f => (f.price as { open: number; high: number; low: number; close: number }).close);
-  const highs = frames.map(f => (f.price as { open: number; high: number; low: number; close: number }).high);
-  const lows = frames.map(f => (f.price as { open: number; high: number; low: number; close: number }).low);
+    if (frames.length < MIN_FRAMES_FOR_SIGNAL) return null;
+
+    const prices = frames.map(f => f.price.close);
+    const highs = frames.map(f => f.price.high);
+    const lows = frames.map(f => f.price.low);
     const volumes = frames.map(f => f.volume || 0);
     
     try {
-      // Enhanced EMA Analysis
+      // Enhanced EMA Analysis (uses indicator cache)
       const emaAnalysis = this.analyzeEMACrosses(frames);
-      
-      // Momentum Analysis
+
+      // Momentum Analysis (uses indicator cache)
       const momentum = this.analyzeMomentum(frames);
-      
+
       // Volume Analysis
       const volume = this.analyzeVolume(frames);
-      
+
       // Market Structure Analysis
       const structure = this.analyzeMarketStructure(frames);
       
@@ -281,56 +354,9 @@ export class EnhancedMultiTimeframeAnalyzer {
       
       // Generate signals for this timeframe
       const signals: Signal[] = [];
-      if (frames.length > 50) {
-        const properlyTypedFrames: MarketFrame[] = frames.map(f => ({
-          symbol: typeof f.symbol === 'string' ? f.symbol : '',
-          id: typeof f.id === 'string' ? f.id : '',
-          timestamp: f.timestamp instanceof Date ? f.timestamp : new Date(f.timestamp),
-          price: ((f.price as { open?: number; high?: number; low?: number; close?: number }) && typeof (f.price as any).open === 'number' && typeof (f.price as any).high === 'number' && typeof (f.price as any).low === 'number' && typeof (f.price as any).close === 'number')
-            ? {
-                open: Number((f.price as any).open ?? 0),
-                high: Number((f.price as any).high ?? 0),
-                low: Number((f.price as any).low ?? 0),
-                close: Number((f.price as any).close ?? 0)
-              }
-            : { open: 0, high: 0, low: 0, close: 0 },
-          volume: typeof f.volume === 'number' ? f.volume : 0,
-          indicators: {
-            rsi: Number((f.indicators as any)?.rsi ?? 0),
-            macd: (f.indicators as any)?.macd ?? { macd: 0, signal: 0, histogram: 0 },
-            bb: (f.indicators as any)?.bb ?? { upper: 0, middle: 0, lower: 0 },
-            ema20: Number((f.indicators as any)?.ema20 ?? 0),
-            ema50: Number((f.indicators as any)?.ema50 ?? 0),
-            ema200: Number((f.indicators as any)?.ema200 ?? 0),
-            multiEMA: (f.indicators as any)?.multiEMA ?? {},
-            stoch_k: Number((f.indicators as any)?.stoch_k ?? 0),
-            stoch_d: Number((f.indicators as any)?.stoch_d ?? 0),
-            adx: Number((f.indicators as any)?.adx ?? 0),
-            vwap: Number((f.indicators as any)?.vwap ?? 0),
-            atr: Number((f.indicators as any)?.atr ?? 0),
-            momentumShort: Number((f.indicators as any)?.momentumShort ?? 0),
-            momentumLong: Number((f.indicators as any)?.momentumLong ?? 0),
-            bbPos: Number((f.indicators as any)?.bbPos ?? 0),
-            volumeRatio: Number((f.indicators as any)?.volumeRatio ?? 0),
-            mom7d: Number((f.indicators as any)?.mom7d ?? 0),
-            mom30d: Number((f.indicators as any)?.mom30d ?? 0),
-            ichimoku_bullish: Boolean((f.indicators as any)?.ichimoku_bullish ?? false)
-          },
-          orderFlow: {
-            bidVolume: Number((f.orderFlow as any)?.bidVolume ?? 0),
-            askVolume: Number((f.orderFlow as any)?.askVolume ?? 0),
-            netFlow: Number((f.orderFlow as any)?.netFlow ?? 0),
-            largeOrders: Number((f.orderFlow as any)?.largeOrders ?? 0),
-            smallOrders: Number((f.orderFlow as any)?.smallOrders ?? 0)
-          },
-          marketMicrostructure: {
-            spread: Number((f.marketMicrostructure as any)?.spread ?? 0),
-            depth: Number((f.marketMicrostructure as any)?.depth ?? 0),
-            imbalance: Number((f.marketMicrostructure as any)?.imbalance ?? 0),
-            toxicity: Number((f.marketMicrostructure as any)?.toxicity ?? 0)
-          }
-        }));
-        const signal = await this.signalEngine.generateSignal(properlyTypedFrames, properlyTypedFrames.length - 1);
+      if (frames.length > MIN_FRAMES_FOR_SIGNAL) {
+        // frames are already normalized by getFramesForTimeframe
+        const signal = await this.signalEngine.generateSignal(frames, frames.length - 1);
         if (signal) signals.push(signal as Signal);
       }
       
@@ -364,42 +390,31 @@ export class EnhancedMultiTimeframeAnalyzer {
   }
   
   private analyzeEMACrosses(frames: MarketFrame[]): EnhancedTimeframeAnalysis['emaAnalysis'] {
-  const prices = frames.map(f => (f.price as { open: number; high: number; low: number; close: number }).close);
-    
-    // Calculate EMAs
-    const ema5 = TechnicalIndicators.calculateEMA(prices, 5);
-    const ema13 = TechnicalIndicators.calculateEMA(prices, 13);
-    const ema9 = TechnicalIndicators.calculateEMA(prices, 9);
-    const ema21 = TechnicalIndicators.calculateEMA(prices, 21);
-    const ema12 = TechnicalIndicators.calculateEMA(prices, 12);
-    const ema26 = TechnicalIndicators.calculateEMA(prices, 26);
-    
-    // Find recent crosses
+    const cache = this.getCachedIndicators(frames);
+    const ema5 = cache.ema!['5'];
+    const ema9 = cache.ema!['9'];
+    const ema12 = cache.ema!['12'];
+    const ema13 = cache.ema!['13'];
+    const ema21 = cache.ema!['21'];
+    const ema26 = cache.ema!['26'];
+
     const ema5_13 = this.findEMACross(ema5, ema13, frames, 5, 13);
     const ema9_21 = this.findEMACross(ema9, ema21, frames, 9, 21);
     const ema12_26 = this.findEMACross(ema12, ema26, frames, 12, 26);
-    
-    // Determine current alignment
-    const currentIdx = prices.length - 1;
+
+    const currentIdx = ema5.length - 1;
     const currentAlignment = this.determineEMAAlignment(
       ema5[currentIdx], ema9[currentIdx], ema12[currentIdx],
       ema13[currentIdx], ema21[currentIdx], ema26[currentIdx]
     );
-    
-    // Calculate alignment strength
+
     const alignmentStrength = this.calculateAlignmentStrength([
       { fast: ema5[currentIdx], slow: ema13[currentIdx] },
       { fast: ema9[currentIdx], slow: ema21[currentIdx] },
       { fast: ema12[currentIdx], slow: ema26[currentIdx] }
     ]);
-    
-    return {
-      ema5_13,
-      ema9_21,
-      ema12_26,
-      currentAlignment,
-      alignmentStrength
-    };
+
+    return { ema5_13, ema9_21, ema12_26, currentAlignment, alignmentStrength };
   }
   
   private findEMACross(fastEMA: number[], slowEMA: number[], frames: MarketFrame[], fastPeriod: number, slowPeriod: number): EMACross | null {
@@ -491,28 +506,25 @@ export class EnhancedMultiTimeframeAnalyzer {
   }
   
   private analyzeMomentum(frames: MarketFrame[]): MomentumIndicators {
-  const prices = frames.map(f => (f.price as { open: number; high: number; low: number; close: number }).close);
-  const highs = frames.map(f => (f.price as { open: number; high: number; low: number; close: number }).high);
-  const lows = frames.map(f => (f.price as { open: number; high: number; low: number; close: number }).low);
-    
-    // RSI Analysis
-    const rsi = TechnicalIndicators.calculateRSI(prices, 14);
-  const currentRSI = Array.isArray(rsi) ? rsi[rsi.length - 1] : rsi;
-  const rsiDivergence = this.detectRSIDivergence(prices, Array.isArray(rsi) ? rsi : [rsi]);
-    
-    // MACD Analysis
-    const macdData = TechnicalIndicators.calculateMACD(prices);
-    const macdArr = Array.isArray(macdData) ? macdData : [macdData];
-    const currentMACD = macdArr[macdArr.length - 1];
-  const macdArrMapped = macdArr.map(m => ({ macd: m.macd, signal: m.signal, histogram: m.histogram }));
+    const cache = this.getCachedIndicators(frames);
+    const prices = frames.map(f => f.price.close);
+    const highs = frames.map(f => f.price.high);
+    const lows = frames.map(f => f.price.low);
+
+    const rsiArr = Array.isArray(cache.rsi) ? cache.rsi : [cache.rsi as number];
+    const currentRSI = rsiArr[rsiArr.length - 1] ?? 0;
+    const rsiDivergence = this.detectRSIDivergence(prices, rsiArr);
+
+    const macdArr = Array.isArray(cache.macd) ? cache.macd : [cache.macd as any];
+    const currentMACD = macdArr[macdArr.length - 1] ?? { macd: 0, signal: 0, histogram: 0 };
+    const macdArrMapped = macdArr.map(m => ({ macd: m.macd, signal: m.signal, histogram: m.histogram }));
     const macdTrend = this.determineMACDTrend(macdArrMapped);
     const macdDivergence = this.detectMACDDivergence(prices, macdArrMapped);
-    
-    // Stochastic Analysis
-    const stochData = TechnicalIndicators.calculateStochastic(highs, lows, prices, 14, 3);
-  const currentStoch = Array.isArray(stochData) ? stochData[stochData.length - 1] : stochData;
-  const stochTrend = this.determineStochasticTrend(Array.isArray(stochData) ? stochData : [stochData]);
-    
+
+    const stochArr = Array.isArray(cache.stochastic) ? cache.stochastic : [];
+    const currentStoch = stochArr[stochArr.length - 1] ?? { k: 50, d: 50 };
+    const stochTrend = this.determineStochasticTrend(stochArr.length ? stochArr : [currentStoch]);
+
     return {
       rsi: currentRSI,
       rsiDivergence,
@@ -623,13 +635,13 @@ export class EnhancedMultiTimeframeAnalyzer {
   }
   
   private analyzeTrend(frames: MarketFrame[]): { trend: 'BULLISH' | 'BEARISH' | 'NEUTRAL'; strength: number } {
-  const prices = frames.map(f => (f.price as { open: number; high: number; low: number; close: number }).close);
-    
-    // Multiple EMA trend confirmation
-    const ema20 = TechnicalIndicators.calculateEMA(prices, 20);
-    const ema50 = TechnicalIndicators.calculateEMA(prices, 50);
-    const ema200 = TechnicalIndicators.calculateEMA(prices, Math.min(200, prices.length));
-    
+    const prices = frames.map(f => f.price.close);
+    // Use cached EMAs when available
+    const cache = this.getCachedIndicators(frames);
+    const ema20 = cache.ema!['20'];
+    const ema50 = cache.ema!['50'];
+    const ema200 = cache.ema!['200'];
+
     const currentPrice = prices[prices.length - 1];
     const currentEma20 = ema20[ema20.length - 1];
     const currentEma50 = ema50[ema50.length - 1];
@@ -676,7 +688,7 @@ export class EnhancedMultiTimeframeAnalyzer {
     const support: Array<{ level: number; strength: number }> = [];
     const resistance: Array<{ level: number; strength: number }> = [];
     
-    const lookback = 8; // Increased lookback for better pivot detection
+    const lookback = this.config.pivotLookback; // configurable pivot lookback
     
     for (let i = lookback; i < frames.length - lookback; i++) {
       // Enhanced resistance detection with volume weighting
@@ -689,7 +701,9 @@ export class EnhancedMultiTimeframeAnalyzer {
       }
       
       if (isResistance) {
-        const volumeWeight = volumes[i] / Math.max(...volumes.slice(i - lookback, i + lookback + 1));
+        const windowSlice = volumes.slice(Math.max(0, i - lookback), Math.min(volumes.length, i + lookback + 1));
+        const maxWindow = Math.max(...windowSlice, 1);
+        const volumeWeight = volumes[i] / maxWindow;
         const strength = volumeWeight * (1 + (frames.length - i) / frames.length); // Recent levels more important
         resistance.push({ level: highs[i], strength });
       }
@@ -704,7 +718,9 @@ export class EnhancedMultiTimeframeAnalyzer {
       }
       
       if (isSupport) {
-        const volumeWeight = volumes[i] / Math.max(...volumes.slice(i - lookback, i + lookback + 1));
+        const windowSlice2 = volumes.slice(Math.max(0, i - lookback), Math.min(volumes.length, i + lookback + 1));
+        const maxWindow2 = Math.max(...windowSlice2, 1);
+        const volumeWeight = volumes[i] / maxWindow2;
         const strength = volumeWeight * (1 + (frames.length - i) / frames.length);
         support.push({ level: lows[i], strength });
       }
@@ -1101,16 +1117,16 @@ export class EnhancedMultiTimeframeAnalyzer {
   }
   
   private calculateSRSpread(analyses: EnhancedTimeframeAnalysis[], currentPrice: number): number {
-    const allSupport = analyses.flatMap(a => a.support).filter(s => s < currentPrice);
-    const allResistance = analyses.flatMap(a => a.resistance).filter(r => r > currentPrice);
-    
-    const nearestSupport = Math.max(...allSupport.filter(s => s > 0));
-    const nearestResistance = Math.min(...allResistance.filter(r => r < Infinity));
-    
-    if (nearestSupport > 0 && nearestResistance < Infinity) {
+    const allSupport = analyses.flatMap(a => a.support).filter(s => s > 0 && s < currentPrice);
+    const allResistance = analyses.flatMap(a => a.resistance).filter(r => r > 0 && r > currentPrice);
+
+    const nearestSupport = allSupport.length > 0 ? Math.max(...allSupport) : null;
+    const nearestResistance = allResistance.length > 0 ? Math.min(...allResistance) : null;
+
+    if (nearestSupport !== null && nearestResistance !== null && nearestResistance > nearestSupport) {
       return (nearestResistance - nearestSupport) / currentPrice;
     }
-    
+
     return 0.05; // Default spread
   }
   
@@ -1182,8 +1198,8 @@ export class EnhancedMultiTimeframeAnalyzer {
     
     // Dynamic stop loss and take profit based on volatility
     const volatilityMultiplier = 1 + volatility * 0.5;
-    const baseStopDistance = price * 0.02 * volatilityMultiplier; // 2% base, adjusted for volatility
-    const baseTakeDistance = price * 0.04 * volatilityMultiplier; // 4% base, adjusted for volatility
+    const baseStopDistance = price * (this.config.stopLossBase) * volatilityMultiplier; // configurable base
+    const baseTakeDistance = price * (this.config.takeProfitBase) * volatilityMultiplier; // configurable base
     
     if (signalType === 'BUY') {
       // Stop loss: nearest significant support or volatility-based

@@ -22,15 +22,15 @@ router.get('/predictions', async (_req: Request, res: Response) => {
     const defaultSymbols = ALL_TRACKED_ASSETS.map(a => `${a.symbol}/USDT`);
     console.log(`[ML Signals] Fetching data for ${defaultSymbols.length} symbols`);
     
-    const recentFrames: MarketFrame[] = [];
+    // Batch fetch frames for all symbols to avoid N+1
+    const framesMap = (storage.getMarketFramesForSymbols
+      ? await storage.getMarketFramesForSymbols(defaultSymbols, 200)
+      : await Promise.all(defaultSymbols.map(async (sym: string) => ({ [sym]: await storage.getMarketFrames(sym, 200) })))) as Record<string, MarketFrame[]>;
 
+    const recentFrames: MarketFrame[] = [];
     for (const symbol of defaultSymbols) {
-      try {
-        const frames = await storage.getMarketFrames(symbol, 200);
-        recentFrames.push(...frames);
-      } catch (e) {
-        console.warn(`[ML Signals] Could not fetch frames for ${symbol}:`, (e as any).message);
-      }
+      const f = framesMap[symbol] || [];
+      if (f && f.length) recentFrames.push(...f);
     }
 
     console.log(`[ML Signals] Total frames fetched: ${recentFrames.length}`);
@@ -86,7 +86,7 @@ router.get('/predictions', async (_req: Request, res: Response) => {
 
       predictions.push({
         symbol,
-        type: mlPrediction.direction.prediction === 'bullish' || mlPrediction.direction.prediction === 'BULLISH' ? 'BUY' : 'SELL',
+        type: mlPrediction.direction.prediction.toLowerCase() === 'bullish' ? 'BUY' : 'SELL',
         direction: mlPrediction.direction.prediction.toUpperCase(),
         confidence: mlPrediction.direction.confidence,
         probability: mlPrediction.direction.probability,
@@ -95,7 +95,7 @@ router.get('/predictions', async (_req: Request, res: Response) => {
         price: mlPrediction.price.predicted,
         priceHigh: mlPrediction.price.high,
         priceLow: mlPrediction.price.low,
-        percentChange: mlPrediction.price.percentChange || (currentPrice > 0 ? ((mlPrediction.price.predicted - currentPrice) / currentPrice * 100) : 0),
+        percentChange: (mlPrediction.price as any).changePercent || (currentPrice > 0 ? ((mlPrediction.price.predicted - currentPrice) / currentPrice * 100) : 0),
 
         // Volatility
         volatility: mlPrediction.volatility.predicted,
@@ -129,7 +129,7 @@ router.get('/predictions', async (_req: Request, res: Response) => {
 
         reasoning: [
           `${mlPrediction.direction.prediction.toUpperCase()} signal with ${(mlPrediction.direction.confidence * 100).toFixed(1)}% confidence`,
-          `Expected price change: ${(mlPrediction.price.percentChange || 0) > 0 ? '+' : ''}${(mlPrediction.price.percentChange || 0).toFixed(2)}%`,
+          `Expected price change: ${(((mlPrediction.price as any).changePercent || 0) > 0 ? '+' : '')}${(((mlPrediction.price as any).changePercent || 0).toFixed(2))}%`,
           `Predicted price: $${mlPrediction.price.predicted.toFixed(2)} (Range: $${mlPrediction.price.low.toFixed(2)} - $${mlPrediction.price.high.toFixed(2)})`,
           `Volatility: ${mlPrediction.volatility.level.toUpperCase()}`,
           `Recommended hold: ${mlPrediction.holdingPeriod.days} days (${mlPrediction.holdingPeriod.hours}h) - ${mlPrediction.holdingPeriod.reason}`,
@@ -324,17 +324,16 @@ router.get('/status', async (_req: Request, res: Response) => {
       };
     }
 
-    // Get market data from a few symbols
+    // Get market data from a few symbols (batch to avoid N+1)
     const defaultSymbols = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT'];
+    const framesMap = (storage.getMarketFramesForSymbols
+      ? await storage.getMarketFramesForSymbols(defaultSymbols, 30)
+      : await Promise.all(defaultSymbols.map(async (sym: string) => ({ [sym]: await storage.getMarketFrames(sym, 30) })))) as Record<string, MarketFrame[]>;
+
     const recentFrames: MarketFrame[] = [];
-    
     for (const symbol of defaultSymbols) {
-      try {
-        const frames = await storage.getMarketFrames(symbol, 30);
-        recentFrames.push(...frames);
-      } catch (e) {
-        console.warn(`[ML Signals] Could not get frames for ${symbol}:`, (e as any).message);
-      }
+      const f = framesMap[symbol] || [];
+      if (f && f.length) recentFrames.push(...f);
     }
 
     // Calculate feature coverage

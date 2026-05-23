@@ -1,8 +1,8 @@
 import { AlertCircle, ArrowLeft } from "lucide-react";
-import { useLocation } from "wouter";
+import { useNavigate } from 'react-router-dom';
 
 export default function NotFound() {
-  const [, setLocation] = useLocation();
+  const navigate = useNavigate();
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950">

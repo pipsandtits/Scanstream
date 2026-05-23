@@ -6,7 +6,6 @@
  */
 
 import React, { useEffect, useRef, useState } from 'react';
-import * as d3 from 'd3';
 import { Card } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Activity, TrendingUp, TrendingDown, Wind } from 'lucide-react';
@@ -50,12 +49,23 @@ export default function FlowFieldVisualizer({
 }: FlowFieldVisualizerProps) {
   const svgRef = useRef<SVGSVGElement>(null);
   const [hoveredVector, setHoveredVector] = useState<FlowFieldVector | null>(null);
+  const [d3Module, setD3Module] = useState<any>(null);
 
   useEffect(() => {
     if (!svgRef.current || !data || data.forceVectors.length === 0) return;
 
-    // Clear previous visualization
-    d3.select(svgRef.current).selectAll('*').remove();
+    let cancelled = false;
+    (async () => {
+      let d3 = d3Module;
+      if (!d3) {
+        const imported = await import('d3');
+        if (cancelled) return;
+        d3 = imported;
+        setD3Module(imported);
+      }
+
+      // Clear previous visualization
+      d3.select(svgRef.current).selectAll('*').remove();
 
     const margin = { top: 40, right: 40, bottom: 60, left: 60 };
     const innerWidth = width - margin.left - margin.right;
@@ -234,7 +244,12 @@ export default function FlowFieldVisualizer({
       .attr('font-weight', 'bold')
       .text(`${symbol} Flow Field`);
 
-  }, [data, width, height, symbol]);
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [data, width, height, symbol, d3Module]);
 
   // Turbulence color
   const turbulenceColor = {

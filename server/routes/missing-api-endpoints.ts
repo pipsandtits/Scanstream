@@ -1,4 +1,10 @@
 import express, { Router, Request, Response } from 'express';
+import { apiRegistry } from '../services/api-registry';
+import { AgentArena } from '../services/rpg-agents/AgentArena';
+import { priceCache } from '../../src/core/PriceCache';
+import { getGatewayServices } from './gateway';
+import { storage } from '../storage';
+import { MLSignalEnhancer } from '../ml-engine';
 
 /**
  * Missing API endpoints that frontend expects
@@ -7,205 +13,187 @@ import express, { Router, Request, Response } from 'express';
 const router = Router();
 
 // GET /api/agents - List of all active agents
-router.get('/agents', (req: Request, res: Response) => {
+let _globalArena: AgentArena | null = null;
+async function getGlobalArena(): Promise<AgentArena> {
+  if (_globalArena) return _globalArena;
+  _globalArena = new AgentArena();
+  return _globalArena;
+}
+
+router.get('/agents', async (req: Request, res: Response) => {
   try {
-    res.json({
-      agents: [
-        {
-          id: 'discovery-agent',
-          name: 'Discovery Agent',
-          status: 'active',
-          performance: 0.65,
-          signals_generated: 1247,
-          win_rate: 0.58
-        },
-        {
-          id: 'arbitrage-agent',
-          name: 'Arbitrage Agent',
-          status: 'active',
-          performance: 0.72,
-          signals_generated: 892,
-          win_rate: 0.71
-        },
-        {
-          id: 'portfolio-agent',
-          name: 'Portfolio Agent',
-          status: 'active',
-          performance: 0.68,
-          signals_generated: 654,
-          win_rate: 0.64
-        },
-        {
-          id: 'rpg-commander',
-          name: 'RPG Commander',
-          status: 'active',
-          performance: 0.75,
-          signals_generated: 523,
-          win_rate: 0.76
-        },
-        {
-          id: 'ml-ensemble',
-          name: 'ML Ensemble',
-          status: 'active',
-          performance: 0.70,
-          signals_generated: 1156,
-          win_rate: 0.68
+    const arena = await getGlobalArena();
+    const agents = arena.getAllAgents ? arena.getAllAgents().map((a: any) => (a.getStatus ? a.getStatus() : a)) : [];
+    res.json({ agents, timestamp: new Date().toISOString() });
+  } catch (error: any) {
+    console.warn('[Missing API] Failed to fetch real agents, falling back to empty list', error);
+    res.status(500).json({ error: error?.message || 'Failed to fetch agents' });
+  }
+});
+
+try {
+  apiRegistry.registerEndpoint({ method: 'GET', path: '/api/agents', category: 'AGENT', name: 'Agents List', description: 'List of active agents', version: '1.0.0', tags: ['agents'], isDeprecated: false, authentication: 'NONE', cacheable: true, cacheTTLSeconds: 5, isActive: true });
+} catch (e) { console.warn('[APIRegistry] Failed to register /api/agents', e); }
+
+// GET /api/market-sentiment - Current market sentiment (derived from storage & cache)
+router.get('/market-sentiment', async (req: Request, res: Response) => {
+  try {
+    // Prefer persisted market sentiment if available
+    try {
+      const persisted = await storage.getMarketSentiment();
+      // Compute a lightweight composite sentiment from cached prices for a few core symbols
+      const core = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT'];
+      const components: any = { technical: 0, fundamental: 0, on_chain: 0, social: 0 };
+      const major_signals: any[] = [];
+
+      for (const s of core) {
+        const candles = priceCache.getCandles(s, '1h');
+        let strength = 0;
+        let sentiment = 'neutral';
+        if (candles && candles.length >= 2) {
+          const last = candles[candles.length - 1][4];
+          const prev = candles[candles.length - 2][4];
+          const pct = prev > 0 ? ((last - prev) / prev) * 100 : 0;
+          strength = Math.min(1, Math.abs(pct) / 5);
+          sentiment = pct > 1 ? 'bullish' : pct < -1 ? 'bearish' : 'neutral';
+        } else {
+          const t = priceCache.get(s);
+          if (t && t.price) { strength = 0.01; }
         }
-      ],
-      timestamp: new Date().toISOString()
-    });
+        major_signals.push({ symbol: s, sentiment, strength });
+        components.technical += strength;
+      }
+      components.technical = +(components.technical / core.length).toFixed(2);
+
+      const overall_score = components.technical; // lightweight proxy
+      const overall = overall_score > 0.1 ? 'bullish' : overall_score < -0.1 ? 'bearish' : 'neutral';
+
+      return res.json({
+        overall_sentiment: overall,
+        sentiment_score: overall_score,
+        components,
+        major_signals,
+        source: 'storage+cache',
+        onChain: persisted,
+        timestamp: new Date().toISOString()
+      });
+    } catch (innerErr) {
+      console.warn('[Missing API] storage.getMarketSentiment failed:', innerErr);
+    }
+
+    // Fallback: very small computed signal using cache
+    res.json({ overall_sentiment: 'neutral', sentiment_score: 0, components: {}, major_signals: [], timestamp: new Date().toISOString() });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
 });
 
-// GET /api/market-sentiment - Current market sentiment
-router.get('/market-sentiment', (req: Request, res: Response) => {
-  try {
-    res.json({
-      overall_sentiment: 'bullish',
-      sentiment_score: 0.72,
-      components: {
-        technical: 0.70,
-        fundamental: 0.68,
-        on_chain: 0.75,
-        social: 0.65
-      },
-      major_signals: [
-        { symbol: 'BTC/USDT', sentiment: 'bullish', strength: 0.78 },
-        { symbol: 'ETH/USDT', sentiment: 'bullish', strength: 0.72 },
-        { symbol: 'SOL/USDT', sentiment: 'neutral', strength: 0.55 }
-      ],
-      timestamp: new Date().toISOString()
-    });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
-  }
-});
+try { apiRegistry.registerEndpoint({ method: 'GET', path: '/api/market-sentiment', category: 'ANALYTICS', name: 'Market Sentiment', description: 'Current market sentiment (storage+cache)', version: '1.0.0', tags: ['sentiment'], isDeprecated: false, authentication: 'NONE', cacheable: true, cacheTTLSeconds: 30, isActive: true }); } catch (e) { console.warn('[APIRegistry] Failed to register /api/market-sentiment', e); }
 
 // GET /api/portfolio-summary - Current portfolio summary
-router.get('/portfolio-summary', (req: Request, res: Response) => {
+router.get('/portfolio-summary', async (req: Request, res: Response) => {
   try {
-    res.json({
-      total_value: 125000,
-      daily_change: 2450,
-      daily_change_percent: 1.98,
-      positions: [
-        { symbol: 'BTC/USDT', quantity: 0.5, entry_price: 42000, current_price: 43500, pnl: 750 },
-        { symbol: 'ETH/USDT', quantity: 5, entry_price: 2200, current_price: 2280, pnl: 400 },
-        { symbol: 'SOL/USDT', quantity: 50, entry_price: 140, current_price: 145, pnl: 250 }
-      ],
-      allocation: {
-        BTC: 0.50,
-        ETH: 0.30,
-        SOL: 0.15,
-        USDT: 0.05
-      },
+    const summary = await storage.getPortfolioSummary();
+    return res.json({
+      total_value: summary.totalValue ?? summary.totalValue,
+      available_cash: summary.availableCash ?? summary.availableCash,
+      invested: summary.invested ?? summary.invested,
+      day_change: summary.dayChange ?? summary.dayChange,
+      day_change_percent: summary.dayChangePercent ?? summary.dayChangePercent,
       timestamp: new Date().toISOString()
     });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
 });
+
+try { apiRegistry.registerEndpoint({ method: 'GET', path: '/api/portfolio-summary', category: 'TRADING', name: 'Portfolio Summary', description: 'Current portfolio summary (storage-backed)', version: '1.0.0', tags: ['portfolio'], isDeprecated: false, authentication: 'NONE', cacheable: true, cacheTTLSeconds: 15, isActive: true }); } catch (e) { console.warn('[APIRegistry] Failed to register /api/portfolio-summary', e); }
 
 // GET /api/exchange/status - Exchange connectivity status
 router.get('/exchange/status', (req: Request, res: Response) => {
   try {
-    res.json({
-      status: 'healthy',
-      exchanges: {
-        binance: { status: 'connected', latency_ms: 45 },
-        kucoinfutures: { status: 'connected', latency_ms: 78 },
-        okx: { status: 'connected', latency_ms: 65 },
-        bybit: { status: 'connected', latency_ms: 52 },
-        kraken: { status: 'connected', latency_ms: 89 },
-        coinbase: { status: 'connected', latency_ms: 123 }
-      },
-      data_freshness_ms: 1250,
-      timestamp: new Date().toISOString()
-    });
+    const { aggregator, cacheManager, rateLimiter } = getGatewayServices();
+    const exchanges: any = {};
+
+    if (aggregator) {
+      const health = aggregator.getHealthStatus();
+      Object.entries(health).forEach(([k, v]: any) => {
+        exchanges[k] = { status: v.healthy ? 'connected' : 'disconnected', latency_ms: v.latency || 0 };
+      });
+    }
+
+    const cacheStats = cacheManager ? cacheManager.getStats() : null;
+    const rateStats = rateLimiter ? {
+      binance: rateLimiter.getStats('binance'),
+      coinbase: rateLimiter.getStats('coinbase'),
+      kraken: rateLimiter.getStats('kraken'),
+      okx: rateLimiter.getStats('okx'),
+      kucoin: rateLimiter.getStats('kucoin')
+    } : {};
+
+    res.json({ status: 'ok', exchanges, rateLimits: rateStats, cache: cacheStats, timestamp: new Date().toISOString() });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
 });
 
+try { apiRegistry.registerEndpoint({ method: 'GET', path: '/api/exchange/status', category: 'CORE', name: 'Exchange Status', description: 'Exchange connectivity and latency status', version: '1.0.0', tags: ['exchange'], isDeprecated: false, authentication: 'NONE', cacheable: true, cacheTTLSeconds: 5, isActive: true }); } catch (e) { console.warn('[APIRegistry] Failed to register /api/exchange/status', e); }
+
 // GET /api/ml/insights - ML model insights and predictions
-router.get('/ml/insights', (req: Request, res: Response) => {
+router.get('/ml/insights', async (req: Request, res: Response) => {
   try {
-    res.json({
-      model_ensemble: {
-        lstm: { confidence: 0.76, signal: 'BUY' },
-        transformer: { confidence: 0.72, signal: 'BUY' },
-        consensus: { confidence: 0.74, signal: 'BUY' }
-      },
-      next_price_prediction: {
-        symbol: 'BTC/USDT',
-        predicted_price: 44200,
-        confidence_interval: [43800, 44600],
-        probability_up: 0.68,
-        probability_down: 0.32
-      },
-      feature_importance: {
-        rsi: 0.18,
-        macd: 0.15,
-        volume: 0.12,
-        volatility: 0.10
-      },
-      timestamp: new Date().toISOString()
-    });
+    const ml = new MLSignalEnhancer();
+    let insights: Record<string, number> = {};
+    try {
+      insights = ml.getModelInsights();
+    } catch (e) {
+      console.warn('[Missing API] ML insights unavailable:', e);
+      insights = {};
+    }
+
+    // Provide a minimal next price prediction using cached price if available
+    const symbol = (req.query.symbol as string) || 'BTC/USDT';
+    const cached = priceCache.get(symbol);
+    const prediction = cached ? { symbol, predicted_price: cached.price, confidence_interval: [cached.price, cached.price], probability_up: 0.5, probability_down: 0.5 } : null;
+
+    res.json({ model_ensemble: insights, next_price_prediction: prediction, feature_importance: insights, timestamp: new Date().toISOString(), dataSource: cached ? 'cache' : 'none' });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
 });
+
+try { apiRegistry.registerEndpoint({ method: 'GET', path: '/api/ml/insights', category: 'ANALYTICS', name: 'ML Insights', description: 'ML ensemble insights (cache+ml-enhancer)', version: '1.0.0', tags: ['ml','insights'], isDeprecated: false, authentication: 'NONE', cacheable: true, cacheTTLSeconds: 30, isActive: true }); } catch (e) { console.warn('[APIRegistry] Failed to register /api/ml/insights', e); }
 
 // GET /api/gateway/price/:base/:quote - Price endpoint (base route for multiple pairs)
 router.get('/gateway/price/:base/:quote', (req: Request, res: Response) => {
   const { base, quote } = req.params;
   try {
-    res.json({
-      symbol: `${base}/${quote}`,
-      price: 43500,
-      bid: 43490,
-      ask: 43510,
-      volume_24h: 28500000000,
-      change_24h_percent: 2.15,
-      timestamp: new Date().toISOString()
-    });
+    const pair = `${base.toUpperCase()}/${quote.toUpperCase()}`;
+    const cached = priceCache.get(pair) || priceCache.get(pair.replace('/USDT','/USD'));
+    if (cached) {
+      return res.json({ symbol: pair, price: cached.price || cached.last || null, source: cached.exchange || cached.source || 'cache', timestamp: new Date().toISOString() });
+    }
+
+    // Fallback to a 404 rather than a mocked price
+    return res.status(404).json({ error: 'Price not available in cache' });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
 });
 
+try { apiRegistry.registerEndpoint({ method: 'GET', path: '/api/gateway/price/:base/:quote', category: 'CORE', name: 'Gateway Price', description: 'Gateway price for base/quote (cache-backed)', version: '1.0.0', tags: ['gateway','price'], isDeprecated: false, authentication: 'NONE', cacheable: true, cacheTTLSeconds: 5, isActive: true }); } catch (e) { console.warn('[APIRegistry] Failed to register /api/gateway/price/:base/:quote', e); }
+
 // GET /api/orders - Current open orders
-router.get('/orders', (req: Request, res: Response) => {
+router.get('/orders', async (req: Request, res: Response) => {
   try {
-    res.json({
-      open_orders: [
-        {
-          id: 'order-001',
-          symbol: 'BTC/USDT',
-          side: 'buy',
-          price: 42800,
-          quantity: 0.1,
-          status: 'pending',
-          created_at: new Date().toISOString()
-        },
-        {
-          id: 'order-002',
-          symbol: 'ETH/USDT',
-          side: 'sell',
-          price: 2350,
-          quantity: 2,
-          status: 'pending',
-          created_at: new Date().toISOString()
-        }
-      ],
-      total_orders: 2,
-      timestamp: new Date().toISOString()
-    });
+    const trades = await storage.getTrades('OPEN');
+    const open = trades.map(t => ({ id: t.id, symbol: t.symbol, side: t.side, price: t.entryPrice || t.price || null, quantity: t.quantity, status: t.status, created_at: t.entryTime || t.createdAt || new Date().toISOString() }));
+    res.json({ open_orders: open, total_orders: open.length, timestamp: new Date().toISOString() });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
 });
+
+try { apiRegistry.registerEndpoint({ method: 'GET', path: '/api/orders', category: 'TRADING', name: 'Open Orders', description: 'List of open orders (storage-backed)', version: '1.0.0', tags: ['orders'], isDeprecated: false, authentication: 'NONE', cacheable: false, isActive: true }); } catch (e) { console.warn('[APIRegistry] Failed to register /api/orders', e); }
 
 export default router;

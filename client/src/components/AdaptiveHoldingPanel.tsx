@@ -5,9 +5,10 @@
  * Allows users to measure impact of regime-aware and flow-based holding strategies
  */
 
-import React, { useState } from 'react';
+import React, { useState, lazy } from 'react';
 import { TrendingUp, Clock, Users, Zap, CheckCircle2, AlertCircle, BarChart3, PieChart } from 'lucide-react';
-import { BarChart, Bar, LineChart, Line, PieChart as RechartsPI, Pie, Cell, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
+import { BarChart, Bar, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
+const AdaptiveHoldingCharts = lazy(() => import('@/components/AdaptiveHoldingCharts'));
 
 interface AdaptiveHoldingPanelProps {
   onMeasure?: (config: any) => void;
@@ -311,23 +312,9 @@ export const AdaptiveHoldingPanel: React.FC<AdaptiveHoldingPanelProps> = ({ onMe
                 Holding Period Distribution
               </h4>
               <div className="bg-white border border-gray-200 rounded-lg p-4">
-                <ResponsiveContainer width="100%" height={300}>
-                  <BarChart
-                    data={[
-                      { name: '1-2 days', value: report.holdingProfile.regime1DayCount },
-                      { name: '3 days', value: report.holdingProfile.regime3DayCount },
-                      { name: '5-9 days', value: report.holdingProfile.regime7DayCount },
-                      { name: '10-16 days', value: report.holdingProfile.regime14DayCount },
-                      { name: '17-21 days', value: report.holdingProfile.regime21DayCount },
-                    ]}
-                  >
-                    <CartesianGrid strokeDasharray="3 3" />
-                    <XAxis dataKey="name" />
-                    <YAxis />
-                    <Tooltip />
-                    <Bar dataKey="value" fill="#3b82f6" />
-                  </BarChart>
-                </ResponsiveContainer>
+                <Suspense fallback={<div className="h-72 flex items-center justify-center">Loading chart…</div>}>
+                  <AdaptiveHoldingCharts holdingProfile={report.holdingProfile} />
+                </Suspense>
               </div>
             </div>
           )}
@@ -339,31 +326,7 @@ export const AdaptiveHoldingPanel: React.FC<AdaptiveHoldingPanelProps> = ({ onMe
                 <PieChart size={18} />
                 Market Volatility Profile
               </h4>
-              <div className="bg-white border border-gray-200 rounded-lg p-4">
-                <ResponsiveContainer width="100%" height={250}>
-                  <RechartsPI>
-                    <Pie
-                      data={[
-                        { name: 'Low Vol', value: report.holdingProfile.volatilityProfile.low },
-                        { name: 'Medium Vol', value: report.holdingProfile.volatilityProfile.medium },
-                        { name: 'High Vol', value: report.holdingProfile.volatilityProfile.high },
-                      ]}
-                      cx="50%"
-                      cy="50%"
-                      labelLine={false}
-                      label={({ name, value }) => `${name}: ${value}%`}
-                      outerRadius={80}
-                      fill="#8884d8"
-                      dataKey="value"
-                    >
-                      <Cell fill="#3b82f6" />
-                      <Cell fill="#10b981" />
-                      <Cell fill="#f59e0b" />
-                    </Pie>
-                    <Tooltip />
-                  </RechartsPI>
-                </ResponsiveContainer>
-              </div>
+              {/* Volatility Pie moved into AdaptiveHoldingCharts */}
             </div>
           )}
 

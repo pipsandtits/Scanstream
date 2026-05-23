@@ -41,10 +41,17 @@ export interface Candle {
   low: number;
   close: number;
   volume: number;
+  /** Timeframe of this candle in seconds (e.g. 60, 300). Helpful for clarity */
+  timeframeSeconds?: number;
+  /** If true, this candle was synthesized (healed/backfilled or interpolated) */
+  isSynthetic?: boolean;
   
   // Metadata
   isFinal: boolean;     // Is this candle closed? (incomplete = unfinalized)
-  source?: string;      // 'ccxt', 'oanda', 'mt5', etc
+  /** Indicates whether this candle is from REST backfill or live WS */
+  source?: 'historical' | 'live';
+  /** Origin adapter / integration name (e.g. 'ccxt', 'oanda', 'mt5') */
+  origin?: string;
   venue?: string;       // 'binance', 'oanda', 'mt5', etc
   
   // Optional raw data from source
@@ -54,8 +61,14 @@ export interface Candle {
   symbol?: string;
   timestamp?: Date;
   id?: string;
+  /** Legacy: price (prefer `close`) */
   price?: unknown;
+  /** Prefer a typed indicators object where possible; kept generic for backward compatibility */
   indicators?: unknown;
+  /** Optional sequence id for traceability across pipelines */
+  sequenceId?: string;
+  /** Optional batch id when candles are produced/processed in groups */
+  batchId?: string;
   orderFlow?: unknown;
   marketMicrostructure?: unknown;
 }
@@ -279,9 +292,22 @@ export interface WorldTick {
    */
   mode: OperationMode;
   
+  /** The underlying candle for this tick */
   candle: Candle;
-  isFinal: boolean;                     // Candle closed
-  source: string;                       // 'ccxt', 'oanda', etc
+  /** Is this candle closed/final */
+  isFinal: boolean;
+  /** Source of the candle (adapter) */
+  source: string;
+  /** Venue (exchange) name */
+  venue?: string;
+  /** Optional reference to stored MarketFrame id for provenance */
+  marketFrameId?: string;
+  /** If true, this tick was synthesized (gap fill/healed) */
+  isSynthetic?: boolean;
+  /** Optional sequence id for traceability */
+  sequenceId?: string;
+  /** Optional batch id for grouped processing */
+  batchId?: string;
   /**
    * Optional regime context attached by the RegimeService / StrategyIntegrationEngine
    * This is a sanitized view intended for agents and UIs (no account/order data)

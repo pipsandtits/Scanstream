@@ -28,6 +28,11 @@ import {
   ClusterThresholdAction,
   PositionSizingAction,
 } from './rl-position-agent';
+import { rlGuard } from './rl-guard';
+import { recordEpisode, recordDomainReward, metricsEnabled as rlMetricsEnabled } from './rl-metrics';
+
+// Module defaults for functions that run outside class instance
+const DEFAULT_SLIPPAGE_MULTIPLIER = 50;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -148,7 +153,10 @@ function rewardEntryTiming(
 ): number {
   // Slippage cost: how far fill was from signal price
   const slippagePct = Math.abs(open.entryFillPrice - open.signalPrice) / open.signalPrice;
-  const slippagePenalty = slippagePct * -50; // 0.2% slip = -10 pts
+  // scale slippage relative to ATR if available to avoid punishing micro-slippage on low-vol assets
+  const relativeAtr = open.atr && open.entryFillPrice > 0 ? (open.atr / open.entryFillPrice) : 0;
+  const atrScale = relativeAtr > 0 ? Math.max(0.001, relativeAtr) : 0.001;
+  const slippagePenalty = -Math.min(20, (slippagePct / atrScale) * DEFAULT_SLIPPAGE_MULTIPLIER);
 
   // Did the trade win?
   const pnlBonus = close.pnlPercent > 0 ? +2 : -2;
@@ -221,12 +229,13 @@ function rewardClusterThreshold(
 
 // ─── Next-state builder ───────────────────────────────────────────────────────
 
-function buildNextState(entryState: RLState, close: TradeCloseRecord): RLState {
+function buildNextState(entryState: RLState, close: TradeCloseRecord, currentMarketState?: Partial<RLState>): RLState {
   // Approximate the state after this trade completes
   // Drawdown shifts based on outcome
+  const base = currentMarketState ? { ...entryState, ...currentMarketState } : { ...entryState };
   const newDrawdown = close.pnlPercent < 0
-    ? Math.min(1, entryState.drawdown + Math.abs(close.pnlPercent) / 100)
-    : Math.max(0, entryState.drawdown - close.pnlPercent / 200);
+    ? Math.min(1, base.drawdown + Math.abs(close.pnlPercent) / 100)
+    : Math.max(0, base.drawdown - close.pnlPercent / 200);
 
   // Loss streak estimate
   const currentLossStreak = entryState.lossStreak ?? 0;
@@ -235,13 +244,13 @@ function buildNextState(entryState: RLState, close: TradeCloseRecord): RLState {
     : 0;
 
   // Equity slope shifts
-  const currentSlope = entryState.equitySlope ?? 0;
+  const currentSlope = base.equitySlope ?? 0;
   const newSlope = Math.max(-1, Math.min(1,
     currentSlope * 0.8 + (close.pnlPercent > 0 ? 0.2 : -0.2)
   ));
 
   return {
-    ...entryState,
+    ...base,
     drawdown:    newDrawdown,
     lossStreak:  newLossStreak,
     equitySlope: newSlope,
@@ -255,8 +264,28 @@ function buildNextState(entryState: RLState, close: TradeCloseRecord): RLState {
 export class TradeLifecycleManager {
   private pendingTrades: Map<string, PendingTrade> = new Map();
   private totalClosedTrades = 0;
+  private cleanupTimer?: NodeJS.Timeout;
+  private readonly config = {
+    rewardClamp: [-10, 10] as const,
+    replayFrequency: 32,
+    maxPendingAgeMs: 7 * 24 * 60 * 60 * 1000, // 7 days
+    slippageMultiplier: 50,
+    slippageUseAtr: true,
+    cleanupIntervalMs: 60 * 60 * 1000, // hourly cleanup
+  } as const;
 
-  constructor(private readonly rlAgent: RLPositionAgent) {}
+  constructor(private readonly rlAgent: RLPositionAgent, opts?: { logger?: any; config?: Partial<any> }) {
+    if (opts?.logger) {
+      // replace console logging if provided
+      (this as any).logger = opts.logger;
+    }
+    if (opts?.config) {
+      Object.assign((this as any).config, opts.config);
+    }
+
+    // Periodic cleanup to prevent memory leaks from stuck trades
+    this.cleanupTimer = setInterval(() => this.cleanupPendingTrades(), this.config.cleanupIntervalMs);
+  }
 
   // ── 1. Called when a trade opens ─────────────────────────────────────────
 
@@ -323,7 +352,15 @@ export class TradeLifecycleManager {
     }
 
     const { open } = trade;
-    const nextState = buildNextState(open.entryState, record);
+    // validate record
+    if (typeof record.exitPrice !== 'number' || typeof record.pnlPercent !== 'number') {
+      console.error(`[RLFeedback] onTradeClose: invalid close record for ${tradeId}`, record);
+      // still evict to prevent leaks
+      this.pendingTrades.delete(tradeId);
+      return;
+    }
+
+    const nextState = buildNextState(open.entryState, record, undefined);
 
     // Derive maxPossiblePnlPct from live MFE if not provided
     if (!record.maxPossiblePnlPct) {
@@ -335,50 +372,36 @@ export class TradeLifecycleManager {
 
     // ── Update each domain ──────────────────────────────────────────────────
 
-    this.updateDomain(
-      'POSITION_SIZING',
-      open.entryState,
-      nextState,
-      open.domainActions.positionSizing,
-      rewardPositionSizing(open, record, open.domainActions.positionSizing),
-      record
-    );
+    // Compute per-domain rewards so we can emit metrics alongside learning updates
+    const r_positionSizing = rewardPositionSizing(open, record, open.domainActions.positionSizing);
+    const r_entryTiming = rewardEntryTiming(open, record);
+    const r_sourceWeighting = rewardSourceWeighting(open, record);
+    const r_exitSequencing = rewardExitSequencing(record);
+    const r_clusterThreshold = rewardClusterThreshold(open, record);
 
-    this.updateDomain(
-      'ENTRY_TIMING',
-      open.entryState,
-      nextState,
-      open.domainActions.entryTiming,
-      rewardEntryTiming(open, record),
-      record
-    );
+    this.updateDomain('POSITION_SIZING', open.entryState, nextState, open.domainActions.positionSizing, r_positionSizing, record);
+    this.updateDomain('ENTRY_TIMING', open.entryState, nextState, open.domainActions.entryTiming, r_entryTiming, record);
+    this.updateDomain('SOURCE_WEIGHTING', open.entryState, nextState, open.domainActions.sourceWeights, r_sourceWeighting, record);
+    this.updateDomain('EXIT_SEQUENCING', open.entryState, nextState, open.domainActions.exitSequence, r_exitSequencing, record);
+    this.updateDomain('CLUSTER_THRESHOLD', open.entryState, nextState, open.domainActions.clusterThreshold, r_clusterThreshold, record);
 
-    this.updateDomain(
-      'SOURCE_WEIGHTING',
-      open.entryState,
-      nextState,
-      open.domainActions.sourceWeights,
-      rewardSourceWeighting(open, record),
-      record
-    );
-
-    this.updateDomain(
-      'EXIT_SEQUENCING',
-      open.entryState,
-      nextState,
-      open.domainActions.exitSequence,
-      rewardExitSequencing(record),
-      record
-    );
-
-    this.updateDomain(
-      'CLUSTER_THRESHOLD',
-      open.entryState,
-      nextState,
-      open.domainActions.clusterThreshold,
-      rewardClusterThreshold(open, record),
-      record
-    );
+    // Emit RL metrics (best-effort)
+    try {
+      const totalDomainReward = r_positionSizing + r_entryTiming + r_sourceWeighting + r_exitSequencing + r_clusterThreshold;
+      // Record reward into RL guard so it can decide whether learning should be frozen
+      try { rlGuard.recordReward(totalDomainReward, { regime: nextState.regime, drawdown: nextState.drawdown }); } catch (e) { /* ignore */ }
+      const outcome = record.pnlPercent > 0 ? 'win' : (record.pnlPercent < 0 ? 'loss' : 'neutral');
+      if (rlMetricsEnabled()) {
+        recordDomainReward('POSITION_SIZING', r_positionSizing);
+        recordDomainReward('ENTRY_TIMING', r_entryTiming);
+        recordDomainReward('SOURCE_WEIGHTING', r_sourceWeighting);
+        recordDomainReward('EXIT_SEQUENCING', r_exitSequencing);
+        recordDomainReward('CLUSTER_THRESHOLD', r_clusterThreshold);
+        recordEpisode(outcome as 'win' | 'loss' | 'neutral', totalDomainReward, record.holdingBars || 0);
+      }
+    } catch (metricErr) {
+      // swallow metric errors
+    }
 
     this.totalClosedTrades++;
 
@@ -393,8 +416,21 @@ export class TradeLifecycleManager {
     this.logOutcome(open, record);
 
     // Evict from memory once feedback is done
-    this.pendingTrades.delete(tradeId);
+      this.pendingTrades.delete(tradeId);
   }
+
+    /** Periodic cleanup to evict very old pending trades to avoid memory leaks */
+    private cleanupPendingTrades(): void {
+      const now = Date.now();
+      const maxAge = (this as any).config?.maxPendingAgeMs ?? 7 * 24 * 60 * 60 * 1000;
+      for (const [id, t] of this.pendingTrades.entries()) {
+        const age = now - (t.open.entryTime ?? now);
+        if (age > maxAge) {
+          console.warn(`[RLFeedback] Evicting aged pending trade ${id} (ageMs=${age})`);
+          this.pendingTrades.delete(id);
+        }
+      }
+    }
 
   // ── Internal helpers ──────────────────────────────────────────────────────
 
@@ -410,11 +446,36 @@ export class TradeLifecycleManager {
       domain,
       state:        entryState,
       nextState,
-      action:       entryState as any,  // legacy field, not used in learnDomain
+      action:       domainAction as any,  // the actual domain action (legacy field kept for compat)
       domainAction,
-      reward:       Math.max(-10, Math.min(10, reward)), // hard clamp
+      reward:       Math.max(this.config.rewardClamp[0], Math.min(this.config.rewardClamp[1], reward)), // clamp by config
       done:         true,
     };
+
+    // Check RL guard before updating Q-tables. If frozen, skip learning and emit a diagnostic event.
+    try {
+      if (rlGuard && rlGuard.isFrozen && rlGuard.isFrozen()) {
+        // best-effort event emission for observability
+        try {
+          const phase5 = require('./services/phase5-event-bridge').phase5EventBridge;
+          if (phase5 && typeof phase5.emit === 'function') {
+            phase5.emit('rl.guard.blocked', { domain, reward: exp.reward, samples: (rlGuard as any).sampleCount, variance: (rlGuard as any).variance, timestamp: Date.now() });
+          }
+          try {
+            const db = require('./db-storage').db;
+            if (db && typeof db.createDecisionEvent === 'function') {
+              db.createDecisionEvent({ correlationId: null, phase: 'RL_GUARD_BLOCKED', domain, actionPayload: domainAction, metrics: { reward: exp.reward, samples: (rlGuard as any).sampleCount, variance: (rlGuard as any).variance }, timestamp: Date.now() });
+            }
+          } catch (_) {}
+        } catch (_) {
+          // ignore
+        }
+        // Skip learning
+        return;
+      }
+    } catch (guardErr) {
+      // if guard check fails, proceed with learning to avoid silent loss
+    }
 
     this.rlAgent.learnDomain(exp);
   }

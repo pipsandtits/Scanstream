@@ -1,4 +1,9 @@
-import { PrismaClient } from '@prisma/client';
+import pkg from '@prisma/client';
+const { PrismaClient } = pkg as any;
+import type { PrismaClient as PrismaClientType } from '@prisma/client';
+import fs from 'fs';
+import fsp from 'fs/promises';
+import path from 'path';
 import { type IStorage } from './storage';
 import { type MarketFrame, type Signal, type Trade, type Strategy, type BacktestResult, type InsertMarketFrame, type InsertSignal, type InsertTrade, type InsertStrategy, type InsertBacktestResult, type MarketSentiment, type PortfolioSummary, type ModelMetric, type InsertModelMetric } from "@shared/schema";
 import { v4 as uuidv4 } from 'uuid';
@@ -13,12 +18,24 @@ class SimpleFallbackStorage implements IStorage {
   private backtestResults: Map<string, BacktestResult> = new Map();
   private modelMetrics: Map<string, ModelMetric> = new Map();
   private auditLogs: Map<string, any> = new Map();
+  private provenances: Map<string, any> = new Map();
+  private decisionEvents: Map<string, any> = new Map();
+  private decisionSnapshots: Map<string, any> = new Map();
+  private orderAudits: Map<string, any> = new Map();
 
   async getMarketFrames(symbol: string, limit = 200): Promise<MarketFrame[]> {
     return Array.from(this.marketFrames.values())
       .filter(frame => frame.symbol === symbol)
       .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
       .slice(0, limit);
+  }
+
+  async getMarketFramesForSymbols(symbols: string[], limit = 200): Promise<Record<string, MarketFrame[]>> {
+    const out: Record<string, MarketFrame[]> = {};
+    for (const s of symbols) {
+      out[s] = await this.getMarketFrames(s, limit);
+    }
+    return out;
   }
 
   async createMarketFrame(frameData: InsertMarketFrame): Promise<MarketFrame> {
@@ -49,7 +66,7 @@ class SimpleFallbackStorage implements IStorage {
 
   async createSignal(signalData: InsertSignal): Promise<Signal> {
     const id = randomUUID();
-    const signal: Signal = {
+    const signal = {
       ...signalData,
       id,
       timestamp: new Date(),
@@ -62,7 +79,8 @@ class SimpleFallbackStorage implements IStorage {
       timeframeAlignment: signalData.timeframeAlignment ?? 0,
       agreementScore: signalData.agreementScore ?? 50,
       positionSize: signalData.positionSize ?? null,
-    };
+      correlationId: (signalData as any).correlationId ?? uuidv4(),
+    } as any as Signal;
     this.signals.set(id, signal);
     return signal;
   }
@@ -191,6 +209,65 @@ class SimpleFallbackStorage implements IStorage {
       this.auditLogs.set(id, record);
     }
 
+    async createTradeProvenance(record: any): Promise<void> {
+      const id = randomUUID();
+      const ts = record.createdAt ? new Date(record.createdAt) : new Date();
+      const rec = { id, ...record, createdAt: ts };
+      this.provenances.set(id, rec);
+    }
+
+    async createDecisionEvent(record: any): Promise<void> {
+      const id = randomUUID();
+      const ts = record.timestamp ? new Date(record.timestamp) : new Date();
+      const rec = { id, ...record, timestamp: ts };
+      this.decisionEvents.set(id, rec);
+    }
+
+    async createDecisionSnapshot(record: any): Promise<void> {
+      const id = randomUUID();
+      const ts = record.timestamp ? new Date(record.timestamp) : new Date();
+      const rec = { id, ...record, timestamp: ts };
+      this.decisionSnapshots.set(id, rec);
+    }
+
+    async getRecentDecisionSnapshots(limit = 200): Promise<any[]> {
+      let items = Array.from(this.decisionSnapshots.values()) as any[];
+      items = items.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()).slice(0, limit);
+      return items;
+    }
+
+    async createOrderAudit(record: any): Promise<any> {
+      const id = randomUUID();
+      const ts = record.createdAt ? new Date(record.createdAt) : new Date();
+      const rec = { id, ...record, createdAt: ts, updatedAt: ts };
+      this.orderAudits.set(id, rec);
+      return rec;
+    }
+
+    async updateOrderAudit(orderIdOrId: string, updates: any): Promise<void> {
+      // find by id or orderId
+      let foundKey: string | null = null;
+      for (const [k, v] of this.orderAudits.entries()) {
+        if (k === orderIdOrId || v.orderId === orderIdOrId) { foundKey = k; break; }
+      }
+      if (!foundKey) throw new Error(`OrderAudit not found for ${orderIdOrId}`);
+      const existing = this.orderAudits.get(foundKey) || {};
+      const updated = { ...existing, ...updates, updatedAt: new Date() };
+      this.orderAudits.set(foundKey, updated);
+    }
+
+    async getTraceChain(traceId: string): Promise<any> {
+      const signals = Array.from(this.signals.values()).filter((s: any) => (s.correlationId === traceId || s.traceId === traceId));
+      const decisionEvents = Array.from(this.decisionEvents.values()).filter((d: any) => (d.correlationId === traceId || d.traceId === traceId));
+      const decisionSnapshots = Array.from(this.decisionSnapshots.values()).filter((d: any) => (d.traceId === traceId || d.correlationId === traceId));
+      const orderAudits = Array.from(this.orderAudits.values()).filter((o: any) => (o.traceId === traceId || o.orderId === traceId));
+      const provenances = Array.from(this.provenances.values()).filter((p: any) => (p.correlationId === traceId || p.traceId === traceId));
+      const frameIds = new Set<string>();
+      for (const d of [...decisionEvents, ...decisionSnapshots]) { if (d.marketFrameId) frameIds.add(d.marketFrameId); }
+      const marketFrames = Array.from(this.marketFrames.values()).filter((f: any) => frameIds.has(f.id));
+      return { traceId, signals, decisionEvents, decisionSnapshots, orderAudits, provenances, marketFrames };
+    }
+
     async getAuditLogs(entityType?: string, entityId?: string, limit = 100): Promise<import("@shared/schema").InsertAuditLog[]> {
       let items = Array.from(this.auditLogs.values()) as any[];
       if (entityType) items = items.filter(i => i.entityType === entityType);
@@ -229,26 +306,127 @@ class SimpleFallbackStorage implements IStorage {
     items = items.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()).slice(0, limit);
     return items;
   }
-
   async getStaleModelMetrics(): Promise<ModelMetric[]> {
     return Array.from(this.modelMetrics.values()).filter(m => m.isStale === true).sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
   }
 }
 
 export class DbStorage implements IStorage {
-  private prisma: PrismaClient;
+  private prisma: PrismaClientType | any;
   private fallback: IStorage = new SimpleFallbackStorage();
   private isConnected: boolean = false;
+  // Use Phase5 event bridge to broadcast fallback events for observability
+  private eventBridge: any;
 
   constructor() {
     this.prisma = new PrismaClient({
       errorFormat: 'minimal',
     });
+    try { this.eventBridge = require('./services/phase5-event-bridge').phase5EventBridge; } catch (e) { this.eventBridge = null; }
     this.testConnection();
+    // Ensure fallback queue directory exists
+    try {
+      const dir = path.join(process.cwd(), 'data');
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    } catch (e) {}
+    // Periodic flush if reconnected
+    setInterval(() => {
+      if (this.isConnected) {
+        this.flushFallbackQueue().catch(() => {});
+      }
+    }, 15_000);
+  }
+
+  private getFallbackQueuePath(): string {
+    return path.join(process.cwd(), 'data', 'db-fallback-queue.jsonl');
+  }
+
+  private async enqueueFallback(record: any): Promise<void> {
+    try {
+      const p = this.getFallbackQueuePath();
+      const line = JSON.stringify(record) + '\n';
+      await fsp.appendFile(p, line, { encoding: 'utf8' });
+    } catch (e) {
+      // last resort: write to in-memory fallback
+      try { this.fallback.createAuditLog({ action: 'fallback_enqueue_failed', entityType: 'system', entityId: null, details: { err: String(e) } } as any); } catch (_) {}
+    }
+  }
+
+  private async flushFallbackQueue(): Promise<void> {
+    try {
+      const p = this.getFallbackQueuePath();
+      if (!fs.existsSync(p)) return;
+      const content = await fsp.readFile(p, { encoding: 'utf8' });
+      if (!content) return;
+      const lines = content.split('\n').filter(Boolean);
+      for (const l of lines) {
+        try {
+          const rec = JSON.parse(l);
+          // Prefer explicit 'type' routing
+          if (rec && rec.type === 'decisionSnapshot') {
+            try { await (this.prisma as any).decisionSnapshot.create({ data: rec }); } catch (_) { try { await this.getFallback().createDecisionSnapshot(rec); } catch (_) {} }
+            continue;
+          }
+          if (rec && rec.type === 'orderAudit') {
+            try { await (this.prisma as any).orderAudit.create({ data: rec }); } catch (_) { try { await this.getFallback().createOrderAudit(rec); } catch (_) {} }
+            continue;
+          }
+          if (rec && rec.type === 'orderAudit.update') {
+            try {
+              // attempt update by id first, then by orderId
+              try { await (this.prisma as any).orderAudit.update({ where: { id: rec.id }, data: rec.updates }); } catch (_) {
+                const found = await (this.prisma as any).orderAudit.findFirst({ where: { orderId: rec.id } });
+                if (!found) throw new Error('OrderAudit not found');
+                await (this.prisma as any).orderAudit.update({ where: { id: found.id }, data: rec.updates });
+              }
+            } catch (_) {
+              try { await this.getFallback().updateOrderAudit(rec.id, rec.updates); } catch (_) { await this.getFallback().createAuditLog({ action: 'orderAudit.update.failed', entityType: 'orderAudit', entityId: rec.id, details: rec.updates } as any); }
+            }
+            continue;
+          }
+
+          // decision events (legacy) or arbitrary event with phase
+          if ((rec && rec.phase && rec.phase.toString().toUpperCase().includes('DECISION')) || rec.entityType === 'decisionEvent' || rec.type === 'decisionEvent') {
+            try { await (this.prisma as any).decisionEvent.create({ data: rec }); } catch (_) { try { await this.getFallback().createDecisionEvent(rec); } catch (_) {} }
+            continue;
+          }
+
+          if (rec && rec.tradeId) {
+            try { await (this.prisma as any).tradeProvenance.create({ data: rec }); } catch (_) { try { await this.getFallback().createTradeProvenance(rec); } catch (_) {} }
+            continue;
+          }
+
+          // default fallback to audit log
+          try { await (this.prisma as any).auditLogs.create({ data: rec }); } catch (_) { try { await this.getFallback().createAuditLog(rec); } catch (_) {} }
+        } catch (e) {
+          // skip malformed
+          continue;
+        }
+      }
+      // Truncate file after successful flush
+      await fsp.writeFile(p, '', { encoding: 'utf8' });
+    } catch (e) {
+      // ignore flush errors
+    }
   }
 
   private getFallback(): IStorage {
     return this.fallback;
+  }
+
+  private reportFallback(reason: string, context?: any) {
+    try {
+      console.warn('[DbStorage] FALLBACK ->', reason, context || {});
+      if (this.eventBridge && typeof this.eventBridge.emit === 'function') {
+        this.eventBridge.emit('dataSource.fallback', {
+          reason,
+          context: context || {},
+          timestamp: Date.now(),
+        });
+      }
+    } catch (e) {
+      // ignore reporting failures
+    }
   }
 
   private async testConnection(): Promise<void> {
@@ -259,11 +437,13 @@ export class DbStorage implements IStorage {
     } catch (error) {
       this.isConnected = false;
       console.warn('[DbStorage] Cannot connect to PostgreSQL, using in-memory fallback:', (error as any).message);
+      this.reportFallback('db_connection_failed', { message: (error as any).message });
     }
   }
 
   async getMarketFrames(symbol: string, limit = 200): Promise<MarketFrame[]> {
     if (!this.isConnected) {
+      this.reportFallback('using_in_memory', { method: 'getMarketFrames', symbol, limit });
       return this.getFallback().getMarketFrames(symbol, limit);
     }
     try {
@@ -278,8 +458,61 @@ export class DbStorage implements IStorage {
     }
   }
 
+  async getMarketFramesForSymbols(symbols: string[], limit = 200): Promise<Record<string, MarketFrame[]>> {
+    // Batch fetch latest `limit` frames per symbol using a single query with
+    // row_number partitioning to avoid N+1 queries.
+    if (!this.isConnected) {
+      const out: Record<string, MarketFrame[]> = {};
+      for (const s of symbols) {
+        out[s] = await this.getFallback().getMarketFrames(s, limit);
+      }
+      return out;
+    }
+
+    if (!symbols || symbols.length === 0) return {};
+
+    // Build VALUES list for parameterized query
+    const vals: string[] = [];
+    const params: any[] = [];
+    let idx = 1;
+    for (const s of symbols) {
+      vals.push(`($${idx})`);
+      params.push(s);
+      idx += 1;
+    }
+
+    const sql = `
+      WITH pairs(symbol) AS (VALUES ${vals.join(',')}),
+      ranked AS (
+        SELECT mf.*, ROW_NUMBER() OVER (PARTITION BY mf.symbol ORDER BY mf.timestamp DESC) rn
+        FROM "MarketFrame" mf
+        JOIN pairs p ON p.symbol = mf.symbol
+      )
+      SELECT * FROM ranked WHERE rn <= ${limit};
+    `;
+
+    try {
+      const rows: any[] = await (this.prisma as any).$queryRawUnsafe(sql, ...params);
+      const grouped: Record<string, MarketFrame[]> = {};
+      for (const r of rows) {
+        const sym = r.symbol;
+        if (!grouped[sym]) grouped[sym] = [];
+        grouped[sym].push(r as MarketFrame);
+      }
+      return grouped;
+    } catch (err) {
+      console.warn('[DbStorage] Batch market frames query failed, falling back:', err);
+      const out: Record<string, MarketFrame[]> = {};
+      for (const s of symbols) {
+        out[s] = await this.getFallback().getMarketFrames(s, limit);
+      }
+      return out;
+    }
+  }
+
   async createMarketFrame(frame: InsertMarketFrame): Promise<MarketFrame> {
     if (!this.isConnected) {
+      this.reportFallback('using_in_memory', { method: 'createMarketFrame', symbol: frame.symbol });
       return this.getFallback().createMarketFrame(frame);
     }
     try {
@@ -311,6 +544,7 @@ export class DbStorage implements IStorage {
 
   async getLatestMarketFrame(symbol: string): Promise<MarketFrame | undefined> {
     if (!this.isConnected) {
+      this.reportFallback('using_in_memory', { method: 'getLatestMarketFrame', symbol });
       return this.getFallback().getLatestMarketFrame(symbol);
     }
     try {
@@ -327,6 +561,7 @@ export class DbStorage implements IStorage {
 
   async getSignals(symbol?: string, limit = 100): Promise<Signal[]> {
     if (!this.isConnected) {
+      this.reportFallback('using_in_memory', { method: 'getSignals', symbol, limit });
       return this.getFallback().getSignals(symbol, limit);
     }
     try {
@@ -352,6 +587,7 @@ export class DbStorage implements IStorage {
 
   async createSignal(signalData: InsertSignal): Promise<Signal> {
     if (!this.isConnected) {
+      this.reportFallback('using_in_memory', { method: 'createSignal', symbol: signalData.symbol });
       return this.getFallback().createSignal(signalData);
     }
     try {
@@ -376,6 +612,7 @@ export class DbStorage implements IStorage {
         agreementScore: signalData.agreementScore ?? 50,
         positionSize: signalData.positionSize ?? null,
         entryPrice: (signalData as any).entryPrice ?? signalData.price ?? 0, // Use provided entryPrice, fallback to price, or default to 0
+        correlationId: (signalData as any).correlationId ?? uuidv4(),
       };
       
       const result = await this.prisma.signal.create({ data: safeSignal });
@@ -415,6 +652,156 @@ export class DbStorage implements IStorage {
     } catch (error) {
       console.warn('[DbStorage] Query failed, using fallback:', (error as any).message);
       return this.getFallback().getLatestSignals(limit);
+    }
+  }
+
+  async createDecisionEvent(record: any): Promise<void> {
+    const safe = {
+      correlationId: record.correlationId ?? null,
+      phase: record.phase ?? 'UNKNOWN',
+      domain: record.domain ?? null,
+      actionPayload: record.actionPayload ?? {},
+      metrics: record.metrics ?? {},
+      agentIds: record.agentIds ?? [],
+      moduleVersion: record.moduleVersion ?? null,
+      marketFrameId: record.marketFrameId ?? null,
+      timestamp: record.timestamp ? new Date(record.timestamp) : new Date(),
+      extra: record.extra ?? {}
+    } as any;
+
+    if (!this.isConnected) {
+      // enqueue to durable on-disk queue
+      try { await this.enqueueFallback({ type: 'decisionEvent', ...safe }); } catch (_) { try { await this.getFallback().createDecisionEvent(record); } catch (_) {} }
+      return;
+    }
+
+    try {
+      try {
+        await (this.prisma as any).decisionEvent.create({ data: safe });
+      } catch (err) {
+        // Prisma model may not exist or write failed; enqueue for later durability
+        try { await this.enqueueFallback({ type: 'decisionEvent', ...safe }); } catch (e) { await this.createAuditLog({ entityType: 'decisionEvent', entityId: safe.correlationId, userId: null, details: safe, severity: 'INFO', timestamp: safe.timestamp } as any); }
+      }
+    } catch (error) {
+      console.warn('[DbStorage] Write failed for decision event, using fallback:', (error as any).message);
+      try { await this.enqueueFallback({ type: 'decisionEvent', ...safe }); } catch (_) { try { await this.getFallback().createDecisionEvent(record); } catch (_) {} }
+    }
+  }
+
+  async createDecisionSnapshot(record: any): Promise<void> {
+    const safe = {
+      traceId: record.traceId ?? record.correlationId ?? null,
+      timestamp: record.timestamp ? new Date(record.timestamp) : new Date(),
+      agents: record.agents ?? [],
+      contributions: record.contributions ?? {},
+      policyOutputs: record.policyOutputs ?? {},
+      positionSizing: record.positionSizing ?? {},
+      marketFrameId: record.marketFrameId ?? null,
+      worldTime: record.worldTime ? new Date(record.worldTime) : null,
+      moduleVersion: record.moduleVersion ?? null,
+      extra: record.extra ?? {}
+    } as any;
+
+    if (!this.isConnected) {
+      try { await this.enqueueFallback({ type: 'decisionSnapshot', ...safe }); } catch (_) { return this.getFallback().createDecisionEvent(record); }
+      return;
+    }
+    try {
+      try { await (this.prisma as any).decisionSnapshot.create({ data: safe }); } catch (err) { await this.enqueueFallback({ type: 'decisionSnapshot', ...safe }); }
+    } catch (error) {
+      console.warn('[DbStorage] Write failed for decision snapshot, enqueuing fallback:', (error as any).message);
+      try { await this.enqueueFallback({ type: 'decisionSnapshot', ...safe }); } catch (_) { return this.getFallback().createDecisionEvent(record); }
+    }
+  }
+
+  // Return recent decision snapshots for aggregation/analysis
+  async getRecentDecisionSnapshots(limit = 200): Promise<any[]> {
+    if (!this.isConnected) {
+      // fallback to in-memory snapshots
+      try { return await (this.getFallback() as any).getRecentDecisionSnapshots?.(limit) || []; } catch (_) { return []; }
+    }
+    try {
+      const snaps = await (this.prisma as any).decisionSnapshot.findMany({ orderBy: { timestamp: 'desc' }, take: limit });
+      return snaps;
+    } catch (error) {
+      console.warn('[DbStorage] getRecentDecisionSnapshots failed, using fallback:', (error as any).message);
+      try { return await (this.getFallback() as any).getRecentDecisionSnapshots?.(limit) || []; } catch (_) { return []; }
+    }
+  }
+
+  async createOrderAudit(record: any): Promise<any> {
+    const safe = {
+      traceId: record.traceId ?? record.correlationId ?? null,
+      orderId: record.orderId ?? null,
+      exchange: record.exchange ?? null,
+      venue: record.venue ?? null,
+      params: record.params ?? {},
+      preBalances: record.preBalances ?? {},
+      reservationAmounts: record.reservationAmounts ?? {},
+      fills: record.fills ?? [],
+      simulatedSlippage: record.simulatedSlippage ?? null,
+      realSlippage: record.realSlippage ?? null,
+      realizedPnl: record.realizedPnl ?? null,
+      createdAt: record.createdAt ? new Date(record.createdAt) : undefined,
+    } as any;
+
+    if (!this.isConnected) {
+      try { await this.enqueueFallback({ type: 'orderAudit', ...safe }); } catch (_) { return this.getFallback().createTradeProvenance(record); }
+      return this.getFallback().createTradeProvenance(record);
+    }
+
+    try {
+      const res = await (this.prisma as any).orderAudit.create({ data: safe });
+      return res;
+    } catch (error) {
+      console.warn('[DbStorage] Write failed for order audit, enqueuing fallback:', (error as any).message);
+      try { await this.enqueueFallback({ type: 'orderAudit', ...safe }); } catch (_) { return this.getFallback().createTradeProvenance(record); }
+      return this.getFallback().createTradeProvenance(record);
+    }
+  }
+
+  async updateOrderAudit(orderIdOrId: string, updates: any): Promise<void> {
+    if (!this.isConnected) {
+      return this.getFallback().createAuditLog({ action: 'updateOrderAudit_fallback', entityType: 'orderAudit', entityId: orderIdOrId, details: updates } as any);
+    }
+    try {
+      // try by primary id
+      try {
+        await (this.prisma as any).orderAudit.update({ where: { id: orderIdOrId }, data: updates });
+        return;
+      } catch (_) {
+        // fallback: find by orderId
+        const found = await (this.prisma as any).orderAudit.findFirst({ where: { orderId: orderIdOrId } });
+        if (!found) throw new Error('OrderAudit not found');
+        await (this.prisma as any).orderAudit.update({ where: { id: found.id }, data: updates });
+        return;
+      }
+    } catch (error) {
+      console.warn('[DbStorage] Update failed for order audit, enqueuing fallback:', (error as any).message);
+      try { await this.enqueueFallback({ type: 'orderAudit.update', id: orderIdOrId, updates }); } catch (_) { await this.getFallback().createAuditLog({ action: 'orderAudit.update.failed', entityType: 'orderAudit', entityId: orderIdOrId, details: updates } as any); }
+    }
+  }
+
+  async getTraceChain(traceId: string): Promise<any> {
+    if (!this.isConnected) {
+      return this.getFallback().getTraceChain(traceId);
+    }
+    try {
+      const signals = await this.prisma.signal.findMany({ where: { correlationId: traceId } });
+      const decisionEvents = await (this.prisma as any).decisionEvent.findMany({ where: { correlationId: traceId } });
+      const decisionSnapshots = await (this.prisma as any).decisionSnapshot.findMany({ where: { traceId } });
+      const orderAudits = await (this.prisma as any).orderAudit.findMany({ where: { traceId } });
+      const provenances = await (this.prisma as any).tradeProvenance.findMany({ where: { correlationId: traceId } });
+
+      // gather market frames referenced
+      const frameIds = new Set<string>();
+      for (const d of [...decisionEvents, ...decisionSnapshots]) { if (d.marketFrameId) frameIds.add(d.marketFrameId); }
+      const marketFrames = frameIds.size > 0 ? await this.prisma.marketFrame.findMany({ where: { id: { in: Array.from(frameIds) } } }) : [];
+
+      return { traceId, signals, decisionEvents, decisionSnapshots, orderAudits, provenances, marketFrames };
+    } catch (error) {
+      console.warn('[DbStorage] getTraceChain failed, using fallback:', (error as any).message);
+      return this.getFallback().getTraceChain(traceId);
     }
   }
 
@@ -718,23 +1105,17 @@ export class DbStorage implements IStorage {
 
   // Audit log persistence (DB-backed when available)
   async createAuditLog(log: import("@shared/schema").InsertAuditLog): Promise<void> {
+    const ts = (log as any).timestamp ? new Date((log as any).timestamp) : new Date();
+    const safe = { action: log.action, entityType: log.entityType, entityId: log.entityId, userId: (log as any).userId ?? null, details: (log as any).details ?? {}, severity: (log as any).severity ?? 'INFO', timestamp: ts } as any;
     if (!this.isConnected) {
-      return this.getFallback().createAuditLog(log);
+      try { await this.enqueueFallback({ type: 'auditLog', ...safe }); } catch (_) { return this.getFallback().createAuditLog(log); }
+      return;
     }
     try {
-      const ts = (log as any).timestamp ? new Date((log as any).timestamp) : new Date();
-      await (this.prisma as any).auditLogs.create({ data: {
-        action: log.action,
-        entityType: log.entityType,
-        entityId: log.entityId,
-        userId: (log as any).userId ?? null,
-        details: (log as any).details ?? {},
-        severity: (log as any).severity ?? 'INFO',
-        timestamp: ts,
-      }} as any);
+      await (this.prisma as any).auditLogs.create({ data: safe } as any);
     } catch (error) {
-      console.warn('[DbStorage] Write failed for audit log, using fallback:', (error as any).message);
-      return this.getFallback().createAuditLog(log);
+      console.warn('[DbStorage] Write failed for audit log, enqueuing fallback:', (error as any).message);
+      try { await this.enqueueFallback({ type: 'auditLog', ...safe }); } catch (_) { return this.getFallback().createAuditLog(log); }
     }
   }
 
@@ -751,6 +1132,33 @@ export class DbStorage implements IStorage {
     } catch (error) {
       console.warn('[DbStorage] Query failed for audit logs, using fallback:', (error as any).message);
       return this.getFallback().getAuditLogs(entityType, entityId, limit);
+    }
+  }
+
+  async createTradeProvenance(record: any): Promise<void> {
+    const safe = {
+      tradeId: record.tradeId ?? null,
+      engine: record.engine ?? 'LIVE',
+      symbol: record.symbol ?? (record.execution?.symbol ?? ''),
+      correlationId: record.correlationId ?? (record.signal?.correlationId ?? null),
+      signalId: record.signalId ?? null,
+      signal: record.signal ?? {},
+      consensus: record.consensus ?? {},
+      agentDecision: record.agentDecision ?? {},
+      execution: record.execution ?? {},
+      extra: record.extra ?? {},
+      createdAt: record.createdAt ? new Date(record.createdAt) : undefined,
+    } as any;
+
+    if (!this.isConnected) {
+      try { await this.enqueueFallback({ type: 'tradeProvenance', ...safe }); } catch (_) { return this.getFallback().createTradeProvenance(record); }
+      return;
+    }
+    try {
+      await (this.prisma as any).tradeProvenance.create({ data: safe });
+    } catch (error) {
+      console.warn('[DbStorage] Write failed for trade provenance, enqueuing fallback:', (error as any).message);
+      try { await this.enqueueFallback({ type: 'tradeProvenance', ...safe }); } catch (_) { return this.getFallback().createTradeProvenance(record); }
     }
   }
 

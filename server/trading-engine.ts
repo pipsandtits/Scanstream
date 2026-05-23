@@ -1,8 +1,11 @@
 // Smart symbol mapper - learns which formats work per exchange
 import symbolMapper from './services/symbol-mapper';
+import { symbolManager } from './services/symbol-manager';
 
 // Normalize a symbol for the given exchange, so only valid symbols are used
 function normalizeSymbol(symbol: string, exchange: ccxt.Exchange): string {
+  // Use SymbolManager to canonicalize input before per-exchange mapping
+  symbol = symbolManager.canonicalize(symbol);
   const exchangeName = exchange.id || 'unknown';
 
   // Check if exchange and symbols are available
@@ -121,6 +124,7 @@ import { storage } from './storage'; // Note: Ensure storage module is implement
 import { getRegimeService } from './services/regime-service';
 import type { RegimeContext as ArmRegimeContext } from './arm-evaluator';
 import { SignalClassifier } from './signal-classifier'; // Note: Ensure SignalClassifier module is implemented
+import { priceCache } from '../src/core/PriceCache';
 
 /**
  * Shared types and interfaces for the trading system.
@@ -620,9 +624,17 @@ class SignalEngine {
     toxicity: number;
   }>>();
   private readonly microHistoryWindow = 20; // Keep 20 bars of history
+  private readonly microstructureTtlMs = 5 * 60 * 1000; // remove symbols not updated for 5 minutes
+  private microCleanupTimer: NodeJS.Timeout | null = null;
+  private microLastSeen = new Map<string, number>();
 
   constructor(config: TradingConfig) {
     this.config = config;
+    try {
+      this.microCleanupTimer = setInterval(() => this.cleanupMicrostructure(), 60 * 1000);
+    } catch (err) {
+      // ignore
+    }
   }
 
   /**
@@ -719,6 +731,38 @@ class SignalEngine {
     // Keep only last 20 bars
     if (history.length > this.microHistoryWindow) {
       history.shift();
+    }
+    // track last seen timestamp for cleanup
+    this.microLastSeen.set(symbol, Date.now());
+  }
+
+  private cleanupMicrostructure(): void {
+    try {
+      const now = Date.now();
+      for (const [symbol, lastSeen] of this.microLastSeen.entries()) {
+        if (now - lastSeen > this.microstructureTtlMs) {
+          this.microstructureHistory.delete(symbol);
+          this.microLastSeen.delete(symbol);
+        }
+      }
+      // additional safety: cap total symbols tracked
+      const MAX_SYMBOLS = 2000;
+      if (this.microstructureHistory.size > MAX_SYMBOLS) {
+        const keys = Array.from(this.microstructureHistory.keys()).slice(0, this.microstructureHistory.size - MAX_SYMBOLS);
+        for (const k of keys) {
+          this.microstructureHistory.delete(k);
+          this.microLastSeen.delete(k);
+        }
+      }
+    } catch (err) {
+      // non-fatal
+    }
+  }
+
+  dispose(): void {
+    if (this.microCleanupTimer) {
+      clearInterval(this.microCleanupTimer);
+      this.microCleanupTimer = null;
     }
   }
 
@@ -1115,16 +1159,29 @@ class ExchangeDataFeed {
         return null;
       }
 
-      // Extract bid/ask volumes - cast to number to handle CCXT's Num type
-      const bidVolume = orderbook.bids.reduce((sum: number, bid: any) => {
+      // Extract bid/ask token volumes (units) and notional volumes (price * qty)
+      const bidTokenVolume = orderbook.bids.reduce((sum: number, bid: any) => {
         const qty = typeof bid[1] === 'number' ? bid[1] : parseFloat(bid[1]) || 0;
         return sum + qty;
       }, 0);
-      const askVolume = orderbook.asks.reduce((sum: number, ask: any) => {
+      const askTokenVolume = orderbook.asks.reduce((sum: number, ask: any) => {
         const qty = typeof ask[1] === 'number' ? ask[1] : parseFloat(ask[1]) || 0;
         return sum + qty;
       }, 0);
-      const totalDepth = bidVolume + askVolume;
+
+      const bidNotional = orderbook.bids.reduce((sum: number, bid: any) => {
+        const price = typeof bid[0] === 'number' ? bid[0] : parseFloat(String(bid[0])) || 0;
+        const qty = typeof bid[1] === 'number' ? bid[1] : parseFloat(bid[1]) || 0;
+        return sum + price * qty;
+      }, 0);
+      const askNotional = orderbook.asks.reduce((sum: number, ask: any) => {
+        const price = typeof ask[0] === 'number' ? ask[0] : parseFloat(String(ask[0])) || 0;
+        const qty = typeof ask[1] === 'number' ? ask[1] : parseFloat(ask[1]) || 0;
+        return sum + price * qty;
+      }, 0);
+
+      // Total depth reported as notional (dollar) value across both sides
+      const totalDepth = bidNotional + askNotional;
 
       // Calculate spread
       let bestBid = 0;
@@ -1137,17 +1194,20 @@ class ExchangeDataFeed {
         const askPrice = orderbook.asks[0][0];
         bestAsk = typeof askPrice === 'number' ? askPrice : (parseFloat(String(askPrice)) || 0);
       }
-      const spread = bestAsk && bestBid ? bestAsk - bestBid : 0;
+      // Use relative spread (percentage) instead of absolute to avoid truncation
+      const spreadPct = (bestAsk > 0 && bestBid > 0) ? ((bestAsk - bestBid) / bestAsk) * 100 : 0;
 
-      // Calculate imbalance (0-1 scale, 0.5 = neutral)
-      const imbalance = totalDepth > 0 ? bidVolume / totalDepth : 0.5;
+      // Calculate imbalance on notional (dollar) basis (0-1, 0.5 = neutral)
+      const imbalance = totalDepth > 0 ? (bidNotional / totalDepth) : 0.5;
 
       return {
-        spread,
+        // `spread` is returned as percentage (e.g. 0.15 => 0.15%) for downstream readability
+        spread: spreadPct,
         depth: totalDepth,
         imbalance,
-        bidVolume,
-        askVolume
+        // Preserve token unit volumes for consumers that expect them
+        bidVolume: bidTokenVolume,
+        askVolume: askTokenVolume
       };
     } catch (error: any) {
       // Silently fail - orderbook is optional
@@ -1334,11 +1394,33 @@ class ExchangeDataFeed {
       
       console.log(`[FETCH] Fetching ${symbol} (normalized: ${normalizedSymbol}) from ${mainExchange} [${timeframe}/${limit}]`);
       
-      // Use rate-limited fetch to prevent throttler overflow
-      const ohlcv = await this.rateLimitedFetch(exchange, () => {
-        console.log(`[FETCH] Calling fetchOHLCV for ${normalizedSymbol}`);
-        return exchange.fetchOHLCV(normalizedSymbol, timeframe, undefined, limit);
-      });
+      // Prefer `priceCache` first (authoritative, avoids extra exchange loads)
+      let ohlcv: any[] = [];
+      try {
+        const cached = priceCache.getCandles(normalizedSymbol, timeframe) || priceCache.getCandles(symbol, timeframe);
+        if (cached && Array.isArray(cached) && cached.length > 0) {
+          console.log(`[FETCH] Using priceCache for ${normalizedSymbol || symbol} ${timeframe} (${cached.length} candles)`);
+          ohlcv = cached.slice(-limit);
+        } else {
+          // Try refreshing cache and re-reading
+          await priceCache.refreshCandles(normalizedSymbol || symbol, timeframe, limit);
+          const refreshed = priceCache.getCandles(normalizedSymbol, timeframe) || priceCache.getCandles(symbol, timeframe);
+          if (refreshed && refreshed.length > 0) {
+            console.log(`[FETCH] Refreshed priceCache for ${normalizedSymbol || symbol} ${timeframe} (${refreshed.length} candles)`);
+            ohlcv = refreshed.slice(-limit);
+          }
+        }
+      } catch (pcErr) {
+        console.debug('[FETCH] priceCache read/refresh failed:', (pcErr as any)?.message || pcErr);
+      }
+
+      // Fallback to exchange fetch if cache miss
+      if (!ohlcv || ohlcv.length === 0) {
+        ohlcv = await this.rateLimitedFetch(exchange, () => {
+          console.log(`[FETCH] Calling fetchOHLCV for ${normalizedSymbol}`);
+          return exchange.fetchOHLCV(normalizedSymbol, timeframe, undefined, limit);
+        });
+      }
       
       // Use latest candle instead of separate ticker fetch to reduce API calls
       // Ticker is expensive and OHLCV already gives us current price in last candle
@@ -1367,7 +1449,7 @@ class ExchangeDataFeed {
       
       if (microstructureData) {
         console.log(
-          `[Microstructure] ${symbol}: spread=${microstructureData.spread.toFixed(6)}, ` +
+          `[Microstructure] ${symbol}: spread=${microstructureData.spread.toFixed(2)}%, ` +
           `depth=${microstructureData.depth.toFixed(0)}, imbalance=${microstructureData.imbalance.toFixed(3)}`
         );
       }
@@ -1492,7 +1574,9 @@ class ExchangeDataFeed {
             close: (ff.price as any)?.close ?? ff.close ?? 0,
             volume: ff.volume ?? 0,
             isFinal: true,
-            source: 'ccxt',
+            // This data path originates from a REST/CCXT fetch inside the trading engine
+            source: 'historical',
+            origin: 'ccxt',
             venue: mainExchange
           };
         });

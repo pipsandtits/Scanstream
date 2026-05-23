@@ -1,7 +1,7 @@
 
 import { useState, useEffect } from 'react';
 import { ArrowLeft, Bell, BellOff, CheckCircle, XCircle, AlertTriangle, Settings, Trash2 } from 'lucide-react';
-import { useLocation } from 'wouter';
+import { useNavigate } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 
 interface Alert {
@@ -25,7 +25,7 @@ interface Thresholds {
 }
 
 export default function GatewayAlertsPage() {
-  const [, setLocation] = useLocation();
+  const navigate = useNavigate();
   const [filter, setFilter] = useState<'all' | 'unacknowledged'>('unacknowledged');
   const [severityFilter, setSeverityFilter] = useState<string>('');
   const [showSettings, setShowSettings] = useState(false);
@@ -41,14 +41,18 @@ export default function GatewayAlertsPage() {
   // Fetch alerts
   const { data: alertsData, isLoading } = useQuery({
     queryKey: ['gatewayAlerts', filter, severityFilter],
-    queryFn: async () => {
+    queryFn: async ({ signal }: any) => {
       const params = new URLSearchParams();
       if (filter === 'unacknowledged') params.append('acknowledged', 'false');
       if (severityFilter) params.append('severity', severityFilter);
-      
-      const res = await fetch(`/api/gateway/alerts?${params}`);
-      if (!res.ok) throw new Error('Failed to fetch alerts');
-      return res.json();
+      try {
+        const res = await fetch(`/api/gateway/alerts?${params}`, { signal });
+        if (!res.ok) throw new Error('Failed to fetch alerts');
+        return res.json();
+      } catch (err: any) {
+        if (err.name === 'AbortError') return null;
+        throw err;
+      }
     },
     refetchInterval: 5000
   });
@@ -58,9 +62,15 @@ export default function GatewayAlertsPage() {
   // Acknowledge mutation
   const acknowledgeMutation = useMutation({
     mutationFn: async (id: string) => {
-      const res = await fetch(`/api/gateway/alerts/${id}/acknowledge`, { method: 'POST' });
-      if (!res.ok) throw new Error('Failed to acknowledge');
-      return res.json();
+      const controller = new AbortController();
+      try {
+        const res = await fetch(`/api/gateway/alerts/${id}/acknowledge`, { method: 'POST', signal: controller.signal });
+        if (!res.ok) throw new Error('Failed to acknowledge');
+        return res.json();
+      } catch (err: any) {
+        if (err.name === 'AbortError') return null;
+        throw err;
+      }
     },
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['gatewayAlerts'] })
   });
@@ -68,9 +78,15 @@ export default function GatewayAlertsPage() {
   // Clear acknowledged mutation
   const clearMutation = useMutation({
     mutationFn: async () => {
-      const res = await fetch('/api/gateway/alerts/acknowledged', { method: 'DELETE' });
-      if (!res.ok) throw new Error('Failed to clear');
-      return res.json();
+      const controller = new AbortController();
+      try {
+        const res = await fetch('/api/gateway/alerts/acknowledged', { method: 'DELETE', signal: controller.signal });
+        if (!res.ok) throw new Error('Failed to clear');
+        return res.json();
+      } catch (err: any) {
+        if (err.name === 'AbortError') return null;
+        throw err;
+      }
     },
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['gatewayAlerts'] })
   });
@@ -78,13 +94,20 @@ export default function GatewayAlertsPage() {
   // Update thresholds mutation
   const updateThresholdsMutation = useMutation({
     mutationFn: async (newThresholds: Thresholds) => {
-      const res = await fetch('/api/gateway/alerts/thresholds', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(newThresholds)
-      });
-      if (!res.ok) throw new Error('Failed to update thresholds');
-      return res.json();
+      const controller = new AbortController();
+      try {
+        const res = await fetch('/api/gateway/alerts/thresholds', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(newThresholds),
+          signal: controller.signal
+        });
+        if (!res.ok) throw new Error('Failed to update thresholds');
+        return res.json();
+      } catch (err: any) {
+        if (err.name === 'AbortError') return null;
+        throw err;
+      }
     }
   });
 

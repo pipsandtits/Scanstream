@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { useLocation } from 'wouter';
+import { useNavigate } from 'react-router-dom';
 import { 
   Shield, Zap, Brain, TrendingUp, Award, Heart, Flame, Eye, BarChart3, Network, 
   Wind, AlertCircle, CheckCircle, RotateCcw, Maximize2, Volume2, Search, Filter, ChevronDown,
@@ -61,7 +61,7 @@ interface RosterStats {
 
 // Main Roster Page
 const AgentRoster: React.FC = () => {
-  const [, navigate] = useLocation();
+  const navigate = useNavigate();
   const [searchTerm, setSearchTerm] = useState('');
   const [sortBy, setSortBy] = useState<SortBy>('level');
   const [filterType, setFilterType] = useState<FilterType>('all');
@@ -74,8 +74,8 @@ const AgentRoster: React.FC = () => {
   // Fetch all agents
   const { data: agentsData, isLoading, error } = useQuery({
     queryKey: ['agents-all'],
-    queryFn: async () => {
-      const response = await fetch('/api/agents/all');
+    queryFn: async ({ signal }: any) => {
+      const response = await fetch('/api/agents/all', { signal });
       if (!response.ok) throw new Error('Failed to fetch agents');
       return response.json();
     },

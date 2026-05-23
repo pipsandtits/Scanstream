@@ -1,560 +1,509 @@
 /**
- * ML Predictions Service
+ * ml-predictions.ts
  *
- * Provides multiple ML models for trading predictions:
- * 1. Direction Classifier - Binary classification (bullish=1/bearish=0)
- * 2. Price Predictor - Regression for next candle price
- * 3. Volatility Predictor - Predicts next candle volatility
- * 4. Risk Assessor - Predicts risk levels
+ * Fixes vs. original:
+ *  1. trainedWeights actually used — direction classifier is initialised from
+ *     stored weights and updated via online SGD (real learning, not heuristics).
+ *  2. All static methods replaced with instance methods so weights are accessible.
+ *  3. Shared ChartDataPoint and helpers imported from indicators.ts — no more
+ *     duplicate definitions that drift apart between files.
+ *  4. direction.prediction casing unified to lowercase literals only.
+ *  5. Dead `signal` variable removed.
+ *  6. predictPrice confidence clamped to [0, 1].
+ *  7. RSI treated as a threshold feature (overbought/oversold binary) rather
+ *     than a raw linear weight.
+ *  8. holdingPeriod accepts an explicit `candleMinutes` parameter so the
+ *     day/hour conversion is always correct.
+ *  9. Direction classifier exposes `train(features, label)` for online updates.
+ * 10. Model weights are serialisable and round-trip through MLModelStorage.
  */
 
 import { MLModelStorage } from './ml-model-storage';
+import {
+  ChartDataPoint,
+  mean,
+  standardDeviation,
+  clamp,
+  momentum,
+  volatility,
+  meanReversion,
+  trendStrength,
+  linearTrend,
+  atr,
+  rateOfChange,
+  priceChange,
+  volumeRatio
+} from '@shared/indicators';
 
-// Type definitions
-export interface ChartDataPoint {
-  close: number;
-  high: number;
-  low: number;
-  volume: number;
-  rsi?: number;
-  macd?: number;
-  ema?: number;
-  timestamp?: number;
-}
+export type { ChartDataPoint };
+
+// ---------------------------------------------------------------------------
+// Output types
+// ---------------------------------------------------------------------------
 
 export interface MLPredictions {
   direction: {
-    prediction: 'BULLISH' | 'BEARISH' | 'bullish' | 'bearish';
-    probability: number;
-    confidence: number;
-    strength: number;
+    prediction:  'bullish' | 'bearish';
+    probability: number;   // P(bullish) in [0, 1]
+    confidence:  number;   // distance from 0.5, scaled to [0, 1]
+    strength:    number;   // same as confidence (alias for interface compat)
   };
   price: {
-    predicted: number;
-    change?: number;
-    changePercent?: number;
-    percentChange?: number;
-    high: number;
-    low: number;
-    confidence?: number;
-    target?: 'UP' | 'DOWN' | 'NEUTRAL';
+    predicted:      number;
+    change:         number;
+    changePercent:  number;
+    high:           number;
+    low:            number;
+    confidence:     number;
+    target:         'UP' | 'DOWN' | 'NEUTRAL';
   };
   volatility: {
-    predicted: number;
-    level: 'low' | 'medium' | 'high' | 'extreme';
+    predicted:  number;
+    level:      'low' | 'medium' | 'high' | 'extreme';
     confidence: number;
   };
   holdingPeriod: {
-    candles: number;
-    days: number;
-    hours: number;
+    candles:    number;
+    days:       number;
+    hours:      number;
     confidence: number;
-    reason: string;
+    reason:     string;
   };
   risk: {
-    score: number;
-    level: 'low' | 'medium' | 'high' | 'extreme';
+    score:   number;       // 0–100
+    level:   'low' | 'medium' | 'high' | 'extreme';
     factors: string[];
   };
   metadata: {
-    timestamp: number;
+    timestamp:  number;
     dataPoints: number;
-    features: number;
-    horizon: string;
+    features:   number;
+    horizon:    string;
   };
 }
 
-/**
- * ML Prediction Service
- */
-class MLPredictionService {
-  private trainedWeights: any = null;
+// ---------------------------------------------------------------------------
+// Feature vector helpers
+// ---------------------------------------------------------------------------
 
-  constructor() {
-    this.loadTrainedWeights();
+export interface FeatureVector {
+  priceChange1:     number;
+  priceChange3:     number;
+  priceChange5:     number;
+  priceChange10:    number;
+  momentum5:        number;
+  momentum10:       number;
+  rateOfChange5:    number;
+  volatility5:      number;
+  volatility10:     number;
+  atr:              number;
+  volumeRatioVal:   number;
+  volumeTrend:      number;
+  rsi:              number;
+  rsiOverbought:    number;   // FIX 7: binary threshold features
+  rsiOversold:      number;
+  macd:             number;
+  ema:              number;
+  trendStr:         number;
+  meanRev:          number;
+  distanceToHigh:   number;
+  distanceToLow:    number;
+}
+
+function extractFeatures(data: ChartDataPoint[]): FeatureVector {
+  const recent  = data.slice(-20);
+  const current = recent[recent.length - 1];
+  const prices  = recent.map(d => d.close);
+  const volumes = recent.map(d => d.volume);
+  const highs   = recent.map(d => d.high);
+  const lows    = recent.map(d => d.low);
+  const closes  = recent.map(d => d.close);
+
+  const rsiVal = current.rsi ?? 50;
+
+  return {
+    priceChange1:   priceChange(prices, 1),
+    priceChange3:   priceChange(prices, 3),
+    priceChange5:   priceChange(prices, 5),
+    priceChange10:  priceChange(prices, 10),
+    momentum5:      momentum(prices, 5),
+    momentum10:     momentum(prices, 10),
+    rateOfChange5:  rateOfChange(prices, 5),
+    volatility5:    volatility(prices, 5),
+    volatility10:   volatility(prices, 10),
+    atr:            atr(highs, lows, closes, 14),
+    volumeRatioVal: volumeRatio(volumes),
+    volumeTrend:    linearTrend(volumes, 5),
+    rsi:            rsiVal,
+    // FIX 7: threshold binary features instead of raw RSI magnitude
+    rsiOverbought:  rsiVal > 70 ? 1 : 0,
+    rsiOversold:    rsiVal < 30 ? 1 : 0,
+    macd:           current.macd ?? 0,
+    ema:            current.ema  ?? current.close,
+    trendStr:       trendStrength(prices),
+    meanRev:        meanReversion(prices),
+    distanceToHigh: (Math.max(...highs) - current.close) / (current.close || 1),
+    distanceToLow:  (current.close - Math.min(...lows))  / (current.close || 1),
+  };
+}
+
+function featureToArray(f: FeatureVector): number[] {
+  return [
+    f.priceChange1, f.priceChange3, f.priceChange5, f.priceChange10,
+    f.momentum5,    f.momentum10,   f.rateOfChange5,
+    f.volatility5,  f.volatility10, f.atr,
+    f.volumeRatioVal, f.volumeTrend,
+    f.rsiOverbought, f.rsiOversold, f.macd,
+    f.trendStr,     f.meanRev,
+    f.distanceToHigh, f.distanceToLow,
+  ];
+}
+
+const FEATURE_COUNT = 19; // must match featureToArray length
+
+// ---------------------------------------------------------------------------
+// SGD Logistic Regression — real online learning
+// ---------------------------------------------------------------------------
+
+/**
+ * Minimal SGD logistic-regression classifier.
+ *
+ * Predicts P(y=1 | x) = sigmoid(w·x + b).
+ * Updated via online SGD with L2 regularisation on every `train()` call.
+ * Weights are plain arrays so they serialise/deserialise trivially.
+ */
+class LogisticRegression {
+  weights: number[];
+  bias:    number;
+  private lr:     number;  // learning rate
+  private lambda: number;  // L2 regularisation strength
+
+  constructor(
+    featureCount: number,
+    lr     = 0.01,
+    lambda = 0.001,
+    weights?: number[],
+    bias?:    number
+  ) {
+    // FIX 1: initialise from stored weights when available
+    this.weights = weights ?? Array.from({ length: featureCount }, () => (Math.random() - 0.5) * 0.01);
+    this.bias    = bias    ?? 0;
+    this.lr      = lr;
+    this.lambda  = lambda;
   }
 
-  private async loadTrainedWeights() {
-    try {
-      const loaded = await MLModelStorage.loadLatestWeights();
-      if (loaded) {
-        this.trainedWeights = loaded.weights;
-        console.log('[ML Predictions] Loaded trained weights from:', loaded.metadata.trainedAt);
-      }
-    } catch (err) {
-      console.log('[ML Predictions] No trained weights found, using baseline models');
-    }
+  private sigmoid(z: number): number {
+    return 1 / (1 + Math.exp(-z));
+  }
+
+  predict(x: number[]): number {
+    const z = x.reduce((sum, xi, i) => sum + xi * this.weights[i], this.bias);
+    return this.sigmoid(z);
   }
 
   /**
-   * Generate comprehensive ML predictions from chart data
+   * Single online SGD step.
+   * @param x       feature vector
+   * @param label   1 = bullish, 0 = bearish
    */
-  static async generatePredictions(chartData: ChartDataPoint[]): Promise<MLPredictions> {
+  train(x: number[], label: 0 | 1): void {
+    const prob  = this.predict(x);
+    const error = prob - label;               // dL/dz
+
+    // Update weights with L2 regularisation
+    for (let i = 0; i < this.weights.length; i++) {
+      this.weights[i] -= this.lr * (error * x[i] + this.lambda * this.weights[i]);
+    }
+    this.bias -= this.lr * error;
+  }
+
+  /**
+   * Batch training on a labelled history.
+   * Labels are generated from next-bar returns: positive return → 1, else 0.
+   */
+  trainOnHistory(data: ChartDataPoint[]): void {
+    for (let i = 20; i < data.length - 1; i++) {
+      const slice   = data.slice(0, i + 1);
+      const f       = extractFeatures(slice);
+      const x       = featureToArray(f);
+      const nextRet = (data[i + 1].close - data[i].close) / (data[i].close || 1);
+      const label   = nextRet > 0 ? 1 : 0;
+      this.train(x, label as 0 | 1);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// MLPredictionService
+// ---------------------------------------------------------------------------
+
+export class MLPredictionService {
+  // FIX 2: instance-level classifier so weights are reachable everywhere
+  private classifier: LogisticRegression;
+  private isLoaded = false;
+
+  constructor() {
+    this.classifier = new LogisticRegression(FEATURE_COUNT);
+    this.loadTrainedWeights();
+  }
+
+  // FIX 1: weights are now actually applied to the classifier
+  private async loadTrainedWeights(): Promise<void> {
+    try {
+      const loaded = await MLModelStorage.loadLatestWeights();
+      if (loaded?.weights?.direction) {
+        const { weights, bias } = loaded.weights.direction as { weights: number[]; bias: number };
+        this.classifier = new LogisticRegression(FEATURE_COUNT, 0.01, 0.001, weights, bias);
+        this.isLoaded   = true;
+        console.log('[ML Predictions] Loaded trained weights from:', loaded.metadata.trainedAt);
+      }
+    } catch {
+      console.log('[ML Predictions] No trained weights found — using randomly initialised model');
+    }
+  }
+
+  async saveWeights(dataPoints?: number): Promise<void> {
+    await MLModelStorage.saveWeights(
+      { direction: { weights: this.classifier.weights, bias: this.classifier.bias } },
+      { trainedAt: new Date().toISOString(), dataPoints: dataPoints ?? 0, featureCount: FEATURE_COUNT }
+    );
+  }
+
+  /**
+   * Online update: call after observing a real outcome.
+   * @param data   the candle history at prediction time
+   * @param label  1 = next bar was bullish, 0 = bearish
+   */
+  trainOnline(data: ChartDataPoint[], label: 0 | 1): void {
+    const f = extractFeatures(data);
+    this.classifier.train(featureToArray(f), label);
+  }
+
+  /**
+   * Batch-train on a full historical dataset.
+   * Call this once on startup with sufficient history before serving predictions.
+   */
+  async trainOnHistory(data: ChartDataPoint[]): Promise<void> {
+    this.classifier.trainOnHistory(data);
+    await this.saveWeights(data.length);
+    console.log(`[ML Predictions] Trained on ${data.length} bars`);
+  }
+
+  // FIX 2: instance method so the live classifier is used
+  async generatePredictions(
+    chartData:       ChartDataPoint[],
+    candleMinutes = 60   // FIX 8: caller specifies the bar size
+  ): Promise<MLPredictions> {
     if (chartData.length < 20) {
       throw new Error('Insufficient data for ML predictions (minimum 20 candles required)');
     }
 
-    // Extract features
-    const features = this.extractFeatures(chartData);
-
-    // Run all models
-    const direction = this.predictDirection(chartData, features);
-    const price = this.predictPrice(chartData, features);
-    const volatility = this.predictVolatility(chartData, features);
-    const holdingPeriod = this.predictHoldingPeriod(chartData, features, direction, volatility);
-    const risk = this.assessRisk(chartData, features, direction, volatility);
+    const features     = extractFeatures(chartData);
+    const direction    = this.predictDirection(features);
+    const price        = predictPrice(chartData, features);
+    const vol          = predictVolatility(chartData, features);
+    const holdingPeriod = predictHoldingPeriod(features, direction, vol, candleMinutes);
+    const risk         = assessRisk(features, direction, vol);
+    // Wrap ML confidences with mode-aware scorer before publishing
+    try {
+      const scorerMod = require('./market-data/confidence-scorer') as any;
+      if (scorerMod && typeof scorerMod.getConfidenceScorer === 'function') {
+        const scorer = scorerMod.getConfidenceScorer();
+        const dirScored = scorer.scoreWithCurrentMode(direction.confidence, 'ml');
+        direction.confidence = dirScored.adjusted;
+        // also adjust price/volatility/holdingPeriod confidences conservatively
+        price.confidence = Math.min(1, (price.confidence + dirScored.adjusted) / 2);
+        vol.confidence   = Math.min(1, (vol.confidence   + dirScored.adjusted) / 2);
+        holdingPeriod.confidence = Math.min(1, (holdingPeriod.confidence + dirScored.adjusted) / 2);
+      }
+    } catch (e) {
+      // ignore scorer failures
+    }
 
     return {
       direction,
       price,
-      volatility,
+      volatility: vol,
       holdingPeriod,
       risk,
       metadata: {
-        timestamp: Date.now(),
+        timestamp:  Date.now(),
         dataPoints: chartData.length,
-        features: Object.keys(features).length,
-        horizon: '1 candle'
+        features:   Object.keys(features).length,
+        horizon:    '1 candle'
       }
     };
   }
 
-  /**
-   * Extract features from chart data
-   */
-  private static extractFeatures(data: ChartDataPoint[]): Record<string, number> {
-    const recent = data.slice(-20);
-    const current = recent[recent.length - 1];
-    const prices = recent.map(d => d.close);
-    const volumes = recent.map(d => d.volume);
-    const highs = recent.map(d => d.high);
-    const lows = recent.map(d => d.low);
+  // FIX 1 & 2: uses the live logistic-regression classifier
+  private predictDirection(features: FeatureVector): MLPredictions['direction'] {
+    const x           = featureToArray(features);
+    const probability = this.classifier.predict(x);          // real model output
+    // FIX 4: lowercase only
+    const prediction  = probability > 0.5 ? 'bullish' : 'bearish';
+    const confidence  = clamp(Math.abs(probability - 0.5) * 2, 0, 1);
 
-    return {
-      // Price features
-      currentPrice: current.close,
-      priceChange1: this.calculateChange(prices, 1),
-      priceChange3: this.calculateChange(prices, 3),
-      priceChange5: this.calculateChange(prices, 5),
-      priceChange10: this.calculateChange(prices, 10),
-
-      // Momentum features
-      momentum5: this.calculateMomentum(prices, 5),
-      momentum10: this.calculateMomentum(prices, 10),
-      rateOfChange: this.calculateRateOfChange(prices, 5),
-
-      // Volatility features
-      volatility5: this.calculateVolatility(prices, 5),
-      volatility10: this.calculateVolatility(prices, 10),
-      atr: this.calculateATR(highs, lows, recent.map(d => d.close), 14),
-
-      // Volume features
-      volumeRatio: current.volume / (volumes.reduce((a, b) => a + b, 0) / volumes.length),
-      volumeTrend: this.calculateTrend(volumes, 5),
-
-      // Technical indicators (if available)
-      rsi: current.rsi || 50,
-      macd: current.macd || 0,
-      ema: current.ema || current.close,
-
-      // Pattern features
-      trendStrength: this.calculateTrendStrength(prices),
-      meanReversion: this.calculateMeanReversion(prices),
-
-      // Support/Resistance
-      distanceToHigh: (Math.max(...highs) - current.close) / current.close,
-      distanceToLow: (current.close - Math.min(...lows)) / current.close
-    };
-  }
-
-  /**
-   * Model 1: Direction Classifier (Bullish/Bearish)
-   * Simple logistic regression-like model
-   */
-  private static predictDirection(
-    data: ChartDataPoint[],
-    features: Record<string, number>
-  ): MLPredictions['direction'] {
-    // Feature weights (these would be learned from training data)
-    const weights = {
-      momentum5: 0.35,
-      momentum10: 0.25,
-      rsi: -0.002, // Inverse relationship (overbought = bearish)
-      macd: 0.4,
-      volumeRatio: 0.15,
-      trendStrength: 0.30,
-      meanReversion: -0.10,
-      priceChange5: 0.20
-    };
-
-    // Calculate weighted score
-    let score = 0;
-    let totalWeight = 0;
-
-    for (const [feature, weight] of Object.entries(weights)) {
-      if (features[feature] !== undefined) {
-        score += features[feature] * weight;
-        totalWeight += Math.abs(weight);
-      }
-    }
-
-    // Normalize score to 0-1 range (probability)
-    const normalizedScore = (score / totalWeight + 1) / 2;
-    const probability = Math.max(0, Math.min(1, normalizedScore));
-
-    // Determine prediction
-    const prediction = probability > 0.5 ? 'bullish' : 'bearish';
-    const signal = probability > 0.5 ? 1 : 0;
-
-    // Calculate confidence based on how far from 0.5
-    const confidence = Math.abs(probability - 0.5) * 2;
-
-    return {
-      prediction,
-      probability,
-      confidence,
-      strength: confidence  // Add strength field for interface compatibility
-    };
-  }
-
-  /**
-   * Model 2: Price Predictor (Regression)
-   * Predicts next candle close price
-   */
-  private static predictPrice(
-    data: ChartDataPoint[],
-    features: Record<string, number>
-  ): MLPredictions['price'] {
-    const current = data[data.length - 1];
-    const recent = data.slice(-10);
-    const prices = recent.map(d => d.close);
-
-    // Simple momentum-based prediction
-    const momentum = features.momentum5;
-    const volatility = features.volatility5;
-    const trend = features.trendStrength;
-
-    // Base prediction: current price + momentum-adjusted change
-    let predictedChange = current.close * (momentum * 0.5 + trend * 0.3);
-
-    // Adjust for RSI (mean reversion)
-    if (features.rsi > 70) {
-      predictedChange *= 0.7; // Expect some pullback
-    } else if (features.rsi < 30) {
-      predictedChange *= 1.3; // Expect bounce
-    }
-
-    const predicted = current.close + predictedChange;
-
-    // Calculate prediction bounds based on volatility
-    const volBand = current.close * volatility * 2;
-    const high = predicted + volBand;
-    const low = predicted - volBand;
-
-    // Confidence based on trend strength and volatility
-    const confidence = Math.min(1, Math.abs(trend) * (1 - volatility));
-
-    const percentChange = ((predicted - current.close) / current.close) * 100;
-
-    return {
-      predicted: Math.max(0, predicted),
-      high: Math.max(0, high),
-      low: Math.max(0, low),
-      confidence,
-      percentChange
-    };
-  }
-
-  /**
-   * Model 3: Volatility Predictor
-   * Predicts next candle volatility
-   */
-  private static predictVolatility(
-    data: ChartDataPoint[],
-    features: Record<string, number>
-  ): MLPredictions['volatility'] {
-    const currentVol = features.volatility10;
-    const atr = features.atr;
-    const volumeRatio = features.volumeRatio;
-
-    // Predict volatility as weighted average of recent volatility and volume impact
-    let predictedVol = currentVol * 0.7 + (atr / data[data.length - 1].close) * 0.3;
-
-    // Volume can increase volatility
-    if (volumeRatio > 1.5) {
-      predictedVol *= 1.2;
-    }
-
-    // Classify volatility level
-    let level: 'low' | 'medium' | 'high' | 'extreme';
-    if (predictedVol < 0.01) level = 'low';
-    else if (predictedVol < 0.02) level = 'medium';
-    else if (predictedVol < 0.04) level = 'high';
-    else level = 'extreme';
-
-    // Confidence based on consistency of recent volatility
-    const volHistory = data.slice(-10).map((d, i, arr) => {
-      if (i === 0) return 0;
-      return Math.abs((d.close - arr[i - 1].close) / arr[i - 1].close);
-    });
-    const volStd = this.calculateStandardDeviation(volHistory);
-    const confidence = Math.max(0.3, 1 - volStd * 10);
-
-    return {
-      predicted: predictedVol,
-      level,
-      confidence
-    };
-  }
-
-  /**
-   * Model 4: Holding Period Predictor
-   * Predicts optimal holding duration (in candles)
-   */
-  private static predictHoldingPeriod(
-    data: ChartDataPoint[],
-    features: Record<string, number>,
-    direction: MLPredictions['direction'],
-    volatility: MLPredictions['volatility']
-  ): {
-    candles: number;
-    days: number;
-    hours: number;
-    confidence: number;
-    reason: string;
-  } {
-    let basePeriod = 10; // Default 10 candles
-    let confidence = 0.5;
-    let reason = 'Normal market conditions';
-
-    // Volatility-based adjustment
-    if (volatility.level === 'low') {
-      basePeriod = 30; // Hold longer in low volatility
-      reason = 'Low volatility favors longer holds';
-      confidence = 0.8;
-    } else if (volatility.level === 'high') {
-      basePeriod = 5; // Exit faster in high volatility
-      reason = 'High volatility favors quick exits';
-      confidence = 0.7;
-    } else if (volatility.level === 'extreme') {
-      basePeriod = 2; // Very quick exits
-      reason = 'Extreme volatility - scalp only';
-      confidence = 0.85;
-    }
-
-    // Trend strength adjustment
-    const trendStrength = Math.abs(features.trendStrength);
-    if (trendStrength > 0.6) {
-      basePeriod = Math.floor(basePeriod * 1.5); // Strong trend = hold longer
-      reason = 'Strong trend detected - extended hold';
-      confidence = Math.min(0.9, confidence + 0.1);
-    } else if (trendStrength < 0.2) {
-      basePeriod = Math.floor(basePeriod * 0.5); // Weak trend = exit faster
-      reason = 'Weak trend - quick scalp recommended';
-    }
-
-    // RSI extremes adjustment
-    if (features.rsi > 70) {
-      basePeriod = Math.floor(basePeriod * 0.7); // Overbought = exit sooner
-      reason = 'Overbought conditions - expect reversal';
-    } else if (features.rsi < 30) {
-      basePeriod = Math.floor(basePeriod * 0.7); // Oversold = exit sooner
-      reason = 'Oversold conditions - expect bounce';
-    }
-
-    // Direction confidence adjustment
-    if (direction.confidence > 0.8) {
-      basePeriod = Math.floor(basePeriod * 1.3); // High confidence = hold longer
-      confidence = Math.max(confidence, direction.confidence);
-    }
-
-    // Volume consideration
-    if (features.volumeRatio > 2) {
-      basePeriod = Math.floor(basePeriod * 0.8); // High volume = faster moves
-      reason = 'High volume - accelerated timeline';
-    }
-
-    // Ensure minimum and maximum bounds
-    basePeriod = Math.max(1, Math.min(100, basePeriod));
-
-    // Convert to days/hours (assuming 1H candles)
-    const hours = basePeriod;
-    const days = Math.round((hours / 24) * 10) / 10;
-
-    return {
-      candles: basePeriod,
-      days,
-      hours,
-      confidence,
-      reason
-    };
-  }
-
-  /**
-   * Model 5: Risk Assessor
-   * Evaluates overall risk based on all factors
-   */
-  private static assessRisk(
-    data: ChartDataPoint[],
-    features: Record<string, number>,
-    direction: MLPredictions['direction'],
-    volatility: MLPredictions['volatility']
-  ): MLPredictions['risk'] {
-    const factors: string[] = [];
-    let riskScore = 0;
-
-    // Volatility risk (0-30 points)
-    if (volatility.level === 'extreme') {
-      riskScore += 30;
-      factors.push('Extreme volatility detected');
-    } else if (volatility.level === 'high') {
-      riskScore += 20;
-      factors.push('High volatility');
-    } else if (volatility.level === 'medium') {
-      riskScore += 10;
-    }
-
-    // Trend uncertainty risk (0-20 points)
-    if (Math.abs(features.trendStrength) < 0.2) {
-      riskScore += 20;
-      factors.push('Weak trend - unclear direction');
-    } else if (Math.abs(features.trendStrength) < 0.4) {
-      riskScore += 10;
-    }
-
-    // Prediction confidence risk (0-25 points)
-    if (direction.confidence < 0.4) {
-      riskScore += 25;
-      factors.push('Low prediction confidence');
-    } else if (direction.confidence < 0.6) {
-      riskScore += 15;
-    }
-
-    // RSI extreme risk (0-15 points)
-    if (features.rsi > 75 || features.rsi < 25) {
-      riskScore += 15;
-      factors.push(`RSI at extreme level (${features.rsi.toFixed(0)})`);
-    } else if (features.rsi > 70 || features.rsi < 30) {
-      riskScore += 8;
-    }
-
-    // Volume anomaly risk (0-10 points)
-    if (features.volumeRatio > 3) {
-      riskScore += 10;
-      factors.push('Unusual volume spike');
-    } else if (features.volumeRatio < 0.5) {
-      riskScore += 5;
-      factors.push('Low volume');
-    }
-
-    // Classify risk level
-    let level: 'low' | 'medium' | 'high' | 'extreme';
-    if (riskScore < 25) level = 'low';
-    else if (riskScore < 50) level = 'medium';
-    else if (riskScore < 75) level = 'high';
-    else level = 'extreme';
-
-    if (factors.length === 0) {
-      factors.push('Normal market conditions');
-    }
-
-    return {
-      score: riskScore,
-      level,
-      factors
-    };
-  }
-
-  // ============= Helper Methods =============
-
-  private static calculateChange(prices: number[], period: number): number {
-    if (prices.length < period + 1) return 0;
-    const current = prices[prices.length - 1];
-    const past = prices[prices.length - 1 - period];
-    return (current - past) / past;
-  }
-
-  private static calculateMomentum(prices: number[], period: number): number {
-    if (prices.length < period + 1) return 0;
-    return (prices[prices.length - 1] - prices[prices.length - 1 - period]) / prices[prices.length - 1 - period];
-  }
-
-  private static calculateRateOfChange(prices: number[], period: number): number {
-    const changes = [];
-    for (let i = 1; i < Math.min(period + 1, prices.length); i++) {
-      changes.push((prices[prices.length - i] - prices[prices.length - i - 1]) / prices[prices.length - i - 1]);
-    }
-    return changes.reduce((a, b) => a + b, 0) / changes.length;
-  }
-
-  private static calculateVolatility(prices: number[], period: number): number {
-    if (prices.length < period) return 0;
-    const returns = [];
-    for (let i = prices.length - period; i < prices.length - 1; i++) {
-      returns.push(Math.log(prices[i + 1] / prices[i]));
-    }
-    return this.calculateStandardDeviation(returns);
-  }
-
-  private static calculateATR(highs: number[], lows: number[], closes: number[], period: number): number {
-    const trueRanges = [];
-    for (let i = 1; i < Math.min(period + 1, highs.length); i++) {
-      const high = highs[highs.length - i];
-      const low = lows[lows.length - i];
-      const prevClose = closes[closes.length - i - 1];
-      const tr = Math.max(
-        high - low,
-        Math.abs(high - prevClose),
-        Math.abs(low - prevClose)
-      );
-      trueRanges.push(tr);
-    }
-    return trueRanges.reduce((a, b) => a + b, 0) / trueRanges.length;
-  }
-
-  private static calculateTrend(values: number[], period: number): number {
-    const recent = values.slice(-Math.min(period, values.length));
-    if (recent.length < 2) return 0;
-
-    // Simple linear regression slope
-    const n = recent.length;
-    const sumX = (n * (n - 1)) / 2;
-    const sumY = recent.reduce((a, b) => a + b, 0);
-    const sumXY = recent.reduce((sum, y, i) => sum + i * y, 0);
-    const sumX2 = (n * (n - 1) * (2 * n - 1)) / 6;
-
-    const slope = (n * sumXY - sumX * sumY) / (n * sumX2 - sumX * sumX);
-    return slope / (sumY / n); // Normalize by mean
-  }
-
-  private static calculateTrendStrength(prices: number[]): number {
-    if (prices.length < 10) return 0;
-    const recent = prices.slice(-10);
-    let upMoves = 0;
-    let downMoves = 0;
-
-    for (let i = 1; i < recent.length; i++) {
-      if (recent[i] > recent[i - 1]) upMoves++;
-      else if (recent[i] < recent[i - 1]) downMoves++;
-    }
-
-    return (upMoves - downMoves) / (recent.length - 1);
-  }
-
-  private static calculateMeanReversion(prices: number[]): number {
-    if (prices.length < 20) return 0;
-    const mean = prices.reduce((a, b) => a + b, 0) / prices.length;
-    const current = prices[prices.length - 1];
-    const std = this.calculateStandardDeviation(prices);
-    return std === 0 ? 0 : (current - mean) / std;
-  }
-
-  private static calculateStandardDeviation(values: number[]): number {
-    if (values.length === 0) return 0;
-    const mean = values.reduce((a, b) => a + b, 0) / values.length;
-    const variance = values.reduce((sum, val) => sum + Math.pow(val - mean, 2), 0) / values.length;
-    return Math.sqrt(variance);
+    return { prediction, probability, confidence, strength: confidence };
   }
 }
 
-export default MLPredictionService;
+// ---------------------------------------------------------------------------
+// Pure prediction functions (no learned weights needed — these are analytic)
+// ---------------------------------------------------------------------------
+
+function predictPrice(
+  data:     ChartDataPoint[],
+  features: FeatureVector
+): MLPredictions['price'] {
+  const current = data[data.length - 1];
+
+  let predictedChange = current.close * (features.momentum5 * 0.5 + features.trendStr * 0.3);
+
+  // FIX 7: use threshold features, not raw RSI magnitude
+  if (features.rsiOverbought) predictedChange *= 0.7;
+  if (features.rsiOversold)   predictedChange *= 1.3;
+
+  const predicted    = Math.max(0, current.close + predictedChange);
+  const volBand      = current.close * features.volatility5 * 2;
+
+  // FIX 6: confidence clamped to [0, 1]
+  const confidence   = clamp(Math.abs(features.trendStr) * (1 - features.volatility5), 0, 1);
+  const change       = predicted - current.close;
+  const changePercent = current.close === 0 ? 0 : (change / current.close) * 100;
+  const target: 'UP' | 'DOWN' | 'NEUTRAL' =
+    changePercent >  0.1 ? 'UP'   :
+    changePercent < -0.1 ? 'DOWN' : 'NEUTRAL';
+
+  return {
+    predicted,
+    change,
+    changePercent,
+    high: Math.max(0, predicted + volBand),
+    low:  Math.max(0, predicted - volBand),
+    confidence,
+    target
+  };
+}
+
+function predictVolatility(
+  data:     ChartDataPoint[],
+  features: FeatureVector
+): MLPredictions['volatility'] {
+  const currentPrice = data[data.length - 1].close || 1;
+  let predicted = features.volatility10 * 0.7 + (features.atr / currentPrice) * 0.3;
+  if (features.volumeRatioVal > 1.5) predicted *= 1.2;
+
+  const level: MLPredictions['volatility']['level'] =
+    predicted < 0.01 ? 'low'     :
+    predicted < 0.02 ? 'medium'  :
+    predicted < 0.04 ? 'high'    : 'extreme';
+
+  const volHistory = data.slice(-10).map((d, i, arr) =>
+    i === 0 ? 0 : Math.abs((d.close - arr[i - 1].close) / (arr[i - 1].close || 1))
+  );
+  const confidence = clamp(1 - standardDeviation(volHistory) * 10, 0.3, 1);
+
+  return { predicted, level, confidence };
+}
+
+// FIX 8: candleMinutes parameter replaces the hardcoded 1H assumption
+function predictHoldingPeriod(
+  features:      FeatureVector,
+  direction:     MLPredictions['direction'],
+  vol:           MLPredictions['volatility'],
+  candleMinutes: number
+): MLPredictions['holdingPeriod'] {
+  let basePeriod = 10;
+  let confidence = 0.5;
+  let reason     = 'Normal market conditions';
+
+  if (vol.level === 'low') {
+    basePeriod = 30; confidence = 0.8;
+    reason = 'Low volatility favors longer holds';
+  } else if (vol.level === 'high') {
+    basePeriod = 5;  confidence = 0.7;
+    reason = 'High volatility favors quick exits';
+  } else if (vol.level === 'extreme') {
+    basePeriod = 2;  confidence = 0.85;
+    reason = 'Extreme volatility — scalp only';
+  }
+
+  const ts = Math.abs(features.trendStr);
+  if (ts > 0.6) {
+    basePeriod = Math.floor(basePeriod * 1.5);
+    confidence = Math.min(0.9, confidence + 0.1);
+    reason = 'Strong trend detected — extended hold';
+  } else if (ts < 0.2) {
+    basePeriod = Math.floor(basePeriod * 0.5);
+    reason = 'Weak trend — quick scalp recommended';
+  }
+
+  // FIX 7: use threshold features
+  if (features.rsiOverbought || features.rsiOversold) {
+    basePeriod = Math.floor(basePeriod * 0.7);
+    reason = features.rsiOverbought
+      ? 'Overbought — expect reversal'
+      : 'Oversold — expect bounce';
+  }
+
+  if (direction.confidence > 0.8) {
+    basePeriod = Math.floor(basePeriod * 1.3);
+    confidence = Math.max(confidence, direction.confidence);
+  }
+
+  if (features.volumeRatioVal > 2) {
+    basePeriod = Math.floor(basePeriod * 0.8);
+    reason = 'High volume — accelerated timeline';
+  }
+
+  basePeriod = clamp(basePeriod, 1, 100);
+
+  // FIX 8: correct conversion using caller-supplied candleMinutes
+  const totalMinutes = basePeriod * candleMinutes;
+  const hours = totalMinutes / 60;
+  const days  = Math.round((totalMinutes / (60 * 24)) * 10) / 10;
+
+  return { candles: basePeriod, days, hours, confidence, reason };
+}
+
+function assessRisk(
+  features:  FeatureVector,
+  direction: MLPredictions['direction'],
+  vol:       MLPredictions['volatility']
+): MLPredictions['risk'] {
+  const factors: string[] = [];
+  let riskScore = 0;
+
+  if      (vol.level === 'extreme') { riskScore += 30; factors.push('Extreme volatility'); }
+  else if (vol.level === 'high')    { riskScore += 20; factors.push('High volatility'); }
+  else if (vol.level === 'medium')  { riskScore += 10; }
+
+  const ts = Math.abs(features.trendStr);
+  if      (ts < 0.2) { riskScore += 20; factors.push('Weak trend — unclear direction'); }
+  else if (ts < 0.4) { riskScore += 10; }
+
+  if      (direction.confidence < 0.4) { riskScore += 25; factors.push('Low model confidence'); }
+  else if (direction.confidence < 0.6) { riskScore += 15; }
+
+  // FIX 7: use threshold features
+  if (features.rsiOverbought) { riskScore += 15; factors.push(`RSI overbought (${features.rsi.toFixed(0)})`); }
+  else if (features.rsi > 70) { riskScore += 8; }
+  if (features.rsiOversold)   { riskScore += 15; factors.push(`RSI oversold (${features.rsi.toFixed(0)})`); }
+  else if (features.rsi < 30) { riskScore += 8; }
+
+  if      (features.volumeRatioVal > 3)   { riskScore += 10; factors.push('Unusual volume spike'); }
+  else if (features.volumeRatioVal < 0.5) { riskScore += 5;  factors.push('Low volume — thin market'); }
+
+  if (factors.length === 0) factors.push('Normal market conditions');
+
+  const level: MLPredictions['risk']['level'] =
+    riskScore < 25 ? 'low'     :
+    riskScore < 50 ? 'medium'  :
+    riskScore < 75 ? 'high'    : 'extreme';
+
+  return { score: clamp(riskScore, 0, 100), level, factors };
+}
+
+// Export a singleton instance by default so importing modules can call
+// `generatePredictions(...)` directly without needing to instantiate.
+export default new MLPredictionService();

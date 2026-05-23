@@ -12,8 +12,8 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { fileURLToPath } from 'url';
-import { TrendConvexityEngine } from '../services/vfmd/trendConvexityEngine.ts';
-import { TrendBacktestLogger } from './trendBacktestLogger.ts';
+import { TrendConvexityEngine } from '../services/vfmd/trendConvexityEngine';
+import { TrendBacktestLogger } from './trendBacktestLogger';
 import type { MarketTick } from '../services/vfmd/types';
 
 const __filename = fileURLToPath(import.meta.url);

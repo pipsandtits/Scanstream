@@ -1,6 +1,12 @@
 
-import React, { useState } from 'react';
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, BarChart, Bar, PieChart, Pie, Cell, AreaChart, Area, ComposedChart } from 'recharts';
+import React, { useState, Suspense, lazy } from 'react';
+const WinRateChart = lazy(() => import('@/components/PortfolioCharts').then(m => ({ default: m.WinRateChart })));
+const TradeDistributionChart = lazy(() => import('@/components/PortfolioCharts').then(m => ({ default: m.TradeDistributionChart })));
+const SignalQualityChart = lazy(() => import('@/components/PortfolioCharts').then(m => ({ default: m.SignalQualityChart })));
+import AreaChartCore from './charts/AreaChartCore';
+import EquityCurve from './visuals/EquityCurve';
+import BarChartCore from './charts/BarChartCore';
+import { Bar, Cell } from '@/components/ui/RechartsLazy';
 import { TrendingUp, TrendingDown, DollarSign, Target, AlertTriangle, BarChart3, PieChart as PieChartIcon, Calendar, Clock, Activity } from 'lucide-react';
 
 export type PortfolioData = {
@@ -289,34 +295,16 @@ const PortfolioVisualizer: React.FC<{ data: PortfolioData }> = ({ data }) => {
 
           {/* Separated Equity and Drawdown Charts */}
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-            {/* Equity Curve */}
+            {/* Equity Curve (rich prototype) */}
             <div className="bg-gradient-to-br from-slate-800/40 to-slate-900/40 backdrop-blur-sm border border-slate-700/50 rounded-xl p-6 shadow-xl">
               <h3 className="text-xl font-bold text-white mb-4 flex items-center">
                 <TrendingUp className="w-5 h-5 mr-2 text-green-400" />
                 Equity Curve
               </h3>
-              <ResponsiveContainer width="100%" height={300}>
-                <AreaChart data={equityChartData}>
-                  <defs>
-                    <linearGradient id="equityGradient" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="5%" stopColor="#3b82f6" stopOpacity={0.3}/>
-                      <stop offset="95%" stopColor="#3b82f6" stopOpacity={0}/>
-                    </linearGradient>
-                  </defs>
-                  <CartesianGrid strokeDasharray="3 3" stroke="#334155" opacity={0.3} />
-                  <XAxis dataKey="date" stroke="#94a3b8" style={{ fontSize: '12px' }} />
-                  <YAxis stroke="#94a3b8" style={{ fontSize: '12px' }} />
-                  <Tooltip content={<CustomTooltip />} />
-                  <Area 
-                    type="monotone" 
-                    dataKey="equity" 
-                    stroke="#3b82f6" 
-                    strokeWidth={3}
-                    fill="url(#equityGradient)"
-                    name="Portfolio Value"
-                  />
-                </AreaChart>
-              </ResponsiveContainer>
+              <EquityCurve
+                data={data.equityCurve.map(p => ({ timestamp: +p.date, equity: p.value }))}
+                height={300}
+              />
             </div>
 
             {/* Drawdown Chart */}
@@ -325,28 +313,16 @@ const PortfolioVisualizer: React.FC<{ data: PortfolioData }> = ({ data }) => {
                 <AlertTriangle className="w-5 h-5 mr-2 text-red-400" />
                 Drawdown Analysis
               </h3>
-              <ResponsiveContainer width="100%" height={300}>
-                <AreaChart data={equityChartData}>
-                  <defs>
-                    <linearGradient id="drawdownGradient" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="5%" stopColor="#ef4444" stopOpacity={0.3}/>
-                      <stop offset="95%" stopColor="#ef4444" stopOpacity={0}/>
-                    </linearGradient>
-                  </defs>
-                  <CartesianGrid strokeDasharray="3 3" stroke="#334155" opacity={0.3} />
-                  <XAxis dataKey="date" stroke="#94a3b8" style={{ fontSize: '12px' }} />
-                  <YAxis stroke="#94a3b8" style={{ fontSize: '12px' }} />
-                  <Tooltip content={<CustomTooltip />} />
-                  <Area 
-                    type="monotone" 
-                    dataKey="drawdown" 
-                    stroke="#ef4444" 
-                    strokeWidth={3}
-                    fill="url(#drawdownGradient)"
-                    name="Drawdown %"
-                  />
-                </AreaChart>
-              </ResponsiveContainer>
+              <AreaChartCore
+                data={equityChartData}
+                dataKey="drawdown"
+                height={300}
+                gradientId="drawdownGradient"
+                stroke="#ef4444"
+                fill="#ef4444"
+                xFormatter={(t: any) => String(t)}
+                yFormatter={(v: any) => `${v.toFixed(2)}%`}
+              />
               <div className="mt-4 grid grid-cols-3 gap-3">
                 <div className="text-center p-2 bg-red-500/10 rounded-lg border border-red-500/20">
                   <p className="text-xs text-red-400 mb-1">Max Drawdown</p>
@@ -453,8 +429,8 @@ const PortfolioVisualizer: React.FC<{ data: PortfolioData }> = ({ data }) => {
               <Calendar className="w-5 h-5 mr-2 text-blue-400" />
               Monthly Returns Distribution
             </h3>
-            <ResponsiveContainer width="100%" height={350}>
-              <BarChart data={monthlyReturnsData}>
+              <div style={{ width: '100%', height: 350 }}>
+                <BarChartCore data={monthlyReturnsData} dataKey="return" height={350}>
                 <defs>
                   <linearGradient id="positiveBar" x1="0" y1="0" x2="0" y2="1">
                     <stop offset="5%" stopColor="#22c55e" stopOpacity={0.8}/>
@@ -465,13 +441,8 @@ const PortfolioVisualizer: React.FC<{ data: PortfolioData }> = ({ data }) => {
                     <stop offset="95%" stopColor="#ef4444" stopOpacity={0.3}/>
                   </linearGradient>
                 </defs>
-                <CartesianGrid strokeDasharray="3 3" stroke="#334155" opacity={0.3} />
-                <XAxis dataKey="month" stroke="#94a3b8" style={{ fontSize: '12px' }} />
-                <YAxis stroke="#94a3b8" style={{ fontSize: '12px' }} />
-                <Tooltip content={<CustomTooltip />} />
                 <Bar 
                   dataKey="return" 
-                  fill="url(#positiveBar)"
                   name="Monthly Return %"
                   radius={[8, 8, 0, 0]}
                 >
@@ -479,8 +450,8 @@ const PortfolioVisualizer: React.FC<{ data: PortfolioData }> = ({ data }) => {
                     <Cell key={`cell-${index}`} fill={entry.positive ? 'url(#positiveBar)' : 'url(#negativeBar)'} />
                   ))}
                 </Bar>
-              </BarChart>
-            </ResponsiveContainer>
+              </BarChartCore>
+            </div>
           </div>
 
           {/* Win Rate Over Time */}
@@ -489,37 +460,9 @@ const PortfolioVisualizer: React.FC<{ data: PortfolioData }> = ({ data }) => {
               <Activity className="w-5 h-5 mr-2 text-green-400" />
               Win Rate Evolution
             </h3>
-            <ResponsiveContainer width="100%" height={350}>
-              <ComposedChart data={winRateOverTime}>
-                <defs>
-                  <linearGradient id="winRateGradient" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="5%" stopColor="#22c55e" stopOpacity={0.3}/>
-                    <stop offset="95%" stopColor="#22c55e" stopOpacity={0}/>
-                  </linearGradient>
-                </defs>
-                <CartesianGrid strokeDasharray="3 3" stroke="#334155" opacity={0.3} />
-                <XAxis dataKey="trade" stroke="#94a3b8" style={{ fontSize: '12px' }} label={{ value: 'Trade Number', position: 'insideBottom', offset: -5 }} />
-                <YAxis stroke="#94a3b8" style={{ fontSize: '12px' }} label={{ value: 'Win Rate %', angle: -90, position: 'insideLeft' }} />
-                <Tooltip content={<CustomTooltip />} />
-                <Legend />
-                <Area 
-                  type="monotone" 
-                  dataKey="winRate" 
-                  fill="url(#winRateGradient)" 
-                  stroke="#22c55e" 
-                  strokeWidth={2}
-                  name="Rolling Win Rate (20 trades)"
-                />
-                <Line 
-                  type="monotone" 
-                  dataKey="cumulativeWinRate" 
-                  stroke="#3b82f6" 
-                  strokeWidth={2}
-                  dot={false}
-                  name="Cumulative Win Rate"
-                />
-              </ComposedChart>
-            </ResponsiveContainer>
+            <Suspense fallback={<div className="h-80 flex items-center justify-center">Loading chart…</div>}>
+              <WinRateChart data={winRateOverTime} />
+            </Suspense>
           </div>
 
           {/* Symbol Performance Table */}
@@ -705,25 +648,9 @@ const PortfolioVisualizer: React.FC<{ data: PortfolioData }> = ({ data }) => {
                 <PieChartIcon className="w-5 h-5 mr-2 text-blue-400" />
                 Trade Distribution
               </h3>
-              <ResponsiveContainer width="100%" height={300}>
-                <PieChart>
-                  <Pie
-                    data={tradeDistribution}
-                    cx="50%"
-                    cy="50%"
-                    labelLine={false}
-                    label={({ name, percent }: any) => `${name.split('(')[0]}: ${((percent || 0) * 100).toFixed(0)}%`}
-                    outerRadius={100}
-                    fill="#8884d8"
-                    dataKey="count"
-                  >
-                    {tradeDistribution.map((entry, index) => (
-                      <Cell key={`cell-${index}`} fill={entry.color} />
-                    ))}
-                  </Pie>
-                  <Tooltip content={<CustomTooltip />} />
-                </PieChart>
-              </ResponsiveContainer>
+              <Suspense fallback={<div className="h-72 flex items-center justify-center">Loading chart…</div>}>
+                <TradeDistributionChart data={tradeDistribution} />
+              </Suspense>
             </div>
 
             <div className="bg-gradient-to-br from-slate-800/40 to-slate-900/40 backdrop-blur-sm border border-slate-700/50 rounded-xl p-6 shadow-xl">
@@ -813,31 +740,9 @@ const PortfolioVisualizer: React.FC<{ data: PortfolioData }> = ({ data }) => {
               <Target className="w-5 h-5 mr-2 text-purple-400" />
               Signal Quality Evolution
             </h3>
-            <ResponsiveContainer width="100%" height={350}>
-              <ComposedChart data={signalQuality}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#334155" opacity={0.3} />
-                <XAxis dataKey="trade" stroke="#94a3b8" style={{ fontSize: '12px' }} />
-                <YAxis stroke="#94a3b8" style={{ fontSize: '12px' }} />
-                <Tooltip content={<CustomTooltip />} />
-                <Legend />
-                <Area 
-                  type="monotone" 
-                  dataKey="returnPct" 
-                  fill="#3b82f6" 
-                  stroke="#3b82f6" 
-                  fillOpacity={0.2}
-                  name="Return %"
-                />
-                <Line 
-                  type="monotone" 
-                  dataKey="avgReturn" 
-                  stroke="#22c55e" 
-                  strokeWidth={2}
-                  dot={false}
-                  name="Average Return"
-                />
-              </ComposedChart>
-            </ResponsiveContainer>
+            <Suspense fallback={<div className="h-80 flex items-center justify-center">Loading chart…</div>}>
+              <SignalQualityChart data={signalQuality} />
+            </Suspense>
           </div>
 
           {/* Monte Carlo Simulation Results */}
@@ -846,28 +751,14 @@ const PortfolioVisualizer: React.FC<{ data: PortfolioData }> = ({ data }) => {
               <Activity className="w-5 h-5 mr-2 text-blue-400" />
               Monte Carlo Simulation
             </h3>
-            <ResponsiveContainer width="100%" height={300}>
-              <AreaChart data={monteCarloData}>
-                <defs>
-                  <linearGradient id="monteCarloGradient" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="5%" stopColor="#8b5cf6" stopOpacity={0.3}/>
-                    <stop offset="95%" stopColor="#8b5cf6" stopOpacity={0}/>
-                  </linearGradient>
-                </defs>
-                <CartesianGrid strokeDasharray="3 3" stroke="#334155" opacity={0.3} />
-                <XAxis dataKey="percentile" stroke="#94a3b8" style={{ fontSize: '12px' }} />
-                <YAxis stroke="#94a3b8" style={{ fontSize: '12px' }} />
-                <Tooltip content={<CustomTooltip />} />
-                <Area 
-                  type="monotone" 
-                  dataKey="value" 
-                  stroke="#8b5cf6" 
-                  strokeWidth={3}
-                  fill="url(#monteCarloGradient)" 
-                  name="Portfolio Value"
-                />
-              </AreaChart>
-            </ResponsiveContainer>
+            <AreaChartCore
+              data={monteCarloData}
+              dataKey="value"
+              height={300}
+              gradientId="monteCarloGradient"
+              stroke="#8b5cf6"
+              fill="#8b5cf6"
+            />
             
             <div className="grid grid-cols-4 gap-4 mt-6">
               <div className="text-center p-4 bg-green-500/10 rounded-lg border border-green-500/20">

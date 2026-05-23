@@ -2,6 +2,7 @@
 import { Router } from 'express';
 import { compositeEntryQualityEngine } from '../services/composite-entry-quality';
 import { storage } from '../storage';
+import type { MarketFrame } from '@shared/schema';
 
 const router = Router();
 
@@ -50,28 +51,32 @@ router.post('/batch', async (req, res) => {
   try {
     const { signals } = req.body; // Array of { symbol, direction }
     
-    const results = await Promise.all(
-      signals.map(async (signal: any) => {
-        const frames = await storage.getMarketFrames(signal.symbol, 1);
-        if (frames.length === 0) return null;
+    // Batch fetch market frames for all requested signals to avoid N+1
+    const uniqueSymbols = Array.from(new Set(signals.map((s: any) => s.symbol)));
+    const framesMap = (storage.getMarketFramesForSymbols
+      ? await storage.getMarketFramesForSymbols(uniqueSymbols, 1)
+      : await Promise.all(uniqueSymbols.map(async (sym: string) => ({ [sym]: await storage.getMarketFrames(sym, 1) })))) as Record<string, MarketFrame[]>;
 
-        const quality = compositeEntryQualityEngine.calculateEntryQuality(
-          frames[0] as any,
-          signal.direction
-        );
+    const results = signals.map((signal: any) => {
+      const frames = framesMap[signal.symbol] || [];
+      if (frames.length === 0) return null;
 
-        return {
-          symbol: signal.symbol,
-          direction: signal.direction,
-          quality,
-          recommendation: quality.quality === 'excellent' || quality.quality === 'good'
-            ? 'ENTER'
-            : quality.quality === 'fair'
-            ? 'CAUTION'
-            : 'AVOID'
-        };
-      })
-    );
+      const quality = compositeEntryQualityEngine.calculateEntryQuality(
+        frames[0] as any,
+        signal.direction
+      );
+
+      return {
+        symbol: signal.symbol,
+        direction: signal.direction,
+        quality,
+        recommendation: quality.quality === 'excellent' || quality.quality === 'good'
+          ? 'ENTER'
+          : quality.quality === 'fair'
+          ? 'CAUTION'
+          : 'AVOID'
+      };
+    });
 
     const filtered = results.filter(r => r !== null);
 
@@ -100,18 +105,20 @@ router.get('/filter/:minQuality', async (req, res) => {
     const minQuality = parseFloat(req.params.minQuality);
     const symbols = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT']; // Example symbols
 
-    const allSignals = await Promise.all(
-      symbols.map(async symbol => {
-        const frames = await storage.getMarketFrames(symbol, 1);
-        if (frames.length === 0) return null;
+    // Batch fetch frames for symbols
+    const framesMap2 = (storage.getMarketFramesForSymbols
+      ? await storage.getMarketFramesForSymbols(symbols, 1)
+      : await Promise.all(symbols.map(async (sym: string) => ({ [sym]: await storage.getMarketFrames(sym, 1) })))) as Record<string, MarketFrame[]>;
 
-        return {
-          marketData: frames[0],
-          direction: 'LONG' as const,
-          symbol
-        };
-      })
-    );
+    const allSignals = symbols.map(symbol => {
+      const frames = framesMap2[symbol] || [];
+      if (frames.length === 0) return null;
+      return {
+        marketData: frames[0],
+        direction: 'LONG' as const,
+        symbol
+      };
+    });
 
     const validSignals = allSignals.filter(s => s !== null) as any[];
     const filtered = compositeEntryQualityEngine.filterByQuality(

@@ -23,9 +23,9 @@ interface SentimentIndicatorProps {
 export function SentimentIndicator({ symbol, className }: SentimentIndicatorProps) {
   const { data, isLoading } = useQuery<SentimentData>({
     queryKey: ['sentiment', symbol],
-    queryFn: async () => {
+    queryFn: async ({ signal }: any) => {
       const baseSymbol = symbol.split('/')[0]; // BTC/USDT -> BTC
-      const response = await fetch(`/api/coingecko/sentiment/${baseSymbol}`);
+      const response = await fetch(`/api/coingecko/sentiment/${baseSymbol}`, { signal });
       if (!response.ok) throw new Error('Failed to fetch sentiment');
       return response.json();
     },
@@ -101,9 +101,9 @@ export function SentimentIndicator({ symbol, className }: SentimentIndicatorProp
 export function SentimentBadge({ symbol }: { symbol: string }) {
   const { data } = useQuery<SentimentData>({
     queryKey: ['sentiment', symbol],
-    queryFn: async () => {
+    queryFn: async ({ signal }: any) => {
       const baseSymbol = symbol.split('/')[0];
-      const response = await fetch(`/api/coingecko/sentiment/${baseSymbol}`);
+      const response = await fetch(`/api/coingecko/sentiment/${baseSymbol}`, { signal });
       return response.json();
     },
     refetchInterval: 300000,

@@ -73,11 +73,12 @@ export interface CommodityAsset {
 export type Asset = CryptoAsset | ForexAsset | StockAsset | CommodityAsset;
 
 // Fetch CoinGecko cryptocurrencies (Top 250)
-const fetchCryptoAssets = async (page: number = 1) => {
+const fetchCryptoAssets = async (page: number = 1, signal?: AbortSignal) => {
   try {
     // Try to get all available price change data from CoinGecko
     const response = await fetch(
-      `https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=250&page=${page}&sparkline=false&price_change_percentage=1h,24h,7d,30d,200d,1y`
+      `https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=250&page=${page}&sparkline=false&price_change_percentage=1h,24h,7d,30d,200d,1y`,
+      { signal }
     );
 
     if (!response.ok) throw new Error('Failed to fetch cryptos from CoinGecko');
@@ -128,9 +129,9 @@ const fetchCryptoAssets = async (page: number = 1) => {
 };
 
 // Fetch from backend - Forex pairs
-const fetchForexAssets = async (page: number = 1) => {
+const fetchForexAssets = async (page: number = 1, signal?: AbortSignal) => {
   try {
-    const response = await fetch(`/api/assets/forex?page=${page}&limit=100`);
+    const response = await fetch(`/api/assets/forex?page=${page}&limit=100`, { signal });
 
     if (!response.ok) {
       // Fallback: return mock data until backend is ready
@@ -155,9 +156,9 @@ const fetchForexAssets = async (page: number = 1) => {
 };
 
 // Fetch from backend - Stocks
-const fetchStockAssets = async (page: number = 1) => {
+const fetchStockAssets = async (page: number = 1, signal?: AbortSignal) => {
   try {
-    const response = await fetch(`/api/assets/stocks?page=${page}&limit=100`);
+    const response = await fetch(`/api/assets/stocks?page=${page}&limit=100`, { signal });
 
     if (!response.ok) {
       return {
@@ -181,9 +182,9 @@ const fetchStockAssets = async (page: number = 1) => {
 };
 
 // Fetch from backend - Commodities
-const fetchCommodityAssets = async (page: number = 1) => {
+const fetchCommodityAssets = async (page: number = 1, signal?: AbortSignal) => {
   try {
-    const response = await fetch(`/api/assets/commodities?page=${page}&limit=100`);
+    const response = await fetch(`/api/assets/commodities?page=${page}&limit=100`, { signal });
 
     if (!response.ok) {
       return {
@@ -210,18 +211,18 @@ const fetchCommodityAssets = async (page: number = 1) => {
 export const useAssetClassData = (assetClass: AssetClass, page: number = 1) => {
   return useQuery({
     queryKey: ['assets', assetClass, page],
-    queryFn: async () => {
+    queryFn: async ({ signal }: any) => {
       switch (assetClass) {
         case 'crypto':
-          return fetchCryptoAssets(page);
+          return fetchCryptoAssets(page, signal);
         case 'forex':
-          return fetchForexAssets(page);
+          return fetchForexAssets(page, signal);
         case 'stocks':
-          return fetchStockAssets(page);
+          return fetchStockAssets(page, signal);
         case 'commodities':
-          return fetchCommodityAssets(page);
+          return fetchCommodityAssets(page, signal);
         case 'indices':
-          return fetchStockAssets(page); // Temporary: use stock structure
+          return fetchStockAssets(page, signal); // Temporary: use stock structure
         default:
           return { data: [], total: 0, page, perPage: 100 };
       }

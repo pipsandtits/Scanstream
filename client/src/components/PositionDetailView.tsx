@@ -3,7 +3,8 @@ import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } f
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, AreaChart, Area } from 'recharts';
+import AreaChartCore from './charts/AreaChartCore';
+import { usePriceHistory } from '@/lib/hooks';
 import { X, TrendingUp, TrendingDown, Clock, Zap, AlertCircle, Copy } from 'lucide-react';
 
 interface PositionDetailViewProps {
@@ -65,6 +66,9 @@ export default function PositionDetailView({
     onClose();
   };
 
+  const priceHistoryQuery = usePriceHistory(position?.id);
+  const resolvedPriceHistory = priceHistory && priceHistory.length > 0 ? priceHistory : (priceHistoryQuery.data?.data || []);
+
   return (
     <Dialog open={isOpen} onOpenChange={onClose}>
       <DialogContent className="max-w-4xl bg-slate-900 border-slate-800 max-h-[90vh] overflow-y-auto">
@@ -114,40 +118,22 @@ export default function PositionDetailView({
           </div>
 
           {/* Price Chart */}
-          {priceHistory.length > 0 && (
+          {resolvedPriceHistory.length > 0 && (
             <Card className="bg-slate-800 border-slate-700">
               <CardHeader>
                 <CardTitle className="text-lg">Price History</CardTitle>
               </CardHeader>
               <CardContent>
-                <ResponsiveContainer width="100%" height={300}>
-                  <AreaChart data={priceHistory}>
-                    <defs>
-                      <linearGradient id="colorPrice" x1="0" y1="0" x2="0" y2="1">
-                        <stop offset="5%" stopColor="#3b82f6" stopOpacity={0.8} />
-                        <stop offset="95%" stopColor="#3b82f6" stopOpacity={0} />
-                      </linearGradient>
-                    </defs>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-                    <XAxis
-                      dataKey="time"
-                      stroke="#94a3b8"
-                      tickFormatter={(time) => new Date(time).toLocaleTimeString()}
-                    />
-                    <YAxis stroke="#94a3b8" />
-                    <Tooltip
-                      contentStyle={{ backgroundColor: '#1e293b', border: '1px solid #475569' }}
-                      formatter={(value: any) => `$${typeof value === 'number' ? value.toFixed(2) : value}`}
-                    />
-                    <Area
-                      type="monotone"
-                      dataKey="price"
-                      stroke="#3b82f6"
-                      fillOpacity={1}
-                      fill="url(#colorPrice)"
-                    />
-                  </AreaChart>
-                </ResponsiveContainer>
+                <AreaChartCore
+                  data={resolvedPriceHistory}
+                  dataKey="price"
+                  height={300}
+                  gradientId="colorPrice"
+                  stroke="#3b82f6"
+                  fill="#3b82f6"
+                  xFormatter={(t: any) => new Date(t).toLocaleTimeString()}
+                  yFormatter={(v: any) => `$${v.toFixed(2)}`}
+                />
               </CardContent>
             </Card>
           )}

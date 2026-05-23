@@ -1,5 +1,7 @@
 import { MarketFrame, Signal, Trade } from "@shared/schema";
 import { EnhancedPortfolioSimulator } from "./portfolio-simulator";
+import SlippageModel from './services/slippage-model';
+import { PartialFillSimulator } from './services/partial-fill-simulator';
 
 export interface BacktestOptions {
   initialCapital?: number;
@@ -17,7 +19,7 @@ export interface BacktestResult {
 }
 
 export async function runBacktest(options: BacktestOptions): Promise<BacktestResult> {
-  const config = (await import('../config/trading-config.json', { assert: { type: 'json' } })).default;
+  const config = (await import('../config/trading-config.json', { with: { type: 'json' } })).default;
   const {
     initialCapital = config.initialCapital,
     signals,
@@ -28,6 +30,9 @@ export async function runBacktest(options: BacktestOptions): Promise<BacktestRes
   } = options;
 
   const sim = new EnhancedPortfolioSimulator({ initialCapital });
+  // Integrate more realistic execution models
+  const slippageModel = new SlippageModel({ mode: 'percentage', percent: (slippage || 0) * 100 });
+  const partialFillSim = new PartialFillSimulator({ typicalDepth: 1000, aggressiveness: 0.7 });
   const frameMap = new Map<string, MarketFrame[]>();
   for (const frame of marketFrames) {
     if (!frameMap.has(frame.symbol)) frameMap.set(frame.symbol, []);
@@ -40,8 +45,14 @@ export async function runBacktest(options: BacktestOptions): Promise<BacktestRes
     const entryFrame = frames.find(f => new Date(f.timestamp).getTime() >= new Date(signal.timestamp).getTime());
     if (!entryFrame) continue;
     const price = entryFrame.price as { open: number; high: number; low: number; close: number };
-    const entryPrice = price.close * (1 + (signal.type === 'BUY' ? slippage : -slippage));
-    const quantity = positionSize / entryPrice;
+    const entryPriceRaw = price.close;
+    const approxQuantity = positionSize / entryPriceRaw;
+    // Apply slippage model to the entry price
+    const entryPrice = slippageModel.applySlippage(entryPriceRaw, approxQuantity, undefined, signal.type === 'BUY' ? 'buy' : 'sell');
+    // Simulate potential partial fills
+    const fills = partialFillSim.simulateProgressiveFills(Math.ceil(approxQuantity), 5);
+    const filledQuantity = fills.reduce((s, v) => s + v, 0);
+
     const trade: Trade = {
       id: `${signal.symbol}-${signal.timestamp}`,
       signalId: signal.id,
@@ -49,7 +60,7 @@ export async function runBacktest(options: BacktestOptions): Promise<BacktestRes
       side: signal.type,
       entryTime: new Date(entryFrame.timestamp),
       entryPrice,
-      quantity,
+      quantity: filledQuantity,
       commission,
       status: 'OPEN',
       exitTime: null,
@@ -72,7 +83,9 @@ export async function runBacktest(options: BacktestOptions): Promise<BacktestRes
       }
     }
     if (!exitFrame) exitFrame = frames[frames.length - 1];
-    const exitPrice = (exitFrame.price as { close: number }).close * (1 - (signal.type === 'BUY' ? slippage : -slippage));
+    const exitPriceRaw = (exitFrame.price as { close: number }).close;
+    // Apply slippage to exit price (use filledQuantity as proxy for order size)
+    const exitPrice = slippageModel.applySlippage(exitPriceRaw, sim.getOpenPositions().find(p => p.symbol === signal.symbol)?.quantity || 0, undefined, signal.type === 'BUY' ? 'sell' : 'buy');
     sim.closePosition(signal.symbol, exitPrice, new Date(exitFrame.timestamp));
   }
 

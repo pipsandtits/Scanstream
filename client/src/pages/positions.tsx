@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { TrendingUp, TrendingDown, X, Edit, Target, AlertTriangle, DollarSign, Percent, Clock } from 'lucide-react';
-import { Link } from 'wouter';
+import { Link } from 'react-router-dom';
 
 interface Position {
   id: string;
@@ -26,8 +26,8 @@ export default function PositionsPage() {
 
   const { data: positions, isLoading } = useQuery<Position[]>({
     queryKey: ['positions'],
-    queryFn: async () => {
-      const response = await fetch('/api/positions');
+    queryFn: async ({ signal }: any) => {
+      const response = await fetch('/api/positions', { signal });
       if (!response.ok) throw new Error('Failed to fetch positions');
       return response.json();
     },
@@ -41,8 +41,10 @@ export default function PositionsPage() {
 
   const closePosition = async (positionId: string) => {
     try {
+      const controller = new AbortController();
       const response = await fetch(`/api/positions/${positionId}/close`, {
         method: 'POST',
+        signal: controller.signal,
       });
       if (!response.ok) throw new Error('Failed to close position');
       // Refetch positions after closing
@@ -53,10 +55,12 @@ export default function PositionsPage() {
 
   const updatePosition = async (positionId: string, updates: Partial<Position>) => {
     try {
+      const controller = new AbortController();
       const response = await fetch(`/api/positions/${positionId}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(updates),
+        signal: controller.signal,
       });
       if (!response.ok) throw new Error('Failed to update position');
     } catch (error) {
@@ -146,7 +150,7 @@ export default function PositionsPage() {
             <Target className="h-16 w-16 text-slate-600 mx-auto mb-4" />
             <h3 className="text-xl font-bold text-white mb-2">No Open Positions</h3>
             <p className="text-slate-400 mb-6">You don't have any active trades at the moment</p>
-            <Link href="/scanner">
+            <Link to="/scanner">
               <button className="px-6 py-3 bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-500 hover:to-purple-500 rounded-lg font-semibold transition-all">
                 Find Opportunities
               </button>

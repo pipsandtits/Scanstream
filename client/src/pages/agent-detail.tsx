@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { useRoute, useLocation } from 'wouter';
+import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import { 
   Shield, Zap, Brain, TrendingUp, Award, Heart, Flame, Eye, BarChart3, Network, 
   Wind, AlertCircle, CheckCircle, RotateCcw, Maximize2, Volume2, Search, Filter, ChevronDown,
@@ -62,15 +62,15 @@ const AGENT_CONFIG: Record<string, { color: string; bgColor: string; icon: React
 };
 
 const AgentDetailPage: React.FC = () => {
-  const [location, navigate] = useLocation();
-  const [match, params] = useRoute('/agent-detail/:agentName');
-  const agentName = params?.agentName || '';
+  const navigate = useNavigate();
+  const params = useParams();
+  const agentName = (params as any)?.agentName || '';
 
   // Fetch agent details
   const { data: agentData, isLoading: agentLoading, error: agentError } = useQuery({
     queryKey: ['agent-detail', agentName],
-    queryFn: async () => {
-      const response = await fetch(`/api/agents/status/${agentName}`);
+    queryFn: async ({ signal }: any) => {
+      const response = await fetch(`/api/agents/status/${agentName}`, { signal });
       if (!response.ok) throw new Error('Failed to fetch agent details');
       return response.json();
     },
@@ -81,8 +81,8 @@ const AgentDetailPage: React.FC = () => {
   // Fetch agent achievements
   const { data: achievementsData } = useQuery({
     queryKey: ['agent-achievements', agentName],
-    queryFn: async () => {
-      const response = await fetch(`/api/agents/${agentName}/achievements`);
+    queryFn: async ({ signal }: any) => {
+      const response = await fetch(`/api/agents/${agentName}/achievements`, { signal });
       if (!response.ok) throw new Error('Failed to fetch achievements');
       return response.json();
     },

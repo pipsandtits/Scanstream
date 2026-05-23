@@ -1,5 +1,5 @@
 import React, { useState, useMemo, useCallback, useEffect } from 'react';
-import { useLocation } from 'wouter';
+import { useNavigate } from 'react-router-dom';
 import {
   ArrowLeft, TrendingUp, TrendingDown, Activity, AlertCircle,
   Info, ChevronDown, BarChart3, PieChart, RefreshCw, Settings
@@ -147,7 +147,7 @@ const MetricCard: React.FC<{
 };
 
 const MetricsDashboard: React.FC = () => {
-  const [, navigate] = useLocation();
+  const navigate = useNavigate();
   const { events, isConnected } = useRealtime();
   const [expandedTier, setExpandedTier] = useState<string | null>('core');
   const [detailMetric, setDetailMetric] = useState<string | null>(null);

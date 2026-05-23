@@ -1,4 +1,5 @@
-import { PrismaClient } from '@prisma/client';
+import pkg from '@prisma/client';
+const { PrismaClient } = pkg as any;
 
 const prisma = new PrismaClient();
 
@@ -89,7 +90,7 @@ async function seedPhase5Data() {
 
   } catch (error) {
     console.error('[Seed] Error seeding Phase 5 data:', error);
-    process.exit(1);
+    (process as any).exit(1);
   } finally {
     await prisma.$disconnect();
   }

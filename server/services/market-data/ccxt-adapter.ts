@@ -10,13 +10,14 @@
  */
 
 import * as ccxt from 'ccxt';
+import { EventEmitter } from 'events';
 import type { MarketDataAdapter, Candle, Ticker, AdapterHealth } from '../../types/market-data';
 
 /**
  * Single exchange adapter for CCXT
  * Example: BinanceMarketDataAdapter, KuCoinMarketDataAdapter, etc.
  */
-export class CCXTMarketDataAdapter implements MarketDataAdapter {
+export class CCXTMarketDataAdapter extends EventEmitter implements MarketDataAdapter {
   readonly venue: string;
   readonly assetClass: 'crypto' | 'forex' = 'crypto';
   
@@ -25,13 +26,20 @@ export class CCXTMarketDataAdapter implements MarketDataAdapter {
   private errorCount: number = 0;
   private lastFetchTime?: number;
   private consecutiveFailures: number = 0;
+  private marketsLoaded: boolean = false;
+  private normalizeSymbolFn?: (s: string) => string;
 
   constructor(
     exchangeName: string,
     exchange: ccxt.Exchange
   ) {
+    super();
     this.venue = exchangeName;
     this.exchange = exchange;
+  }
+
+  setNormalizeSymbol(fn: (s: string) => string) {
+    this.normalizeSymbolFn = fn;
   }
 
   /**
@@ -49,7 +57,23 @@ export class CCXTMarketDataAdapter implements MarketDataAdapter {
     since?: number,
     limit?: number
   ): Promise<Candle[]> {
+    const started = Date.now();
     try {
+      // Lazy-load markets if not already done
+      try {
+        if (!this.marketsLoaded && (!this.exchange.markets || Object.keys(this.exchange.markets).length === 0)) {
+          await this.exchange.loadMarkets();
+          this.marketsLoaded = true;
+        }
+      } catch (merr) {
+        // non-fatal — continue (some exchanges allow fetch without markets loaded)
+        console.debug(`[${this.venue}] loadMarkets() failed (non-fatal):`, (merr as any)?.message || merr);
+      }
+
+      // Allow symbol normalization if provided
+      if (this.normalizeSymbolFn) {
+        symbol = this.normalizeSymbolFn(symbol);
+      }
       // Convert seconds to CCXT format (M1, M5, H1, D1, etc)
       const ccxtTimeframe = this.secondsToTimeframe(timeframe);
 
@@ -70,28 +94,44 @@ export class CCXTMarketDataAdapter implements MarketDataAdapter {
         close: Math.floor((row[4] as any) || 0),
         volume: row[5] || 0,
         isFinal: this.isCandleFinal(Math.floor((row[0] as any) || 0), timeframe),
-        source: 'ccxt',
+        // fetchOHLCV is a REST/backfill call — mark as historical and record adapter origin
+        source: 'historical',
+        origin: 'ccxt',
         venue: this.venue,
         raw: row,
       }));
 
       // Track success
+      const elapsed = Date.now() - started;
       this.lastFetchTime = Date.now();
       this.consecutiveFailures = 0;
       this.errorCount = 0;
       this.lastError = undefined;
 
+      // Emit adapter-level metrics
+      try {
+        this.emit('metrics', { venue: this.venue, symbol, timeframe, latency: elapsed, success: true, count: candles.length });
+      } catch (em) {
+        // ignore
+      }
+
       return candles;
     } catch (error: any) {
+      const elapsed = Date.now() - started;
       this.errorCount++;
       this.consecutiveFailures++;
       this.lastError = error?.message || 'Unknown error';
-      
+
       console.error(
-        `[${this.venue}] fetchOHLCV failed:`,
+        `[${this.venue}] fetchOHLCV(${symbol}, ${timeframe}s) failed:`,
         error?.message
       );
-      
+
+      // Emit adapter-level failure metrics
+      try {
+        this.emit('metrics', { venue: this.venue, symbol, timeframe, latency: elapsed, success: false, error: this.lastError });
+      } catch (em) {}
+
       throw error;
     }
   }
@@ -121,14 +161,25 @@ export class CCXTMarketDataAdapter implements MarketDataAdapter {
    * Get adapter health status
    */
   async getHealth(): Promise<AdapterHealth> {
+    const now = Date.now();
+    const uptime = this.lastFetchTime ? now - this.lastFetchTime : 0;
+    const latency = undefined as number | undefined;
+    const rateLimit = (this.exchange as any)?.rateLimit || undefined;
+
     return {
-      healthy: this.consecutiveFailures < 3,
-      lastCheckTime: Date.now(),
+      healthy: this.consecutiveFailures < 3 && uptime < 1000 * 60 * 10, // consider unhealthy if no fetch in last 10m
+      lastCheckTime: now,
       lastFetchTime: this.lastFetchTime,
+      latencyMs: latency,
       errorCount: this.errorCount,
       errorMessage: this.lastError,
       consecutiveFailures: this.consecutiveFailures,
-    };
+      // Extra info (consumers may ignore):
+      // @ts-ignore allow extra fields
+      uptime,
+      // @ts-ignore
+      rateLimit,
+    } as AdapterHealth;
   }
 
   /**

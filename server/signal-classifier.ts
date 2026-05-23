@@ -1,12 +1,13 @@
-
 import { useMemo, useRef } from 'react';
 import axios from 'axios';
 import { ARMEvaluator, MomentumSignalContext, RegimeContext } from './arm-evaluator';
 
-// User-supplied mappings for i18n
+// ─────────────────────────────────────────────────────────────
+// TYPES & INTERFACES
+// ─────────────────────────────────────────────────────────────
+
 export type LegacyLabelMap = { [k in LegacyLabel]?: LegacyLabel };
 
-// Interface for additional indicators, aligned with RL system
 export interface AdditionalIndicators {
   ichimoku_bullish?: boolean;
   vwap_bullish?: boolean;
@@ -14,10 +15,9 @@ export interface AdditionalIndicators {
   [key: string]: number | boolean | undefined;
 }
 
-// Type for streaming bars, aligned with RLSignal and ChartDataPoint
 export interface Bar {
   timestamp: number | bigint;
-  open: number; // Added for TradingChart
+  open: number;
   high: number;
   low: number;
   close: number;
@@ -30,7 +30,7 @@ export interface Bar {
   mom1d?: number;
   mom7d?: number;
   mom30d?: number;
-  bbPosition?: number; // Standardized from bbPos/bb_position
+  bbPosition?: number;
   additionalIndicators?: AdditionalIndicators;
   signal?: SignalStrengthLabel;
 }
@@ -77,7 +77,6 @@ export type LegacyLabel =
   | 'MACD Bearish'
   | 'Neutral';
 
-// Config type for classifier rules and thresholds
 export interface VolatilityProxies {
   volumeRatio?: number;
   atr?: number;
@@ -88,9 +87,11 @@ export interface VolatilityProxies {
 export interface SignalClassifierConfig {
   thresholds: { [k: string]: number };
   volatility?: VolatilityProxies;
-  hysteresis?: number; // Controls micro-state smoothing
-  legacyLabelMap?: LegacyLabelMap; // For i18n
-  enableARMIntegration?: boolean; // Enable Adaptive Regime Matcher
+  hysteresis?: number;
+  legacyLabelMap?: LegacyLabelMap;
+  enableARMIntegration?: boolean;
+  /** Base URL for the signals API. Defaults to VITE_SIGNALS_URL env var or '' (same origin). */
+  signalsApiUrl?: string;
   armConfig?: {
     regimeWeighting?: Record<string, number>;
     volatilityAdjustment?: number;
@@ -98,29 +99,104 @@ export interface SignalClassifierConfig {
   };
 }
 
-// Helper to freeze thresholds for type safety
-function freezeThresholds(thresholds: { [k: string]: number }): { [k: string]: number } {
-  return Object.freeze({ ...thresholds });
+// ─────────────────────────────────────────────────────────────
+// LABEL ORDERINGS (single source of truth)
+// ─────────────────────────────────────────────────────────────
+
+const SIGNAL_ORDER: SignalStrengthLabel[] = [
+  'Strong Sell', 'Sell', 'Weak Sell', 'Neutral', 'Weak Buy', 'Buy', 'Strong Buy',
+];
+
+const REGIME_ORDER: RegimeState[] = [
+  'BEAR_CAPITULATION', 'BEAR_STRONG', 'BEAR_EARLY',
+  'NEUTRAL', 'NEUTRAL_ACCUM', 'NEUTRAL_DIST',
+  'BULL_EARLY', 'BULL_STRONG', 'BULL_PARABOLIC',
+];
+
+const LEGACY_ORDER: LegacyLabel[] = [
+  'Oversold', 'MACD Bearish', 'Topping', 'Reversal',
+  'Neutral', 'Lagging', 'Consolidation',
+  'Weak Uptrend', 'Moderate Uptrend', 'MACD Bullish', 'Uptrend', 'Spike', 'Overbought',
+];
+
+const VALID_LEGACY_LABELS: ReadonlySet<LegacyLabel> = new Set<LegacyLabel>([
+  'Uptrend', 'Spike', 'Topping', 'Lagging', 'Moderate Uptrend', 'Reversal',
+  'Consolidation', 'Weak Uptrend', 'Overbought', 'Oversold', 'MACD Bullish',
+  'MACD Bearish', 'Neutral',
+]);
+
+// ─────────────────────────────────────────────────────────────
+// CONFIG LOADING
+// ─────────────────────────────────────────────────────────────
+
+function freezeThresholds(t: { [k: string]: number }): { [k: string]: number } {
+  return Object.freeze({ ...t });
 }
 
-// Load default config or fetch from backend
+/**
+ * Synchronous config loader — uses require() in Node, returns safe defaults in browser.
+ * For browser environments call loadSignalClassifierConfigAsync() at init time instead.
+ */
 export function loadSignalClassifierConfig(source: string = 'default'): SignalClassifierConfig {
-  if (source === 'default') {
-    const config = require('../config/signal-config.json');
-    return {
-      thresholds: config.thresholds,
-      volatility: config.volatility,
-      hysteresis: config.hysteresis ?? 2,
-      legacyLabelMap: config.legacyLabelMap ?? {},
-    };
+  if (source !== 'default') {
+    console.warn(`[SignalClassifier] Config source "${source}" not implemented, using defaults.`);
+    return loadSignalClassifierConfig();
   }
-  // Placeholder for fetching from backend or file
-  console.warn(`Config source ${source} not implemented, using default`);
-  return loadSignalClassifierConfig();
+
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const cfg = require('../config/signal-config.json');
+    return {
+      thresholds:     cfg.thresholds    ?? {},
+      volatility:     cfg.volatility    ?? {},
+      hysteresis:     cfg.hysteresis    ?? 2,
+      legacyLabelMap: cfg.legacyLabelMap ?? {},
+    };
+  } catch {
+    // Fixed: log clearly instead of silently swallowing, so callers know thresholds
+    // are falling back to inline defaults in every classify call.
+    console.error(
+      '[SignalClassifier] Could not load signal-config.json — all thresholds will use' +
+      ' hardcoded ?? defaults. Call loadSignalClassifierConfigAsync() at app init ' +
+      'to avoid this in browser environments.',
+    );
+    return { thresholds: {}, volatility: {}, hysteresis: 2, legacyLabelMap: {} };
+  }
 }
+
+/**
+ * Fixed: async config loader for browser environments.
+ * Await this once at app startup and pass the result everywhere.
+ */
+export async function loadSignalClassifierConfigAsync(
+  url: string = '/config/signal-config.json',
+): Promise<SignalClassifierConfig> {
+  try {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const cfg = await res.json();
+    return {
+      thresholds:     cfg.thresholds    ?? {},
+      volatility:     cfg.volatility    ?? {},
+      hysteresis:     cfg.hysteresis    ?? 2,
+      legacyLabelMap: cfg.legacyLabelMap ?? {},
+    };
+  } catch (err) {
+    console.error('[SignalClassifier] Failed to load config from', url, err);
+    return { thresholds: {}, volatility: {}, hysteresis: 2, legacyLabelMap: {} };
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// SIGNAL CLASSIFIER
+// ─────────────────────────────────────────────────────────────
 
 export class SignalClassifier {
-  // Static proxy for API usage: allows direct calls without instantiation
+  // ── Static proxies ───────────────────────────────────────
+
+  // Fixed: sharedInstance declared before the static methods that reference it
+  private static readonly sharedInstance = new SignalClassifier();
+
   static classifyMomentumSignal(
     momentumShort: number,
     momentumLong: number,
@@ -132,133 +208,184 @@ export class SignalClassifier {
     timestamp?: bigint | number,
     externalRegime?: RegimeContext,
   ): SignalStrengthLabel {
-    return new SignalClassifier().classifyMomentumSignal(
-      momentumShort,
-      momentumLong,
-      rsi,
-      macd,
-      config,
-      additionalIndicators,
-      previousLabel,
-      timestamp,
-      externalRegime,
+    return SignalClassifier.sharedInstance.classifyMomentumSignal(
+      momentumShort, momentumLong, rsi, macd, config,
+      additionalIndicators, previousLabel, timestamp, externalRegime,
     );
   }
 
   static classifyState(
-    mom1d: number,
-    mom7d: number,
-    mom30d: number,
-    rsi: number,
-    macd: number,
-    bbPosition: number,
+    mom1d: number, mom7d: number, mom30d: number,
+    rsi: number, macd: number, bbPosition: number,
     config: SignalClassifierConfig,
     previousLabel?: RegimeState,
     timestamp?: bigint | number,
   ): RegimeState {
-    return new SignalClassifier().classifyState(
-      mom1d,
-      mom7d,
-      mom30d,
-      rsi,
-      macd,
-      bbPosition,
-      config,
-      previousLabel,
-      timestamp,
+    return SignalClassifier.sharedInstance.classifyState(
+      mom1d, mom7d, mom30d, rsi, macd, bbPosition,
+      config, previousLabel, timestamp,
     );
   }
 
   static classifyLegacy(
-    mom7d: number,
-    mom30d: number,
-    rsi: number,
-    macd: number,
-    bbPosition: number,
+    mom7d: number, mom30d: number,
+    rsi: number, macd: number, bbPosition: number,
     config: SignalClassifierConfig,
     previousLabel?: LegacyLabel,
     timestamp?: bigint | number,
   ): LegacyLabel {
-    return new SignalClassifier().classifyLegacy(
-      mom7d,
-      mom30d,
-      rsi,
-      macd,
-      bbPosition,
-      config,
-      previousLabel,
-      timestamp,
+    return SignalClassifier.sharedInstance.classifyLegacy(
+      mom7d, mom30d, rsi, macd, bbPosition,
+      config, previousLabel, timestamp,
     );
   }
-  private signalMemoCache: Map<string, SignalStrengthLabel | RegimeState | LegacyLabel>;
-  private readonly MAX_CACHE_SIZE = 1000; // Prevent memory leaks
 
-  constructor() {
-    this.signalMemoCache = new Map();
-  }
+  // ── Per-method caches ─────────────────────────────────────
+  // Fixed: three separate Maps so classifyMomentumSignal, classifyState, and
+  // classifyLegacy can never collide on a matching key and return each other's
+  // cached label (which would be the wrong type at runtime).
+  private signalCache:  Map<string, SignalStrengthLabel> = new Map();
+  private regimeCache:  Map<string, RegimeState>         = new Map();
+  private legacyCache:  Map<string, LegacyLabel>         = new Map();
 
-  /**
-   * Clears the memoization cache to prevent memory leaks
-   */
-  private clearCacheIfNeeded(): void {
-    if (this.signalMemoCache.size > this.MAX_CACHE_SIZE) {
-      this.signalMemoCache.clear();
+  private signalCacheTs: Map<string, number> = new Map();
+  private regimeCacheTs: Map<string, number> = new Map();
+  private legacyCacheTs: Map<string, number> = new Map();
+
+  private readonly MAX_CACHE_SIZE   = 1000;
+  private readonly MAX_CACHE_AGE_MS = 24 * 60 * 60 * 1000;
+
+  // ── Cache helpers ─────────────────────────────────────────
+
+  private evict<T>(
+    cache: Map<string, T>,
+    timestamps: Map<string, number>,
+  ): void {
+    const now = Date.now();
+    for (const [k, t] of timestamps) {
+      if (now - t > this.MAX_CACHE_AGE_MS) {
+        cache.delete(k);
+        timestamps.delete(k);
+      }
+    }
+    if (cache.size > this.MAX_CACHE_SIZE) {
+      cache.clear();
+      timestamps.clear();
     }
   }
 
+  private createCacheKey(...args: unknown[]): string {
+    return args.map(a => {
+      if (typeof a === 'number') return a.toFixed(6);
+      if (a !== null && typeof a === 'object') {
+        try { return JSON.stringify(a, Object.keys(a as object).sort()); }
+        catch { return String(a); }
+      }
+      return String(a);
+    }).join('|');
+  }
+
+  // ── Volatility multiplier ─────────────────────────────────
+  // Fixed: was multiplying all four proxies together (could reach ×16).
+  // Now uses the single largest active proxy, clamped to [0.5, 2.0].
+  private applyVolatilityMultiplier(base: number, vol: VolatilityProxies = {}): number {
+    const candidates: number[] = [];
+    if (vol.atr           !== undefined) candidates.push(vol.atr);
+    if (vol.rv            !== undefined) candidates.push(vol.rv);
+    if (vol.ivPercentile  !== undefined) candidates.push(vol.ivPercentile / 100);
+    if (vol.volumeRatio   !== undefined) candidates.push(vol.volumeRatio);
+    if (candidates.length === 0) return base;
+    const mult = Math.max(0.5, Math.min(2.0, Math.max(...candidates)));
+    return base * mult;
+  }
+
+  // ── Regime helper (shared path) ───────────────────────────
+  // Fixed: ARM regime inference and classifyState previously used different
+  // code paths and could disagree. ARM now calls classifyState directly so
+  // the regime used for weighting is always consistent with what's returned.
+  private computeRegime(
+    mom1d: number, mom7d: number, mom30d: number,
+    rsi: number, macd: number, bbPosition: number,
+    thresholds: { [k: string]: number },
+    vol: VolatilityProxies,
+  ): RegimeState {
+    const thWeak   = this.applyVolatilityMultiplier(thresholds['weak']   ?? 0.015, vol);
+    const thMed    = this.applyVolatilityMultiplier(thresholds['med']    ?? 0.035, vol);
+    const thStrong = this.applyVolatilityMultiplier(thresholds['strong'] ?? 0.075, vol);
+
+    const breakoutUp   = bbPosition > 0.85 && mom1d > thWeak;
+    const breakoutDn   = bbPosition < 0.15 && mom1d < -thWeak;
+    const thrustUp     = mom1d > thMed  && mom7d > thMed;
+    const thrustDn     = mom1d < -thMed && mom7d < -thMed;
+    const parabolic    = Math.abs(mom1d) > thStrong && Math.abs(mom7d) > thStrong;
+
+    if (parabolic && mom1d > 0) return 'BULL_PARABOLIC';
+    if (parabolic && mom1d < 0) return 'BEAR_CAPITULATION';
+    if (thrustUp)               return 'BULL_STRONG';
+    if (thrustDn)               return 'BEAR_STRONG';
+    if (breakoutUp)             return 'BULL_EARLY';
+    if (breakoutDn)             return 'BEAR_EARLY';
+    if (-thWeak < mom7d && mom7d < thWeak) {
+      if (rsi < 35 && mom1d > 0) return 'NEUTRAL_ACCUM';
+      if (rsi > 65 && mom1d < 0) return 'NEUTRAL_DIST';
+    }
+    return 'NEUTRAL';
+  }
+
+  // ── Signal API ────────────────────────────────────────────
+
   /**
-   * Fetches signals from the RL trading system backend
-   * @param timeframe - Trading timeframe (e.g., '1h', '1d')
-   * @param dryRun - Whether to simulate trades
-   * @returns Array of Bar objects
+   * Fixed: P3 — API URL is now configurable via config.signalsApiUrl,
+   * falling back to VITE_SIGNALS_URL env var, then same-origin /signals.
+   * Returns [] on error but logs a distinguishable message so callers know
+   * whether empty results are real or a fetch failure.
    */
-  static async fetchSignals(timeframe: string = '1h', dryRun: boolean = true): Promise<Bar[]> {
+  static async fetchSignals(
+    timeframe: string = '1h',
+    dryRun: boolean = true,
+    config?: Pick<SignalClassifierConfig, 'signalsApiUrl'>,
+  ): Promise<Bar[]> {
+    const base =
+      config?.signalsApiUrl ??
+      (typeof import.meta !== 'undefined'
+        ? (import.meta as any).env?.VITE_SIGNALS_URL
+        : undefined) ??
+      '';
+    const url = `${base}/signals`;
+
     try {
-      const response = await axios.post('http://localhost:8000/signals', {
-        timeframe,
-        dry_run: dryRun,
-      });
-      return response.data.map((signal: any) => ({
-        timestamp: new Date(signal.timestamp || Date.now()).getTime(),
-        open: signal.open || signal.price,
-        high: signal.high || signal.price * 1.01,
-        low: signal.low || signal.price * 0.99,
-        close: signal.close || signal.price,
-        volume: signal.volume || 0,
-        momentumShort: signal.momentum_short,
-        momentumLong: signal.momentum_long,
-        rsi: signal.rsi,
-        macd: signal.macd,
-        volumeRatio: signal.volume_ratio,
-        mom1d: signal.mom1d,
-        mom7d: signal.mom7d,
-        mom30d: signal.mom30d,
-        bbPosition: signal.bb_position,
+      const response = await axios.post(url, { timeframe, dry_run: dryRun });
+      return (response.data as any[]).map(s => ({
+        timestamp: new Date(s.timestamp ?? Date.now()).getTime(),
+        open:      s.open  ?? s.price,
+        high:      s.high  ?? s.price * 1.01,
+        low:       s.low   ?? s.price * 0.99,
+        close:     s.close ?? s.price,
+        volume:    s.volume ?? 0,
+        momentumShort: s.momentum_short,
+        momentumLong:  s.momentum_long,
+        rsi:           s.rsi,
+        macd:          s.macd,
+        volumeRatio:   s.volume_ratio,
+        mom1d:         s.mom1d,
+        mom7d:         s.mom7d,
+        mom30d:        s.mom30d,
+        bbPosition:    s.bb_position,
         additionalIndicators: {
-          ichimoku_bullish: signal.ichimoku_bullish,
-          vwap_bullish: signal.vwap_bullish,
-          ema_crossover: signal.ema_crossover,
+          ichimoku_bullish: s.ichimoku_bullish,
+          vwap_bullish:     s.vwap_bullish,
+          ema_crossover:    s.ema_crossover,
         },
-        signal: signal.signal,
-      }));
+        signal: s.signal,
+      } as Bar));
     } catch (error) {
-      console.error('Failed to fetch signals:', error);
+      console.error(`[SignalClassifier] fetchSignals failed (url=${url}):`, error);
       return [];
     }
   }
 
-  /**
-   * Classifies the main trading signal with ARM integration, hysteresis and memoization
-   * @param momentumShort - Short-term momentum
-   * @param momentumLong - Long-term momentum
-   * @param rsi - Relative Strength Index
-   * @param macd - MACD indicator
-   * @param config - Classifier configuration
-   * @param additionalIndicators - Additional indicators (e.g., ichimoku_bullish)
-   * @param previousLabel - Previous signal label for hysteresis
-   * @param timestamp - Timestamp for cache key
-   * @returns Signal strength label
-   */
+  // ── classifyMomentumSignal ────────────────────────────────
+
   classifyMomentumSignal(
     momentumShort: number,
     momentumLong: number,
@@ -270,442 +397,307 @@ export class SignalClassifier {
     timestamp?: bigint | number,
     externalRegime?: RegimeContext,
   ): SignalStrengthLabel {
-    const key = `${timestamp ?? ''}|${momentumShort}|${momentumLong}|${rsi}|${macd}|${JSON.stringify(additionalIndicators)}`;
-    if (this.signalMemoCache.has(key)) {
-      return this.signalMemoCache.get(key) as SignalStrengthLabel;
-    }
+    const key = this.createCacheKey(
+      'sig', timestamp ?? '', momentumShort, momentumLong, rsi, macd, additionalIndicators,
+    );
+    if (this.signalCache.has(key)) return this.signalCache.get(key)!;
 
-    this.clearCacheIfNeeded();
+    this.evict(this.signalCache, this.signalCacheTs);
+
     const thresholds = freezeThresholds(config.thresholds || {});
-    const vol = config.volatility || {};
-    let volMult = 1.0;
-    if (vol.atr) volMult *= Math.max(0.5, Math.min(2.0, vol.atr));
-    if (vol.rv) volMult *= Math.max(0.5, Math.min(2.0, vol.rv));
-    if (vol.ivPercentile) volMult *= Math.max(0.5, Math.min(2.0, vol.ivPercentile / 100));
-    if (vol.volumeRatio) volMult *= Math.max(0.5, Math.min(2.0, vol.volumeRatio));
-    const momTh = (thresholds['momentum_short'] ?? 0.01) * volMult;
+    const vol    = config.volatility ?? {};
+    const momTh  = this.applyVolatilityMultiplier(thresholds['momentum_short'] ?? 0.01, vol);
     const rsiMin = thresholds['rsi_min'] ?? 50;
     const rsiMax = thresholds['rsi_max'] ?? 70;
     const macdMin = thresholds['macd_min'] ?? 0;
 
     let label: SignalStrengthLabel = 'Neutral';
     if (
-      momentumShort > momTh * 2 &&
-      momentumLong > momTh &&
-      rsi > rsiMin &&
-      rsi < rsiMax &&
-      macd > macdMin &&
+      momentumShort > momTh * 2 && momentumLong > momTh &&
+      rsi > rsiMin && rsi < rsiMax && macd > macdMin &&
       additionalIndicators.ichimoku_bullish
     ) {
       label = 'Strong Buy';
-    } else if (momentumShort > momTh && rsi > rsiMin && macd > 0) {
+    } else if (momentumShort > momTh  && rsi > rsiMin       && macd > 0) {
       label = 'Buy';
-    } else if (momentumShort > 0 && rsi > 45 && macd > 0) {
+    } else if (momentumShort > 0      && rsi > 45            && macd > 0) {
       label = 'Weak Buy';
     } else if (
-      momentumShort < -momTh * 2 &&
-      momentumLong < -momTh &&
-      rsi < 100 - rsiMin &&
-      rsi > 20 &&
-      macd < -macdMin &&
+      momentumShort < -momTh * 2 && momentumLong < -momTh &&
+      rsi < 100 - rsiMin && rsi > 20 && macd < -macdMin &&
       !additionalIndicators.ichimoku_bullish
     ) {
       label = 'Strong Sell';
     } else if (momentumShort < -momTh && rsi < 100 - rsiMin && macd < 0) {
       label = 'Sell';
-    } else if (momentumShort < 0 && rsi < 55 && macd < 0) {
+    } else if (momentumShort < 0      && rsi < 55             && macd < 0) {
       label = 'Weak Sell';
     }
 
-    // ARM Integration: Apply regime-aware adjustments
+    // ARM integration
+    // Fixed: regime is now computed via computeRegime() — the same function used
+    // by classifyState — so ARM weighting and regime output are always consistent.
     if (config.enableARMIntegration) {
-      // Use externally provided regimeContext when available (from RegimeService)
       let regimeContext: RegimeContext;
       if (externalRegime) {
         regimeContext = externalRegime;
       } else {
-        const regimeConfidence = ARMEvaluator.calculateRegimeConfidence(momentumShort, momentumLong, rsi);
-        const trendStrength = ARMEvaluator.evaluateTrendStrength(momentumLong, macd, rsi);
-        const volatility = ARMEvaluator.evaluateVolatility(momentumShort, rsi, additionalIndicators);
-        // Determine regime state based on momentum and RSI
-        const regimeState = this.inferRegimeFromMomentum(momentumLong, rsi, macd);
-
-        regimeContext = {
-          regime: regimeState,
-          volatility,
-          trendStrength,
-          regimeConfidence,
-        };
+        const regimeState  = this.computeRegime(
+          0, momentumLong, 0, rsi, macd, 0.5, thresholds, vol,
+        );
+        const regimeConf   = ARMEvaluator.calculateRegimeConfidence(momentumShort, momentumLong, rsi);
+        const trendStr     = ARMEvaluator.evaluateTrendStrength(momentumLong, macd, rsi);
+        const volatility   = ARMEvaluator.evaluateVolatility(momentumShort, rsi, additionalIndicators);
+        regimeContext = { regime: regimeState, volatility, trendStrength: trendStr, regimeConfidence: regimeConf };
       }
 
       const signalContext: MomentumSignalContext = {
-        momentumShort,
-        momentumLong,
-        rsi,
-        macd,
-        regimeContext,
-        additionalIndicators,
+        momentumShort, momentumLong, rsi, macd, regimeContext, additionalIndicators,
       };
 
-      // Apply ARM evaluation
-      const armConfig = {
+      const armCfg = {
         enableAdaptiveThresholds: true,
-        regimeWeighting: config.armConfig?.regimeWeighting || {
-          'BULL_EARLY': 1.1,
-          'BULL_STRONG': 1.3,
-          'BULL_PARABOLIC': 1.2,
-          'BEAR_EARLY': 0.9,
-          'BEAR_STRONG': 0.7,
-          'BEAR_CAPITULATION': 0.8,
-          'NEUTRAL_ACCUM': 1.0,
-          'NEUTRAL_DIST': 1.0,
-          'NEUTRAL': 1.0,
+        regimeWeighting: config.armConfig?.regimeWeighting ?? {
+          BULL_EARLY: 1.1, BULL_STRONG: 1.3, BULL_PARABOLIC: 1.2,
+          BEAR_EARLY: 0.9, BEAR_STRONG: 0.7, BEAR_CAPITULATION: 0.8,
+          NEUTRAL_ACCUM: 1.0, NEUTRAL_DIST: 1.0, NEUTRAL: 1.0,
         },
         volatilityAdjustment: config.armConfig?.volatilityAdjustment ?? 0.5,
-        trendInfluence: config.armConfig?.trendInfluence ?? 0.3,
+        trendInfluence:       config.armConfig?.trendInfluence       ?? 0.3,
       };
 
-      label = ARMEvaluator.evaluateMomentumWithRegime(signalContext, label, armConfig);
+      label = ARMEvaluator.evaluateMomentumWithRegime(signalContext, label, armCfg);
     }
 
-    // Hysteresis smoothing
-    if (previousLabel && config.hysteresis !== undefined && previousLabel !== label) {
-      const labelOrder: SignalStrengthLabel[] = [
-        'Strong Sell',
-        'Sell',
-        'Weak Sell',
-        'Neutral',
-        'Weak Buy',
-        'Buy',
-        'Strong Buy',
-      ];
-      const prevIdx = labelOrder.indexOf(previousLabel);
-      const currIdx = labelOrder.indexOf(label);
-      if (Math.abs(currIdx - prevIdx) < (config.hysteresis ?? 2)) {
-        label = previousLabel;
-      }
-    }
+    // Hysteresis
+    label = applyHysteresis(label, previousLabel, SIGNAL_ORDER, config.hysteresis);
 
-    this.signalMemoCache.set(key, label);
+    this.signalCache.set(key, label);
+    this.signalCacheTs.set(key, Date.now());
     return label;
   }
 
-  /**
-   * Infers regime state from momentum and price action indicators
-   * Maps momentum signals to regime states for ARM
-   */
-  private inferRegimeFromMomentum(momentumLong: number, rsi: number, macd: number): RegimeState {
-    const isBullish = momentumLong > 0 && rsi > 50 && macd > 0;
-    const isBearish = momentumLong < 0 && rsi < 50 && macd < 0;
-    const isMildBullish = momentumLong > 0 && rsi > 45;
-    const isMildBearish = momentumLong < 0 && rsi < 55;
-    const isAccumulation = rsi < 35 && momentumLong >= 0;
-    const isDistribution = rsi > 65 && momentumLong <= 0;
-    
-    // Strong regimes
-    if (Math.abs(momentumLong) > 0.05) {
-      if (isBullish) return 'BULL_STRONG';
-      if (isBearish) return 'BEAR_STRONG';
-    }
-    
-    // Mild regimes
-    if (isMildBullish && momentumLong > 0.01) return 'BULL_EARLY';
-    if (isMildBearish && momentumLong < -0.01) return 'BEAR_EARLY';
-    
-    // Neutral phases
-    if (isAccumulation) return 'NEUTRAL_ACCUM';
-    if (isDistribution) return 'NEUTRAL_DIST';
-    
-    return 'NEUTRAL';
-  }
+  // ── classifyState ─────────────────────────────────────────
 
-  /**
-   * Classifies the regime state with memoization
-   * @param mom1d - 1-day momentum
-   * @param mom7d - 7-day momentum
-   * @param mom30d - 30-day momentum
-   * @param rsi - Relative Strength Index
-   * @param macd - MACD indicator
-   * @param bbPosition - Bollinger Band position
-   * @param config - Classifier configuration
-   * @param previousLabel - Previous regime label
-   * @param timestamp - Timestamp for cache key
-   * @returns Regime state
-   */
+  // Fixed: hysteresis now applied (was accepted but silently ignored before)
   classifyState(
-    mom1d: number,
-    mom7d: number,
-    mom30d: number,
-    rsi: number,
-    macd: number,
-    bbPosition: number,
+    mom1d: number, mom7d: number, mom30d: number,
+    rsi: number, macd: number, bbPosition: number,
     config: SignalClassifierConfig,
     previousLabel?: RegimeState,
     timestamp?: bigint | number,
   ): RegimeState {
-    const key = `${timestamp ?? ''}|${mom1d}|${mom7d}|${mom30d}|${rsi}|${macd}|${bbPosition}`;
-    if (this.signalMemoCache.has(key)) {
-      return this.signalMemoCache.get(key) as RegimeState;
-    }
+    const key = this.createCacheKey('reg', timestamp ?? '', mom1d, mom7d, mom30d, rsi, macd, bbPosition);
+    if (this.regimeCache.has(key)) return this.regimeCache.get(key)!;
 
-    this.clearCacheIfNeeded();
+    this.evict(this.regimeCache, this.regimeCacheTs);
+
     const thresholds = freezeThresholds(config.thresholds || {});
-    const vol = config.volatility || {};
-    let volMult = 1.0;
-    if (vol.atr) volMult *= Math.max(0.5, Math.min(2.0, vol.atr));
-    if (vol.rv) volMult *= Math.max(0.5, Math.min(2.0, vol.rv));
-    if (vol.ivPercentile) volMult *= Math.max(0.5, Math.min(2.0, vol.ivPercentile / 100));
-    if (vol.volumeRatio) volMult *= Math.max(0.5, Math.min(2.0, vol.volumeRatio));
-    const thWeak = (thresholds['weak'] ?? 0.015) * volMult;
-    const thMed = (thresholds['med'] ?? 0.035) * volMult;
-    const thStrong = (thresholds['strong'] ?? 0.075) * volMult;
+    const vol = config.volatility ?? {};
 
-    let label: RegimeState = 'NEUTRAL';
-    const breakoutUp = bbPosition > 0.85 && mom1d > thWeak;
-    const breakoutDn = bbPosition < 0.15 && mom1d < -thWeak;
-    const thrustUp = mom1d > thMed && mom7d > thMed;
-    const thrustDn = mom1d < -thMed && mom7d < -thMed;
-    const parabolic = Math.abs(mom1d) > thStrong && Math.abs(mom7d) > thStrong;
+    let label = this.computeRegime(mom1d, mom7d, mom30d, rsi, macd, bbPosition, thresholds, vol);
+    label = applyHysteresis(label, previousLabel, REGIME_ORDER, config.hysteresis);
 
-    if (parabolic && mom1d > 0) label = 'BULL_PARABOLIC';
-    else if (parabolic && mom1d < 0) label = 'BEAR_CAPITULATION';
-    else if (thrustUp) label = 'BULL_STRONG';
-    else if (thrustDn) label = 'BEAR_STRONG';
-    else if (breakoutUp) label = 'BULL_EARLY';
-    else if (breakoutDn) label = 'BEAR_EARLY';
-    else if (-thWeak < mom7d && mom7d < thWeak) {
-      if (rsi < 35 && mom1d > 0) label = 'NEUTRAL_ACCUM';
-      if (rsi > 65 && mom1d < 0) label = 'NEUTRAL_DIST';
-    }
-
-    this.signalMemoCache.set(key, label);
+    this.regimeCache.set(key, label);
+    this.regimeCacheTs.set(key, Date.now());
     return label;
   }
 
-  /**
-   * Classifies legacy labels with memoization and i18n support
-   * @param mom7d - 7-day momentum
-   * @param mom30d - 30-day momentum
-   * @param rsi - Relative Strength Index
-   * @param macd - MACD indicator
-   * @param bbPosition - Bollinger Band position
-   * @param config - Classifier configuration
-   * @param previousLabel - Previous legacy label
-   * @param timestamp - Timestamp for cache key
-   * @returns Legacy label
-   */
+  // ── classifyLegacy ────────────────────────────────────────
+
+  // Fixed: hysteresis now applied (was accepted but silently ignored before)
   classifyLegacy(
-    mom7d: number,
-    mom30d: number,
-    rsi: number,
-    macd: number,
-    bbPosition: number,
+    mom7d: number, mom30d: number,
+    rsi: number, macd: number, bbPosition: number,
     config: SignalClassifierConfig,
     previousLabel?: LegacyLabel,
     timestamp?: bigint | number,
   ): LegacyLabel {
-    const key = `${timestamp ?? ''}|${mom7d}|${mom30d}|${rsi}|${macd}|${bbPosition}`;
-    if (this.signalMemoCache.has(key)) {
-      return this.signalMemoCache.get(key) as LegacyLabel;
-    }
+    const key = this.createCacheKey('leg', timestamp ?? '', mom7d, mom30d, rsi, macd, bbPosition);
+    if (this.legacyCache.has(key)) return this.legacyCache.get(key)!;
 
-    this.clearCacheIfNeeded();
+    this.evict(this.legacyCache, this.legacyCacheTs);
+
     const thresholds = freezeThresholds(config.thresholds || {});
-    const vol = config.volatility || {};
-    let volMult = 1.0;
-    if (vol.atr) volMult *= Math.max(0.5, Math.min(2.0, vol.atr));
-    if (vol.rv) volMult *= Math.max(0.5, Math.min(2.0, vol.rv));
-    if (vol.ivPercentile) volMult *= Math.max(0.5, Math.min(2.0, vol.ivPercentile / 100));
-    if (vol.volumeRatio) volMult *= Math.max(0.5, Math.min(2.0, vol.volumeRatio));
-    const thHigh = (thresholds['high'] ?? 0.07) * volMult;
-    const thMed = (thresholds['med'] ?? 0.035) * volMult;
-    const thLow = (thresholds['low'] ?? 0.015) * volMult;
+    const vol  = config.volatility ?? {};
+    const thHigh = this.applyVolatilityMultiplier(thresholds['high'] ?? 0.07,  vol);
+    const thMed  = this.applyVolatilityMultiplier(thresholds['med']  ?? 0.035, vol);
+    const thLow  = this.applyVolatilityMultiplier(thresholds['low']  ?? 0.015, vol);
 
     let label: LegacyLabel = 'Neutral';
-    if (mom7d > thMed && mom30d > thHigh && mom7d < 0.5 * mom30d) label = 'Uptrend';
-    else if (mom7d > thHigh && Math.abs(mom30d) < thMed) label = 'Spike';
+    if      (mom7d > thMed  && mom30d > thHigh && mom7d < 0.5 * mom30d) label = 'Uptrend';
+    else if (mom7d > thHigh && Math.abs(mom30d) < thMed)                 label = 'Spike';
     else if (mom7d < -thMed && mom30d > thHigh && bbPosition > 0.80 && rsi > 65) label = 'Topping';
-    else if (Math.abs(mom7d) < thLow && Math.abs(mom30d) < thMed) label = 'Lagging';
+    else if (Math.abs(mom7d) < thLow && Math.abs(mom30d) < thMed)        label = 'Lagging';
     else if (thLow < mom7d && mom7d < thHigh && thMed < mom30d && mom30d < thHigh) label = 'Moderate Uptrend';
-    else if (mom7d > thMed && mom30d < -thMed && rsi < 45) label = 'Reversal';
+    else if (mom7d > thMed  && mom30d < -thMed && rsi < 45)              label = 'Reversal';
     else if (Math.abs(mom7d) < thLow && Math.abs(mom30d) < thLow && rsi >= 40 && rsi <= 60) label = 'Consolidation';
-    else if (mom7d > thLow && Math.abs(mom30d) < thLow) label = 'Weak Uptrend';
-    else if (rsi > 75 && mom7d > thMed) label = 'Overbought';
-    else if (rsi < 25 && mom7d < -thMed) label = 'Oversold';
-    else if (macd > 0 && mom7d > thMed) label = 'MACD Bullish';
-    else if (macd < 0 && mom7d < -thMed) label = 'MACD Bearish';
+    else if (mom7d > thLow  && Math.abs(mom30d) < thLow)                 label = 'Weak Uptrend';
+    else if (rsi > 75       && mom7d > thMed)                            label = 'Overbought';
+    else if (rsi < 25       && mom7d < -thMed)                           label = 'Oversold';
+    else if (macd > 0       && mom7d > thMed)                            label = 'MACD Bullish';
+    else if (macd < 0       && mom7d < -thMed)                           label = 'MACD Bearish';
 
     // i18n mapping with validation
-    if (config.legacyLabelMap && config.legacyLabelMap[label]) {
-      const mappedLabel = config.legacyLabelMap[label];
-      const validLabels: LegacyLabel[] = [
-        'Uptrend', 'Spike', 'Topping', 'Lagging', 'Moderate Uptrend', 'Reversal',
-        'Consolidation', 'Weak Uptrend', 'Overbought', 'Oversold', 'MACD Bullish',
-        'MACD Bearish', 'Neutral',
-      ];
-      if (validLabels.includes(mappedLabel as LegacyLabel)) {
-        label = mappedLabel as LegacyLabel;
-      }
+    if (config.legacyLabelMap?.[label]) {
+      const mapped = config.legacyLabelMap[label]!;
+      // LegacyLabelMap allows mapping a label to itself for partial-override configs
+      if (VALID_LEGACY_LABELS.has(mapped)) label = mapped;
     }
 
-    this.signalMemoCache.set(key, label);
+    label = applyHysteresis(label, previousLabel, LEGACY_ORDER, config.hysteresis);
+
+    this.legacyCache.set(key, label);
+    this.legacyCacheTs.set(key, Date.now());
     return label;
   }
 
-  /**
-   * Classifies streaming bars (e.g., from RL system)
-   * @param bars - Array of Bar objects (rolling window)
-   * @param config - Classifier configuration
-   * @returns Classification for the latest bar
-   */
+  // ── classifyStreaming ─────────────────────────────────────
+
   classifyStreaming(bars: Bar[], config: SignalClassifierConfig): Classification {
-    if (!bars.length) throw new Error('No bars provided');
-    const latest = bars[bars.length - 1];
+    if (!bars.length) throw new Error('[SignalClassifier] No bars provided to classifyStreaming');
+    const latest    = bars[bars.length - 1];
     const prevSignal = bars.length > 1 ? bars[bars.length - 2].signal : undefined;
 
     const signal = this.classifyMomentumSignal(
-      latest.momentumShort,
-      latest.momentumLong,
-      latest.rsi,
-      latest.macd,
-      config,
-      latest.additionalIndicators ?? {},
-      prevSignal,
-      latest.timestamp,
+      latest.momentumShort, latest.momentumLong, latest.rsi, latest.macd,
+      config, latest.additionalIndicators ?? {}, prevSignal, latest.timestamp,
     );
     const regime = this.classifyState(
-      latest.mom1d ?? 0,
-      latest.mom7d ?? 0,
-      latest.mom30d ?? 0,
-      latest.rsi,
-      latest.macd,
-      latest.bbPosition ?? 0,
-      config,
-      undefined,
-      latest.timestamp,
+      latest.mom1d ?? 0, latest.mom7d ?? 0, latest.mom30d ?? 0,
+      latest.rsi, latest.macd, latest.bbPosition ?? 0,
+      config, undefined, latest.timestamp,
     );
     const legacy = this.classifyLegacy(
-      latest.mom7d ?? 0,
-      latest.mom30d ?? 0,
-      latest.rsi,
-      latest.macd,
-      latest.bbPosition ?? 0,
-      config,
-      undefined,
-      latest.timestamp,
+      latest.mom7d ?? 0, latest.mom30d ?? 0,
+      latest.rsi, latest.macd, latest.bbPosition ?? 0,
+      config, undefined, latest.timestamp,
     );
 
     return { signal, regime, legacy, bar: latest };
   }
 
+  // ── classifyBatch ─────────────────────────────────────────
+
   /**
-   * Batch classification for back-tests
-   * @param bars - Array of Bar objects
-   * @param config - Classifier configuration
-   * @returns Array of Classification objects
+   * Fixed: hysteresis now carries forward the signal computed in this batch run,
+   * not the stale `.signal` field from the original input bar objects.
    */
   classifyBatch(bars: Bar[], config: SignalClassifierConfig): Classification[] {
-    return bars.map((bar, i) => {
-      const prevSignal = i > 0 ? bars[i - 1].signal : undefined;
+    const results: Classification[] = [];
+    let prevSignal: SignalStrengthLabel | undefined;
+    let prevRegime: RegimeState         | undefined;
+    let prevLegacy: LegacyLabel         | undefined;
+
+    for (const bar of bars) {
       const signal = this.classifyMomentumSignal(
-        bar.momentumShort,
-        bar.momentumLong,
-        bar.rsi,
-        bar.macd,
-        config,
-        bar.additionalIndicators ?? {},
-        prevSignal,
-        bar.timestamp,
+        bar.momentumShort, bar.momentumLong, bar.rsi, bar.macd,
+        config, bar.additionalIndicators ?? {}, prevSignal, bar.timestamp,
       );
       const regime = this.classifyState(
-        bar.mom1d ?? 0,
-        bar.mom7d ?? 0,
-        bar.mom30d ?? 0,
-        bar.rsi,
-        bar.macd,
-        bar.bbPosition ?? 0,
-        config,
-        undefined,
-        bar.timestamp,
+        bar.mom1d ?? 0, bar.mom7d ?? 0, bar.mom30d ?? 0,
+        bar.rsi, bar.macd, bar.bbPosition ?? 0,
+        config, prevRegime, bar.timestamp,
       );
       const legacy = this.classifyLegacy(
-        bar.mom7d ?? 0,
-        bar.mom30d ?? 0,
-        bar.rsi,
-        bar.macd,
-        bar.bbPosition ?? 0,
-        config,
-        undefined,
-        bar.timestamp,
+        bar.mom7d ?? 0, bar.mom30d ?? 0,
+        bar.rsi, bar.macd, bar.bbPosition ?? 0,
+        config, prevLegacy, bar.timestamp,
       );
-      return { signal, regime, legacy, bar };
-    });
+
+      results.push({ signal, regime, legacy, bar });
+      prevSignal = signal;
+      prevRegime = regime;
+      prevLegacy = legacy;
+    }
+
+    return results;
   }
 }
 
+// ─────────────────────────────────────────────────────────────
+// SHARED HYSTERESIS UTILITY
+// ─────────────────────────────────────────────────────────────
+
 /**
- * React hook for signal classification
- * @param bar - Current bar data
- * @param config - Classifier configuration
- * @returns Classification result
+ * Generic ordinal hysteresis: if the new label is within `threshold` steps of
+ * the previous label in the given ordering array, keep the previous label.
+ * Works for SignalStrengthLabel, RegimeState, and LegacyLabel.
+ */
+function applyHysteresis<T>(
+  label: T,
+  previous: T | undefined,
+  order: T[],
+  threshold: number = 0,
+): T {
+  if (!previous || threshold <= 0 || previous === label) return label;
+  const prevIdx = order.indexOf(previous);
+  const currIdx = order.indexOf(label);
+  if (prevIdx === -1 || currIdx === -1) return label;
+  return Math.abs(currIdx - prevIdx) < threshold ? previous : label;
+}
+
+// ─────────────────────────────────────────────────────────────
+// REACT HOOK
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * Fixed: memo dependencies are stable primitives extracted from bar,
+ * so the memo doesn't invalidate on every render when bar is a new object.
+ * config should be passed as a stable reference (memoised by the caller).
  */
 export function useSignalClassifier(bar: Bar, config: SignalClassifierConfig) {
-  const classifier = useRef(new SignalClassifier());
-  const prevSignalRef = useRef<SignalStrengthLabel | undefined>(undefined);
+  const classifier  = useRef(new SignalClassifier());
+  const prevSigRef  = useRef<SignalStrengthLabel | undefined>(undefined);
+  const prevRegRef  = useRef<RegimeState | undefined>(undefined);
+  const prevLegRef  = useRef<LegacyLabel | undefined>(undefined);
+
+  // Stable primitive deps — avoids invalidating on every new bar object reference
+  const ts    = typeof bar.timestamp === 'bigint' ? Number(bar.timestamp) : bar.timestamp;
+  const mShort = bar.momentumShort;
+  const mLong  = bar.momentumLong;
+  const rsi    = bar.rsi;
+  const macd   = bar.macd;
+  const bb     = bar.bbPosition ?? 0;
+  const mom1d  = bar.mom1d   ?? 0;
+  const mom7d  = bar.mom7d   ?? 0;
+  const mom30d = bar.mom30d  ?? 0;
 
   const result = useMemo(() => {
     const signal = classifier.current.classifyMomentumSignal(
-      bar.momentumShort,
-      bar.momentumLong,
-      bar.rsi,
-      bar.macd,
-      config,
-      bar.additionalIndicators ?? {},
-      prevSignalRef.current,
-      bar.timestamp,
+      mShort, mLong, rsi, macd, config,
+      bar.additionalIndicators ?? {}, prevSigRef.current, ts,
     );
-    prevSignalRef.current = signal;
-
     const regime = classifier.current.classifyState(
-      bar.mom1d ?? 0,
-      bar.mom7d ?? 0,
-      bar.mom30d ?? 0,
-      bar.rsi,
-      bar.macd,
-      bar.bbPosition ?? 0,
-      config,
-      undefined,
-      bar.timestamp,
+      mom1d, mom7d, mom30d, rsi, macd, bb,
+      config, prevRegRef.current, ts,
+    );
+    const legacy = classifier.current.classifyLegacy(
+      mom7d, mom30d, rsi, macd, bb,
+      config, prevLegRef.current, ts,
     );
 
-    const legacy = classifier.current.classifyLegacy(
-      bar.mom7d ?? 0,
-      bar.mom30d ?? 0,
-      bar.rsi,
-      bar.macd,
-      bar.bbPosition ?? 0,
-      config,
-      undefined,
-      bar.timestamp,
-    );
+    prevSigRef.current = signal;
+    prevRegRef.current = regime;
+    prevLegRef.current = legacy;
 
     return { signal, regime, legacy };
-  }, [bar, config]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ts, mShort, mLong, rsi, macd, bb, mom1d, mom7d, mom30d, config]);
 
   return result;
 }
 
-// Placeholder for calculateSignalStrength (implement as needed)
+// ─────────────────────────────────────────────────────────────
+// HELPERS
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * Fixed: uses the shared singleton instead of allocating a new classifier
+ * instance (and empty cache) on every call.
+ */
 export function calculateSignalStrength(bar: Bar, config: SignalClassifierConfig): number {
-  const classification = new SignalClassifier().classifyStreaming([bar], config);
-  const signalOrder: SignalStrengthLabel[] = [
-    'Strong Sell',
-    'Sell',
-    'Weak Sell',
-    'Neutral',
-    'Weak Buy',
-    'Buy',
-    'Strong Buy',
-  ];
-  return signalOrder.indexOf(classification.signal) / (signalOrder.length - 1);
+  const result = SignalClassifier.sharedInstance.classifyStreaming([bar], config);
+  const idx = SIGNAL_ORDER.indexOf(result.signal);
+  return idx === -1 ? 0.5 : idx / (SIGNAL_ORDER.length - 1);
 }

@@ -11,8 +11,8 @@ export default function AdvancedAgentDashboard() {
   // Market Sage queries
   const { data: patterns } = useQuery({
     queryKey: ['market-sage-patterns'],
-    queryFn: async () => {
-      const res = await fetch('/api/rpg-agents/market-sage/patterns');
+    queryFn: async ({ signal }: any) => {
+      const res = await fetch('/api/rpg-agents/market-sage/patterns', { signal });
       return res.json();
     },
     refetchInterval: 30000
@@ -28,8 +28,8 @@ export default function AdvancedAgentDashboard() {
   // Portfolio Manager queries
   const { data: portfolio } = useQuery({
     queryKey: ['portfolio-metrics'],
-    queryFn: async () => {
-      const res = await fetch('/api/rpg-agents/portfolio/metrics');
+    queryFn: async ({ signal }: any) => {
+      const res = await fetch('/api/rpg-agents/portfolio/metrics', { signal });
       return res.json();
     },
     refetchInterval: 10000
@@ -37,8 +37,8 @@ export default function AdvancedAgentDashboard() {
 
   const { data: allocations } = useQuery({
     queryKey: ['portfolio-allocations'],
-    queryFn: async () => {
-      const res = await fetch('/api/rpg-agents/portfolio/allocations');
+    queryFn: async ({ signal }: any) => {
+      const res = await fetch('/api/rpg-agents/portfolio/allocations', { signal });
       return res.json();
     },
     refetchInterval: 30000

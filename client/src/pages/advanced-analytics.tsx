@@ -1,10 +1,10 @@
 
-import React, { useState } from 'react';
+import React, { useState, Suspense, lazy } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { ArrowLeft, Brain, TrendingUp, Activity, Zap, Target, BarChart3, AlertCircle, CheckCircle } from 'lucide-react';
-import { useLocation } from 'wouter';
+import { useNavigate } from 'react-router-dom';
 import { useTheme } from '../contexts/ThemeContext';
-import { LineChart, Line, ScatterChart, Scatter, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, Cell } from 'recharts';
+const AdvancedAnalyticsCharts = lazy(() => import('@/components/AdvancedAnalyticsCharts'));
 
 interface ClusterData {
   clusterId: number;
@@ -41,7 +41,7 @@ interface MarketRegime {
 }
 
 export default function AdvancedAnalytics() {
-  const [, setLocation] = useLocation();
+  const navigate = useNavigate();
   const { colors } = useTheme();
   const [selectedSymbol, setSelectedSymbol] = useState('BTC/USDT');
   const [timeframe, setTimeframe] = useState('1h');
@@ -49,8 +49,8 @@ export default function AdvancedAnalytics() {
   // Fetch candle clustering analysis
   const { data: clusterData, isLoading: clustersLoading } = useQuery({
     queryKey: ['analytics-clusters', selectedSymbol, timeframe],
-    queryFn: async () => {
-      const response = await fetch(`/api/analytics/clusters?symbol=${selectedSymbol}&timeframe=${timeframe}`);
+    queryFn: async ({ signal }: any) => {
+      const response = await fetch(`/api/analytics/clusters?symbol=${selectedSymbol}&timeframe=${timeframe}`, { signal });
       if (!response.ok) throw new Error('Failed to fetch cluster data');
       return response.json();
     },
@@ -60,8 +60,8 @@ export default function AdvancedAnalytics() {
   // Fetch pattern detection
   const { data: patternData, isLoading: patternsLoading } = useQuery({
     queryKey: ['analytics-patterns', selectedSymbol, timeframe],
-    queryFn: async () => {
-      const response = await fetch(`/api/analytics/patterns?symbol=${selectedSymbol}&timeframe=${timeframe}`);
+    queryFn: async ({ signal }: any) => {
+      const response = await fetch(`/api/analytics/patterns?symbol=${selectedSymbol}&timeframe=${timeframe}`, { signal });
       if (!response.ok) throw new Error('Failed to fetch pattern data');
       return response.json();
     },
@@ -71,8 +71,8 @@ export default function AdvancedAnalytics() {
   // Fetch market regime analysis
   const { data: regimeData, isLoading: regimeLoading } = useQuery({
     queryKey: ['analytics-regime', selectedSymbol],
-    queryFn: async () => {
-      const response = await fetch(`/api/analytics/regime?symbol=${selectedSymbol}`);
+    queryFn: async ({ signal }: any) => {
+      const response = await fetch(`/api/analytics/regime?symbol=${selectedSymbol}`, { signal });
       if (!response.ok) throw new Error('Failed to fetch regime data');
       return response.json();
     },
@@ -128,18 +128,9 @@ export default function AdvancedAnalytics() {
         <div className="mb-6 rounded-xl border p-4" style={{ backgroundColor: colors.card, borderColor: colors.border }}>
           <div className="flex items-center space-x-4">
             <div className="flex-1">
-              <label className="block text-sm font-medium mb-2" style={{ color: colors.text }}>Symbol</label>
-              <select
-                value={selectedSymbol}
-                onChange={(e) => setSelectedSymbol(e.target.value)}
-                className="w-full px-3 py-2 rounded-lg border focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-                style={{ backgroundColor: colors.surface, borderColor: colors.border, color: colors.text }}
-              >
-                <option>BTC/USDT</option>
-                <option>ETH/USDT</option>
-                <option>SOL/USDT</option>
-                <option>AVAX/USDT</option>
-              </select>
+              <Suspense fallback={<div className="h-72 flex items-center justify-center">Loading chart…</div>}>
+                <AdvancedAnalyticsCharts clusterData={clusterData} clusterColors={clusterColors} colors={{ border: '#334155', textSecondary: '#94a3b8', surface: '#0f172a', accent: '#6366f1' }} />
+              </Suspense>
             </div>
 
             <div className="flex-1">

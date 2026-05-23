@@ -1,0 +1,7 @@
+celery>=5.2
+redis>=4.0
+pandas
+pyarrow
+fastparquet
+boto3
+pytest

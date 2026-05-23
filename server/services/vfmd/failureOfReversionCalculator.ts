@@ -7,7 +7,7 @@
  */
 
 import type { MarketTick } from './types';
-import { FlowRegime } from './regimeClassifier.ts';
+import { FlowRegime } from './regimeClassifier';
 
 /**
  * A hostile event: any corrective move against the primary direction

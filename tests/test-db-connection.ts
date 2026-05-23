@@ -1,10 +1,12 @@
 #!/usr/bin/env node
+/// <reference types="node" />
 /**
  * Quick database connection test
  * Run: npx tsx test-db-connection.ts
  */
 
-import { PrismaClient } from '@prisma/client';
+import pkg from '@prisma/client';
+const { PrismaClient } = pkg as any;
 
 const prisma = new PrismaClient();
 

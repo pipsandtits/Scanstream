@@ -9,6 +9,7 @@ Addresses key limitations:
 """
 
 import asyncio
+import random
 import ccxt.pro as ccxt_async
 import pandas as pd
 import numpy as np
@@ -22,6 +23,8 @@ from pathlib import Path
 import aiofiles
 
 from scanner import MomentumScanner
+from metrics_collector import get_collector
+metrics = get_collector()
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +44,8 @@ class StreamConfig:
     max_candles_per_timeframe: int = 500
     max_signals_per_market: int = 1000
     max_ticks_buffer: int = 100
+    # Concurrency
+    max_concurrent_requests: int = 8
     
     # Mean reversion parameters
     momentum_exhaustion_threshold: int = 4  # 4+ consecutive moves same direction
@@ -128,9 +133,8 @@ class DataPersistenceManager:
     async def persist_ohlcv(self, symbol: str, timeframe: str, ohlcv_df: pd.DataFrame):
         """Store OHLCV data as parquet files"""
         file_path = self.ohlcv_path / f"{symbol.replace('/', '_')}_{timeframe}.parquet"
-        
-        # Use sync write (pandas doesn't have async parquet write)
-        ohlcv_df.to_parquet(file_path, compression='gzip')
+        # Use sync write (pandas doesn't have async parquet write) offloaded to threadpool
+        await asyncio.to_thread(ohlcv_df.to_parquet, file_path, compression='gzip')
     
     async def persist_clustering(self, cluster_data: CandleCluster):
         """Store clustering analysis data"""
@@ -226,6 +230,10 @@ class ContinuousMultiTimeframeScanner:
         
         # Exchange connections
         self.exchanges = {}
+        # tracked child tasks to prevent leak and allow cancellation
+        self._child_tasks: set = set()
+        # per-exchange ws capability
+        self._supports_ws: Dict[str, bool] = {}
         
         logger.info(f"Initialized ContinuousMultiTimeframeScanner with config: {self.config}")
     
@@ -239,7 +247,8 @@ class ContinuousMultiTimeframeScanner:
             try:
                 exchange_class = getattr(ccxt_async, exchange_name)
                 self.exchanges[exchange_name] = exchange_class({'enableRateLimit': True})
-                logger.info(f"Connected to {exchange_name}")
+                self._supports_ws[exchange_name] = hasattr(self.exchanges[exchange_name], 'watch_ticker')
+                logger.info(f"Connected to {exchange_name} (ws_supported={self._supports_ws[exchange_name]})")
             except Exception as e:
                 logger.error(f"Failed to connect to {exchange_name}: {e}")
         
@@ -252,9 +261,15 @@ class ContinuousMultiTimeframeScanner:
         ]
         
         try:
-            await asyncio.gather(*tasks)
-        except Exception as e:
-            logger.error(f"Error in continuous scanner: {e}")
+            # run streams and capture exceptions per-task
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for r in results:
+                if isinstance(r, Exception):
+                    logger.exception('Continuous scanner task failed')
+                    try:
+                        metrics.inc('continuous_scanner_task_exceptions')
+                    except Exception:
+                        pass
         finally:
             await self.stop()
     
@@ -263,31 +278,127 @@ class ContinuousMultiTimeframeScanner:
         logger.info("Stopping continuous scanner...")
         self.running = False
         
+        # cancel tracked child tasks
+        try:
+            for t in list(self._child_tasks):
+                try:
+                    t.cancel()
+                except Exception:
+                    pass
+            # give tasks a brief moment
+            await asyncio.sleep(0)
+        except Exception:
+            pass
+
         # Close exchange connections
         for exchange in self.exchanges.values():
-            await exchange.close()
+            try:
+                await exchange.close()
+            except Exception:
+                logger.exception('Error closing exchange')
         
         logger.info("Continuous scanner stopped")
+
+    def _create_tracked_task(self, coro):
+        """Create an asyncio.Task and track it for later cancellation."""
+        try:
+            task = asyncio.create_task(coro)
+            self._child_tasks.add(task)
+            def _on_done(t):
+                try:
+                    self._child_tasks.discard(t)
+                except Exception:
+                    pass
+            task.add_done_callback(_on_done)
+            return task
+        except Exception:
+            # fallback
+            return asyncio.create_task(coro)
+
+    async def _watch_ticker_loop(self, exchange, symbol: str, exchange_name: str):
+        """Long-lived loop using ccxt.pro watch_ticker where available."""
+        base = 0.2
+        while self.running:
+            try:
+                tick = await exchange.watch_ticker(symbol)
+                # ccxt watch_ticker returns dict similar to fetch_ticker
+                m = MarketTick(
+                    symbol=f"{exchange_name}:{symbol}",
+                    timestamp=datetime.now(timezone.utc),
+                    price=tick.get('last') or tick.get('close') or 0,
+                    volume=tick.get('quoteVolume') or tick.get('baseVolume') or 0,
+                    bid=tick.get('bid'),
+                    ask=tick.get('ask')
+                )
+                self.tick_buffers[m.symbol].append(m)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                msg = str(e).lower()
+                if '429' in msg or 'rate limit' in msg:
+                    try:
+                        metrics.inc('rate_limit_hits')
+                    except Exception:
+                        pass
+                await asyncio.sleep(base + random.uniform(0, base))
+
+    async def _poll_ticker_loop(self, exchange, symbol: str, exchange_name: str):
+        """Long-lived polling loop that sleeps between fetches."""
+        base = self.config.price_update_interval or 5
+        backoff = 0.2
+        while self.running:
+            try:
+                ticker = await exchange.fetch_ticker(symbol)
+                tick = MarketTick(
+                    symbol=f"{exchange_name}:{symbol}",
+                    timestamp=datetime.now(timezone.utc),
+                    price=ticker.get('last') or 0,
+                    volume=ticker.get('quoteVolume') or 0,
+                    bid=ticker.get('bid'),
+                    ask=ticker.get('ask')
+                )
+                self.tick_buffers[tick.symbol].append(tick)
+                await asyncio.sleep(base)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                msg = str(e).lower()
+                if '429' in msg or 'rate limit' in msg:
+                    try:
+                        metrics.inc('rate_limit_hits')
+                    except Exception:
+                        pass
+                    await asyncio.sleep((backoff * 5) + random.uniform(0, backoff))
+                else:
+                    await asyncio.sleep(backoff + random.uniform(0, backoff))
     
     async def _continuous_price_updates(self, symbols: List[str]):
         """Stream 1: Real-time price ticks every 5 seconds"""
-        logger.info("Starting continuous price update stream (5-second updates)")
-        
-        while self.running:
-            try:
-                update_tasks = []
+        logger.info("Starting continuous price update stream (long-lived per-symbol tasks)")
+
+        # create long-lived per-(exchange,symbol) tasks to avoid churn
+        tasks = []
+        try:
+            for exchange_name, exchange in self.exchanges.items():
                 for symbol in symbols:
-                    for exchange_name, exchange in self.exchanges.items():
-                        update_tasks.append(
-                            self._fetch_and_store_tick(exchange, symbol, exchange_name)
-                        )
-                
-                await asyncio.gather(*update_tasks, return_exceptions=True)
-                await asyncio.sleep(self.config.price_update_interval)
-                
-            except Exception as e:
-                logger.error(f"Error in price update stream: {e}")
-                await asyncio.sleep(5)
+                    if self._supports_ws.get(exchange_name):
+                        t = self._create_tracked_task(self._watch_ticker_loop(exchange, symbol, exchange_name))
+                    else:
+                        t = self._create_tracked_task(self._poll_ticker_loop(exchange, symbol, exchange_name))
+                    tasks.append(t)
+
+            # wait until any task fails or scanner stops
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for r in results:
+                if isinstance(r, Exception):
+                    logger.exception('Price stream child task failed')
+                    try:
+                        metrics.inc('price_stream_child_exceptions')
+                    except Exception:
+                        pass
+        except Exception as e:
+            logger.error(f"Error in price update setup: {e}")
+            await asyncio.sleep(5)
     
     async def _fetch_and_store_tick(self, exchange, symbol: str, exchange_name: str):
         """Fetch and store a single tick"""
@@ -312,16 +423,42 @@ class ContinuousMultiTimeframeScanner:
         
         while self.running:
             try:
-                signal_tasks = []
+                signal_coros = []
                 for symbol in symbols:
                     for timeframe_style, timeframe in self.config.timeframes.items():
-                        signal_tasks.append(
-                            self._generate_signals_for_symbol_timeframe(
-                                symbol, timeframe_style, timeframe
-                            )
-                        )
-                
-                await asyncio.gather(*signal_tasks, return_exceptions=True)
+                        signal_coros.append((symbol, timeframe_style, timeframe))
+
+                sem = asyncio.Semaphore(self.config.max_concurrent_requests)
+
+                async def sem_signal(sym, style, tf):
+                    async with sem:
+                        base = 0.3
+                        for attempt in range(4):
+                            try:
+                                await self._generate_signals_for_symbol_timeframe(sym, style, tf)
+                                break
+                            except Exception as e:
+                                msg = str(e).lower()
+                                if '429' in msg or 'rate limit' in msg or 'too many requests' in msg:
+                                    try:
+                                        metrics.inc('rate_limit_hits')
+                                    except Exception:
+                                        pass
+                                    delay = base * (2 ** attempt) * 4
+                                else:
+                                    delay = base * (2 ** attempt)
+                                delay = delay + random.uniform(0, base)
+                                await asyncio.sleep(delay)
+
+                tasks = [asyncio.create_task(sem_signal(s, st, tfm)) for (s, st, tfm) in signal_coros]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                for r in results:
+                    if isinstance(r, Exception):
+                        logger.exception('Signal generation task failed')
+                        try:
+                            metrics.inc('signal_generation_task_exceptions')
+                        except Exception:
+                            pass
                 await asyncio.sleep(self.config.signal_generation_interval)
                 
             except Exception as e:

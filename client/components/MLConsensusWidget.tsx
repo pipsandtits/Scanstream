@@ -11,10 +11,10 @@
  * - Risk assessment visualization
  */
 
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, Suspense } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { useQuery } from '@tanstack/react-query';
-import { LineChart, Line, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, ScatterChart, Scatter } from 'recharts';
+import { useMLConsensus } from '@/lib/hooks';
+const MLConsensusWidgetChartImpl = React.lazy(() => import('./MLConsensusWidgetChartImpl'));
 
 interface TimeframeConfidence {
   timeframe: string;
@@ -86,32 +86,8 @@ export const MLConsensusWidget: React.FC<MLConsensusWidgetProps> = ({
   const [autoRefresh, setAutoRefresh] = useState(true);
   const navigate = useNavigate();
 
-  // Fetch ML predictions
-  const { data, isLoading, error, refetch } = useQuery({
-    queryKey: ['ml-consensus', symbol],
-    queryFn: () =>
-      fetch(`/api/ml/mtf/predictions/${symbol}`)
-        .then(r => {
-          if (!r.ok) throw new Error('Failed to fetch predictions');
-          return r.json();
-        })
-        .catch(err => {
-          console.error('ML consensus fetch error:', err);
-          return null;
-        }),
-    refetchInterval: autoRefresh ? 60000 : false, // 60 seconds
-    enabled: !!symbol,
-  });
-
-  // Auto-refresh on mount
-  useEffect(() => {
-    if (autoRefresh) {
-      const interval = setInterval(() => {
-        refetch();
-      }, 60000);
-      return () => clearInterval(interval);
-    }
-  }, [autoRefresh, refetch]);
+  // Fetch ML predictions via typed hook
+  const { data, isLoading, error } = useMLConsensus(symbol);
 
   // Check alignment with scanner signal
   useEffect(() => {
@@ -263,24 +239,12 @@ export const MLConsensusWidget: React.FC<MLConsensusWidgetProps> = ({
         </div>
       )}
 
-      {/* Confidence by timeframe chart */}
+      {/* Confidence by timeframe chart (lazy-loaded impl) */}
       <div className="space-y-3">
         <h4 className="text-sm font-semibold text-gray-700">Confidence by Timeframe</h4>
-        <ResponsiveContainer width="100%" height={250}>
-          <BarChart data={timeframeChartData}>
-            <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" />
-            <XAxis dataKey="timeframe" />
-            <YAxis yAxisId="left" />
-            <YAxis yAxisId="right" orientation="right" />
-            <Tooltip
-              contentStyle={{ backgroundColor: '#fff', border: '1px solid #e5e7eb' }}
-              formatter={(value: any) => value.toFixed(1)}
-            />
-            <Legend />
-            <Bar yAxisId="left" dataKey="confidence" fill="#3b82f6" name="Confidence %" />
-            <Bar yAxisId="right" dataKey="riskScore" fill="#f59e0b" name="Risk Score" />
-          </BarChart>
-        </ResponsiveContainer>
+        <Suspense fallback={<div className="h-64 bg-gray-50 rounded" />}> 
+          <MLConsensusWidgetChartImpl data={timeframeChartData} />
+        </Suspense>
       </div>
 
       {/* Timeframe details table */}

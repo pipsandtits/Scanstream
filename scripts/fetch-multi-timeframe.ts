@@ -11,7 +11,7 @@
  *   pnpm run fetch:multi-tf
  */
 
-import { BinanceDataFetcher } from '../server/services/vfmd/binanceDataFetcher.ts';
+import { BinanceDataFetcher } from '../server/services/vfmd/binanceDataFetcher';
 
 async function main() {
   console.log('\n');

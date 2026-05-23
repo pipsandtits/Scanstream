@@ -1,11 +1,11 @@
 
 import React, { useState } from 'react';
-import { useLocation } from 'wouter';
+import { useNavigate } from 'react-router-dom';
 import { ArrowLeft, Activity, TrendingUp, Zap, Target, BarChart3, Download } from 'lucide-react';
 import { useQuery } from '@tanstack/react-query';
 
 export default function FlowEnginePage() {
-  const [, setLocation] = useLocation();
+  const navigate = useNavigate();
   const [selectedSymbol, setSelectedSymbol] = useState('BTC/USDT');
   const [selectedTimeframe, setSelectedTimeframe] = useState('1h');
 

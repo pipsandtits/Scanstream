@@ -92,48 +92,81 @@ export class SignalWebSocketService extends EventEmitter {
         transports: ['websocket', 'polling']
       });
 
-      // ALSO create a raw WebSocket server on /ws for raw WebSocket clients
-      // This allows clients connecting with raw WebSocket protocol to work alongside Socket.IO
-      this.wss = new WebSocketServer({
-        server: server as any,
-        path: '/ws'
-      });
+      // If an external bridge exists, avoid creating a second raw WebSocket server
+      // to prevent race conditions on the same upgrade path (/ws). Instead, we
+      // rely on the bridge's raw server and forward our signal broadcasts to it.
+      const externalBridge = (global as any).__wss_bridge;
+      if (externalBridge && externalBridge.rawWss) {
+        console.log('[WS] Detected external WS bridge — reusing its raw WebSocket server');
 
-      this.wss.on('connection', (ws: WebSocket) => {
-        console.log('[RawWebSocket] New client connected to /ws');
-        this.clients.add(ws);
-
-        // Send initial connection message
-        ws.send(JSON.stringify({
-          type: 'connected',
-          message: 'Connected to Scanstream WebSocket',
-          timestamp: Date.now()
-        }));
-
-        ws.on('message', (message: string) => {
-          try {
-            const data = JSON.parse(message.toString());
-            this.handleClientMessage(ws, data);
-          } catch (error) {
-            console.warn('[RawWebSocket] Failed to parse message:', error);
-            ws.send(JSON.stringify({
-              type: 'error',
-              error: 'Invalid JSON',
-              timestamp: Date.now()
-            }));
-          }
+        // Optionally register for connection events to track clients if needed
+        externalBridge.rawWss.on('connection', (ws: WebSocket) => {
+          console.log('[RawWebSocket] (bridge) New client connected to /ws');
+          // do not re-add message handlers here — bridge already handles messages/subscriptions
+        });
+      } else {
+        // ALSO create a raw WebSocket server on /ws for raw WebSocket clients
+        // This allows clients connecting with raw WebSocket protocol to work alongside Socket.IO
+        this.wss = new WebSocketServer({
+          server: server as any,
+          path: '/ws'
         });
 
-        ws.on('close', () => {
-          console.log('[RawWebSocket] Client disconnected');
-          this.clients.delete(ws);
+        this.wss.on('connection', (ws: WebSocket) => {
+          console.log('[RawWebSocket] New client connected to /ws');
+          this.clients.add(ws);
+
+          // Send initial connection message
+          ws.send(JSON.stringify({
+            type: 'connected',
+            message: 'Connected to Scanstream WebSocket',
+            timestamp: Date.now()
+          }));
+
+          ws.on('message', (message: string) => {
+            try {
+              const data = JSON.parse(message.toString());
+              this.handleClientMessage(ws, data);
+            } catch (error) {
+              console.warn('[RawWebSocket] Failed to parse message:', error);
+              ws.send(JSON.stringify({
+                type: 'error',
+                error: 'Invalid JSON',
+                timestamp: Date.now()
+              }));
+            }
+          });
+
+          ws.on('close', () => {
+            console.log('[RawWebSocket] Client disconnected');
+            this.clients.delete(ws);
+          });
+
+          ws.on('error', (error) => {
+            console.error('[RawWebSocket] Client error:', error);
+            this.clients.delete(ws);
+          });
         });
 
-        ws.on('error', (error) => {
-          console.error('[RawWebSocket] Client error:', error);
-          this.clients.delete(ws);
-        });
-      });
+        // Keepalive for raw ws server
+        try {
+          const PING_INTERVAL = 30000;
+          this.wss.on('connection', (c: any) => {
+            (c as any).isAlive = true;
+            c.on('pong', () => { (c as any).isAlive = true; });
+          });
+
+          setInterval(() => {
+            this.wss!.clients.forEach((c: any) => {
+              try {
+                if ((c as any).isAlive === false) return c.terminate();
+                (c as any).isAlive = false;
+                c.ping();
+              } catch (e) { try { c.terminate(); } catch {} }
+            });
+          }, PING_INTERVAL).unref();
+        } catch (e) { /* ignore keepalive errors */ }
+      }
 
       this.io.on('connection', (socket) => {
         this.connectedClients++;
@@ -276,6 +309,14 @@ export class SignalWebSocketService extends EventEmitter {
     }
 
     console.log(`[WS] Broadcasted ${type} signal for ${signal.symbol}: ${signal.signal} (${signal.strength}%)`);
+
+    // If a centralized bridge is present, forward signal updates to it
+    const bridgeBroadcast = (global as any).__bridgeBroadcast;
+    if (bridgeBroadcast && typeof bridgeBroadcast === 'function') {
+      try {
+        bridgeBroadcast({ type: 'signal', payload: { type, data: signal }, timestamp: Date.now() });
+      } catch (e) { /* ignore bridge forwarding failures */ }
+    }
   }
 
   subscribeToExchange(socket: any, exchange: string) {

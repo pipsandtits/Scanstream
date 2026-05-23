@@ -24,16 +24,20 @@ export default function WatchlistManager({ watchlists: initialWatchlists, setWat
   const [newName, setNewName] = useState('');
   const [error, setError] = useState<string | null>(null);
   const queryClient = useQueryClient();
+  const createControllerRef = React.useRef<AbortController | null>(null);
+  const updateControllerRef = React.useRef<AbortController | null>(null);
+  const deleteControllerRef = React.useRef<AbortController | null>(null);
 
   // Fetch watchlists from API
   const { data: watchlistsData, isLoading } = useQuery({
     queryKey: ['watchlists'],
-    queryFn: async () => {
+    queryFn: async ({ signal }: any) => {
       try {
-        const response = await fetch('/api/watchlists');
+        const response = await fetch('/api/watchlists', { signal });
         if (!response.ok) throw new Error('Failed to fetch watchlists');
         return response.json();
-      } catch (err) {
+      } catch (err: any) {
+        if (err?.name === 'AbortError') return { data: initialWatchlists };
         console.error('Watchlist fetch error:', err);
         // Fall back to initial watchlists
         return { data: initialWatchlists };
@@ -52,10 +56,14 @@ export default function WatchlistManager({ watchlists: initialWatchlists, setWat
   // Create watchlist mutation
   const createMutation = useMutation({
     mutationFn: async (name: string) => {
+      try { createControllerRef.current?.abort(); } catch (e) {}
+      const controller = new AbortController();
+      createControllerRef.current = controller;
       const response = await fetch('/api/watchlists', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name, symbols: [] }),
+        signal: controller.signal,
       });
       if (!response.ok) throw new Error('Failed to create watchlist');
       return response.json();
@@ -75,10 +83,14 @@ export default function WatchlistManager({ watchlists: initialWatchlists, setWat
   // Update watchlist mutation
   const updateMutation = useMutation({
     mutationFn: async (watchlist: Watchlist) => {
+      try { updateControllerRef.current?.abort(); } catch (e) {}
+      const controller = new AbortController();
+      updateControllerRef.current = controller;
       const response = await fetch(`/api/watchlists/${watchlist.id}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name: watchlist.name, symbols: watchlist.symbols }),
+        signal: controller.signal,
       });
       if (!response.ok) throw new Error('Failed to update watchlist');
       return response.json();
@@ -97,7 +109,10 @@ export default function WatchlistManager({ watchlists: initialWatchlists, setWat
   // Delete watchlist mutation
   const deleteMutation = useMutation({
     mutationFn: async (id: string) => {
-      const response = await fetch(`/api/watchlists/${id}`, { method: 'DELETE' });
+      try { deleteControllerRef.current?.abort(); } catch (e) {}
+      const controller = new AbortController();
+      deleteControllerRef.current = controller;
+      const response = await fetch(`/api/watchlists/${id}`, { method: 'DELETE', signal: controller.signal });
       if (!response.ok) throw new Error('Failed to delete watchlist');
       return response.json();
     },

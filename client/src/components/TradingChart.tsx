@@ -1,19 +1,7 @@
 import React, { useMemo, useState, useCallback, useEffect } from "react";
+import type { ChartDataPoint } from '../types/chart';
 import usePerformanceMark from '../hooks/usePerformanceMark';
-import Chart from "react-apexcharts";
-import { ApexOptions } from "apexcharts";
 
-export interface ChartDataPoint {
-  timestamp: number;
-  open: number;
-  high: number;
-  low: number;
-  close: number;
-  volume?: number;
-  rsi?: number | null;
-  macd?: number | null;
-  ema?: number | null;
-}
 
 interface TradingChartProps {
   data: ChartDataPoint[];
@@ -326,6 +314,8 @@ export const TradingChart: React.FC<TradingChartProps> = React.memo(({
   try { usePerformanceMark('TradingChart'); } catch (e) {}
   const [chartReady, setChartReady] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
+  // Use centralized Apex wrapper
+  const ChartComp = require('@/components/ui/ApexChartWrapper').default;
 
   // Configuration
   const config: ChartConfig = useMemo(() => ({
@@ -419,7 +409,7 @@ export const TradingChart: React.FC<TradingChartProps> = React.memo(({
     );
   }
 
-  if (isLoading) {
+  if (isLoading || !ChartComp) {
     return <ChartLoader />;
   }
 
@@ -430,7 +420,7 @@ export const TradingChart: React.FC<TradingChartProps> = React.memo(({
   const indicatorHeight = hasIndicators ? height * (0.3 / indicatorCount) : 0;
 
   // Main chart options
-  const mainChartOptions: ApexOptions = {
+  const mainChartOptions: any = {
     chart: {
       type: "candlestick",
       height: mainChartHeight,
@@ -508,8 +498,8 @@ export const TradingChart: React.FC<TradingChartProps> = React.memo(({
     tooltip: {
       enabled: true,
       shared: true,
-      custom: ({ seriesIndex, dataPointIndex, w }) => {
-        const data = w.globals.initialSeries[seriesIndex].data[dataPointIndex];
+      custom: ({ seriesIndex, dataPointIndex, w }: { seriesIndex: number; dataPointIndex: number; w: any }) => {
+        const data = w?.globals?.initialSeries?.[seriesIndex]?.data?.[dataPointIndex];
         if (seriesIndex === 0 && data?.y) { // Candlestick data
           const [open, high, low, close] = data.y;
           return `
@@ -539,7 +529,7 @@ export const TradingChart: React.FC<TradingChartProps> = React.memo(({
   };
 
   // RSI chart options
-  const rsiChartOptions: ApexOptions = {
+  const rsiChartOptions: any = {
     ...mainChartOptions,
     chart: {
       ...mainChartOptions.chart,
@@ -565,7 +555,7 @@ export const TradingChart: React.FC<TradingChartProps> = React.memo(({
   };
 
   // MACD chart options
-  const macdChartOptions: ApexOptions = {
+  const macdChartOptions: any = {
     ...mainChartOptions,
     chart: {
       ...mainChartOptions.chart,
@@ -588,8 +578,8 @@ export const TradingChart: React.FC<TradingChartProps> = React.memo(({
 
   return (
     <ChartErrorBoundary onError={onError}>
-      <div style={{ height }} className="w-full">
-        <Chart
+      <div className={`w-full ${height ? `h-[${height}px]` : ''}`}>
+        <ChartComp
           options={mainChartOptions}
           series={series}
           type="candlestick"
@@ -598,7 +588,7 @@ export const TradingChart: React.FC<TradingChartProps> = React.memo(({
         />
         
         {showRSI && rsiData.length > 0 && (
-          <Chart
+          <ChartComp
             options={rsiChartOptions}
             series={[{ name: "RSI", data: rsiData ?? [] }]}
             type="line"
@@ -608,7 +598,7 @@ export const TradingChart: React.FC<TradingChartProps> = React.memo(({
         )}
         
         {showMACD && macdData.length > 0 && (
-          <Chart
+          <ChartComp
             options={macdChartOptions}
             series={[{ name: "MACD", data: macdData ?? [] }]}
             type="line"

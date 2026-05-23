@@ -9,14 +9,57 @@
  * Integration is additive — RL controls specific decisions, legacy code unchanged.
  */
 
-import { RLPositionAgent, SourceWeightAction, ClusterThresholdAction } from './rl-position-agent';
+import { RLPositionAgent, SourceWeightAction, ClusterThresholdAction, PositionSizingAction, EntryTimingAction, ExitSequenceAction } from './rl-position-agent';
+import { getRLAgent } from '../src/agents/rl-agent.singleton';
 import { TradeLifecycleManager } from './rl-feedback-loop';
 import { MarketFrame } from '@shared/schema';
+import * as fs from 'fs';
+import * as path from 'path';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+import { initMetrics, incrementDecision, incrementFallback, metricsEnabled } from './rl-metrics';
 
 // ─── Singleton instances (wire into your service layer) ─────────────────────
 
-export const rlAgent = new RLPositionAgent();
+export const rlAgent = getRLAgent();
 export const rlFeedback = new TradeLifecycleManager(rlAgent);
+
+// Central RL configuration (can be overridden by config/rl-config.json or environment variables)
+export let RLConfig: {
+  enableRL: boolean;
+  minExperienceForRL: number;
+  defaultWeights: { scannerWeight: number; mlWeight: number; rlWeight: number };
+  defaultThresholds: { minClusterStrength: number; minFollowThrough: number; minDirectionalRatio: number };
+  logLevel: string;
+} = {
+  enableRL: true,
+  minExperienceForRL: 50,
+  defaultWeights: { scannerWeight: 0.40, mlWeight: 0.35, rlWeight: 0.25 },
+  defaultThresholds: { minClusterStrength: 0.70, minFollowThrough: 0.40, minDirectionalRatio: 0.60 },
+  logLevel: 'info'
+};
+
+// Attempt to load runtime config from config/rl-config.json
+try {
+  const cfgPath = path.resolve(__dirname, '..', 'config', 'rl-config.json');
+  if (fs.existsSync(cfgPath)) {
+    const file = fs.readFileSync(cfgPath, 'utf8');
+    const parsed = JSON.parse(file);
+    RLConfig = { ...RLConfig, ...parsed };
+    console.log('[RL-Config] Loaded overrides from config/rl-config.json');
+  }
+} catch (err) {
+  console.warn('[RL-Config] Failed to load config/rl-config.json', err);
+}
+
+// Environment overrides (optional)
+if (process.env.RL_ENABLE !== undefined) RLConfig.enableRL = String(process.env.RL_ENABLE).toLowerCase() === 'true';
+if (process.env.RL_MIN_EXPERIENCE) RLConfig.minExperienceForRL = Number(process.env.RL_MIN_EXPERIENCE) || RLConfig.minExperienceForRL;
+
+// Initialize metrics (no-op if prom-client is not installed)
+initMetrics();
 
 // ─── Integration Point 1: Consensus Weighting ─────────────────────────────────
 //
@@ -40,35 +83,35 @@ export function getAdaptiveConsensusWeights(
   regime: string,
   drawdown: number
 ): ConsensusWeights {
+  if (!RLConfig.enableRL) {
+    return { ...RLConfig.defaultWeights, isRLControlled: false };
+  }
+
   try {
     // Extract RL state from current market
     const state = rlAgent.extractState(frames, mlConfidence, regime, drawdown);
-    
+
     // Get SOURCE_WEIGHTING domain decision
     const action = rlAgent.selectActionForDomain(
       'SOURCE_WEIGHTING',
       state,
       false // exploration: use best action (no randomness) in production
     );
-    
+
     const weights = action as SourceWeightAction;
-    
-    return {
+
+    const res = {
       scannerWeight: weights.scannerWeight,
       mlWeight: weights.mlWeight,
       rlWeight: weights.rlWeight,
       isRLControlled: true
     };
+    if (metricsEnabled()) incrementDecision('SOURCE_WEIGHTING', true);
+    return res;
   } catch (error) {
     console.warn('[RL-Integration] Failed to get RL weights, using defaults:', error);
-    
-    // Fallback to static defaults
-    return {
-      scannerWeight: 0.40,
-      mlWeight: 0.35,
-      rlWeight: 0.25,
-      isRLControlled: false
-    };
+    if (metricsEnabled()) incrementFallback('SOURCE_WEIGHTING');
+    return { ...RLConfig.defaultWeights, isRLControlled: false };
   }
 }
 
@@ -113,35 +156,35 @@ export function getAdaptiveClusterThreshold(
   regime: string,
   drawdown: number
 ): AdaptiveClusterThreshold {
+  if (!RLConfig.enableRL) {
+    return { ...RLConfig.defaultThresholds, isRLControlled: false };
+  }
+
   try {
     // Extract RL state from current market
     const state = rlAgent.extractState(frames, mlConfidence, regime, drawdown);
-    
+
     // Get CLUSTER_THRESHOLD domain decision
     const action = rlAgent.selectActionForDomain(
       'CLUSTER_THRESHOLD',
       state,
       false // exploration: use best action (no randomness) in production
     );
-    
+
     const threshold = action as ClusterThresholdAction;
-    
-    return {
+
+    const res = {
       minClusterStrength: threshold.minClusterStrength,
       minFollowThrough: threshold.minFollowThrough,
       minDirectionalRatio: threshold.minDirectionalRatio,
       isRLControlled: true
     };
+    if (metricsEnabled()) incrementDecision('CLUSTER_THRESHOLD', true);
+    return res;
   } catch (error) {
     console.warn('[RL-Integration] Failed to get RL thresholds, using defaults:', error);
-    
-    // Fallback to sensible defaults
-    return {
-      minClusterStrength: 0.70,
-      minFollowThrough: 0.40,
-      minDirectionalRatio: 0.60,
-      isRLControlled: false
-    };
+    if (metricsEnabled()) incrementFallback('CLUSTER_THRESHOLD');
+    return { ...RLConfig.defaultThresholds, isRLControlled: false };
   }
 }
 
@@ -221,6 +264,74 @@ export const RLFeedbackCallbacks = {
    */
   onTradeClose: (tradeId: string, record: any) => rlFeedback.onTradeClose(tradeId, record)
 };
+
+// ─── Convenience wrappers for other RL domains ─────────────────────────────
+
+/** Get RL position sizing decision (with safe fallback) */
+export function getRLPositionSizing(
+  frames: MarketFrame[],
+  mlConfidence: number,
+  regime: string,
+  drawdown: number,
+  baseSize: number,
+  atr: number,
+  price: number
+): { positionSize: number; stopLoss: number; takeProfit: number; riskReward: number; isRLControlled: boolean } {
+  if (!RLConfig.enableRL) {
+    return { positionSize: baseSize, stopLoss: price - atr, takeProfit: price + atr * 2, riskReward: 2, isRLControlled: false };
+  }
+
+  try {
+    const state = rlAgent.extractState(frames, mlConfidence, regime, drawdown);
+    const params = rlAgent.getPositionParameters(state, baseSize, atr, price);
+    if (metricsEnabled()) incrementDecision('POSITION_SIZING', true);
+    return { ...params, isRLControlled: true };
+  } catch (error) {
+    console.warn('[RL-Integration] getRLPositionSizing failed, using fallback:', error);
+    if (metricsEnabled()) incrementFallback('POSITION_SIZING');
+    return { positionSize: baseSize, stopLoss: price - atr, takeProfit: price + atr * 2, riskReward: 2, isRLControlled: false };
+  }
+}
+
+/** Get RL entry timing (limit vs market and waitBars) */
+export function getRLEntryTiming(
+  frames: MarketFrame[],
+  mlConfidence: number,
+  regime: string,
+  drawdown: number
+): { entryTiming: EntryTimingAction; isRLControlled: boolean } {
+  if (!RLConfig.enableRL) return { entryTiming: { waitBars: 0, entryType: 'MARKET', limitOffsetPct: 0 }, isRLControlled: false };
+  try {
+    const state = rlAgent.extractState(frames, mlConfidence, regime, drawdown);
+    const action = rlAgent.selectActionForDomain('ENTRY_TIMING', state, false) as EntryTimingAction;
+    if (metricsEnabled()) incrementDecision('ENTRY_TIMING', true);
+    return { entryTiming: action, isRLControlled: true };
+  } catch (error) {
+    console.warn('[RL-Integration] getRLEntryTiming failed, using fallback:', error);
+    if (metricsEnabled()) incrementFallback('ENTRY_TIMING');
+    return { entryTiming: { waitBars: 0, entryType: 'MARKET', limitOffsetPct: 0 }, isRLControlled: false };
+  }
+}
+
+/** Get RL exit sequencing decision */
+export function getRLExitSequence(
+  frames: MarketFrame[],
+  mlConfidence: number,
+  regime: string,
+  drawdown: number
+): { exitSequence: ExitSequenceAction; isRLControlled: boolean } {
+  if (!RLConfig.enableRL) return { exitSequence: { t1ExitPct: 0.33, t2ExitPct: 0.33, trailRemaining: true, trailActivationPct: 1.0 }, isRLControlled: false };
+  try {
+    const state = rlAgent.extractState(frames, mlConfidence, regime, drawdown);
+    const action = rlAgent.selectActionForDomain('EXIT_SEQUENCING', state, false) as ExitSequenceAction;
+    if (metricsEnabled()) incrementDecision('EXIT_SEQUENCING', true);
+    return { exitSequence: action, isRLControlled: true };
+  } catch (error) {
+    console.warn('[RL-Integration] getRLExitSequence failed, using fallback:', error);
+    if (metricsEnabled()) incrementFallback('EXIT_SEQUENCING');
+    return { exitSequence: { t1ExitPct: 0.33, t2ExitPct: 0.33, trailRemaining: true, trailActivationPct: 1.0 }, isRLControlled: false };
+  }
+}
 
 // ─── Health & Monitoring ──────────────────────────────────────────────────────
 

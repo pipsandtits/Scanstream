@@ -21,6 +21,7 @@
 import axios, { AxiosInstance } from 'axios';
 import * as ccxt from 'ccxt';
 import type { AssetVelocityData, VelocityMetrics } from './asset-velocity-profile';
+import { symbolManager } from './symbol-manager';
 
 interface PolygonCandle {
   t: number; // timestamp in ms
@@ -95,9 +96,10 @@ export class LiveVelocityCalculator {
         `[LiveVelocity] Fetching live data for ${symbol} (${lookbackDays}D lookback)`
       );
 
-      // Fetch daily candles
+      // Fetch daily candles (use canonical normalization from SymbolManager)
+      const canonical = symbolManager.canonicalize(symbol);
       const candles = await this.fetchDailyCandles(
-        this.normalizeSymbol(symbol),
+        canonical,
         lookbackDays
       );
 
@@ -146,8 +148,9 @@ export class LiveVelocityCalculator {
     lookbackDays: number = 365
   ): Promise<{ profile: AssetVelocityData; regime: RegimeDetectionResult }> {
     try {
+      const canonical = symbolManager.canonicalize(symbol);
       const candles = await this.fetchDailyCandles(
-        this.normalizeSymbol(symbol),
+        canonical,
         lookbackDays
       );
 
@@ -312,14 +315,17 @@ export class LiveVelocityCalculator {
           `[LiveVelocity] Fetching Polygon daily candles for ${normalizedSymbol} from ${from} to ${to}`
         );
 
-        const response = await this.client.get('/v2/aggs/ticker/X:CRYPTOUSD/range/1/day', {
+        // Use the ticker in the request path. `normalizedSymbol` should be
+        // returned by `toPolygonSymbol()` in the form `X:BASEQUOTE` when
+        // possible. We encode it to be safe.
+        const tickerPath = encodeURIComponent(normalizedSymbol);
+        const response = await this.client.get(`/v2/aggs/ticker/${tickerPath}/range/1/day`, {
           params: {
-            'ticker': normalizedSymbol,
-            'from': from,
-            'to': to,
-            'apiKey': this.POLYGON_API_KEY,
-            'sort': 'asc',
-            'limit': 50000, // Max per request
+            from,
+            to,
+            apiKey: this.POLYGON_API_KEY,
+            sort: 'asc',
+            limit: 50000, // Max per request
           },
         });
 
@@ -374,6 +380,7 @@ export class LiveVelocityCalculator {
     for (const [name, days] of Object.entries(timeframes)) {
       const moves: number[] = [];
       const percentMoves: number[] = [];
+      const windowVolumes: number[] = [];
       let upCount = 0;
 
       // Rolling window analysis
@@ -384,19 +391,48 @@ export class LiveVelocityCalculator {
         const dollarMove = Math.abs(endPrice - startPrice);
         const percentMove = (dollarMove / startPrice) * 100;
 
+        // Sum volumes across the window for VW metrics
+        let volSum = 0;
+        for (let j = i; j <= i + days; j++) {
+          volSum += (candles[j]?.v || 0);
+        }
+
         moves.push(dollarMove);
         percentMoves.push(percentMove);
+        windowVolumes.push(volSum);
 
         if (endPrice > startPrice) upCount++;
       }
 
-      // Calculate statistics
-      profile[name] = this.calculateStatistics(
+      // Calculate base statistics
+      const stats = this.calculateStatistics(
         moves,
         percentMoves,
         upCount,
-        candles.length - days
+        Math.max(1, candles.length - days)
       );
+
+      // Compute volume-weighted average dollar move
+      const totalVol = windowVolumes.reduce((a, b) => a + b, 0) || 0;
+      const weightedSum = moves.reduce((acc, m, idx) => acc + m * (windowVolumes[idx] || 0), 0);
+      const vwAvgDollarMove = totalVol > 0 ? weightedSum / totalVol : stats.avgDollarMove;
+
+      // Volatility-adjusted velocity: normalize percent move by ATR% (avoid divide-by-zero)
+      const atrPercent = this.calculateATR(candles, Math.min(14, Math.max(2, days)));
+      const volatilityAdjustedPercent = atrPercent > 0 ? stats.avgPercentMove / atrPercent : stats.avgPercentMove;
+
+      profile[name] = {
+        ...stats,
+        vwAvgDollarMove,
+        volatilityAdjustedPercent,
+      } as any;
+    }
+
+    // Momentum divergence between short and long velocity profiles
+    try {
+      profile.momentumDivergence = this.detectMomentumDivergence(candles);
+    } catch (e) {
+      profile.momentumDivergence = { score: 0, divergent: false };
     }
 
     return profile as AssetVelocityData;
@@ -435,6 +471,54 @@ export class LiveVelocityCalculator {
       maxMove: moves[moves.length - 1],
       upDaysPercent: (upCount / totalWindows) * 100,
     };
+  }
+
+  /**
+   * Calculate ATR (average true range) as a percent of price
+   */
+  private calculateATR(candles: PolygonCandle[], period: number = 14): number {
+    if (candles.length < 2) return 0;
+    const trs: number[] = [];
+    for (let i = 1; i < candles.length; i++) {
+      const high = candles[i].h;
+      const low = candles[i].l;
+      const prevClose = candles[i - 1].c;
+      const tr = Math.max(high - low, Math.abs(high - prevClose), Math.abs(low - prevClose));
+      trs.push(tr);
+    }
+    const slice = trs.slice(-period);
+    const atr = slice.reduce((a, b) => a + b, 0) / slice.length;
+    const recentClose = candles[candles.length - 1].c || 1;
+    return (atr / recentClose) * 100; // percent
+  }
+
+  /**
+   * Detect momentum divergence between short and long velocity profiles.
+   * Returns a simple score and flag if divergent.
+   */
+  private detectMomentumDivergence(candles: PolygonCandle[]): { score: number; divergent: boolean } {
+    // Use percent moves over short (7) and long (30) windows
+    const short = 7;
+    const long = 30;
+    if (candles.length < long + 2) return { score: 0, divergent: false };
+
+    const calcAvgPercentForWindow = (windowDays: number) => {
+      const moves: number[] = [];
+      for (let i = candles.length - windowDays - 1; i < candles.length - 1; i++) {
+        const start = candles[i].c;
+        const end = candles[i + 1].c;
+        moves.push(Math.abs(end - start) / Math.max(1e-9, start) * 100);
+      }
+      return moves.reduce((a, b) => a + b, 0) / Math.max(1, moves.length);
+    };
+
+    const shortAvg = calcAvgPercentForWindow(short);
+    const longAvg = calcAvgPercentForWindow(long);
+
+    // Score: positive if short > long (momentum accelerating), negative if short < long
+    const score = (shortAvg - longAvg) / Math.max(1e-9, longAvg);
+    const divergent = Math.abs(score) > 0.15; // arbitrary threshold
+    return { score, divergent };
   }
 
   /**
@@ -599,23 +683,59 @@ export class LiveVelocityCalculator {
     // - "BTC/USDT" or "BTC" → for CCXT (already good)
     // - "X:BTCUSD" format → for Polygon.io API
     
-    if (symbol.includes('X:')) {
-      // Already Polygon format
-      return symbol;
+    if (!symbol) return symbol;
+
+    let s = symbol.trim().toUpperCase();
+    if (s.startsWith('X:')) return s; // already polygon style
+
+    // handle common separators
+    if (s.includes('/')) return s;
+    if (s.includes('-')) return s.replace('-', '/');
+
+    // known quote currencies
+    const knownQuotes = ['USD', 'USDT', 'USDC', 'BTC', 'ETH', 'EUR', 'BUSD'];
+    for (const q of knownQuotes) {
+      if (s.endsWith(q)) {
+        const base = s.slice(0, s.length - q.length);
+        return `${base}/${q}`;
+      }
     }
 
-    const base = symbol.split('/')[0].toUpperCase();
-    
-    // Return both formats where needed, but default to base/USDT for CCXT
-    return `${base}/USDT`;
+    // fallback to USDT for crypto
+    return `${s}/USDT`;
   }
 
   /**
    * Convert to Polygon format if needed
    */
   private toPolygonSymbol(symbol: string): string {
-    const base = symbol.split('/')[0].toUpperCase();
-    return `X:${base}USD`;
+    if (!symbol) return symbol;
+    let s = symbol.trim().toUpperCase();
+    if (s.startsWith('X:')) return s;
+
+    let base = '';
+    let quote = '';
+    if (s.includes('/')) {
+      [base, quote] = s.split('/');
+    } else if (s.includes('-')) {
+      [base, quote] = s.split('-');
+    } else {
+      const knownQuotes = ['USD', 'USDT', 'USDC', 'BTC', 'ETH', 'EUR', 'BUSD'];
+      for (const q of knownQuotes) {
+        if (s.endsWith(q)) {
+          base = s.slice(0, s.length - q.length);
+          quote = q;
+          break;
+        }
+      }
+      if (!base) {
+        base = s;
+        quote = 'USD';
+      }
+    }
+
+    // Polygon uses `X:BASEQUOTE` for crypto aggregates (e.g., X:BTCUSD)
+    return `X:${base}${quote}`;
   }
 
   /**
@@ -623,6 +743,8 @@ export class LiveVelocityCalculator {
    */
   private getDefaultFallback(symbol: string): AssetVelocityData {
     const base = symbol.split('/')[0].toUpperCase();
+    // Better defaults based on market cap / known large caps
+    const isHighCap = ['BTC', 'ETH'].includes(base);
 
     // Return generic safe defaults for unknown assets
     const generic: AssetVelocityData = {
@@ -630,8 +752,8 @@ export class LiveVelocityCalculator {
       '1D': {
         avgDollarMove: 0,
         medianDollarMove: 0,
-        avgPercentMove: 2.5,
-        medianPercentMove: 2.0,
+        avgPercentMove: isHighCap ? 1.5 : 2.5,
+        medianPercentMove: isHighCap ? 1.2 : 2.0,
         p25: 0,
         p75: 0,
         p90: 0,
@@ -641,8 +763,8 @@ export class LiveVelocityCalculator {
       '3D': {
         avgDollarMove: 0,
         medianDollarMove: 0,
-        avgPercentMove: 5.0,
-        medianPercentMove: 4.0,
+        avgPercentMove: isHighCap ? 3.5 : 5.0,
+        medianPercentMove: isHighCap ? 2.8 : 4.0,
         p25: 0,
         p75: 0,
         p90: 0,
@@ -652,8 +774,8 @@ export class LiveVelocityCalculator {
       '7D': {
         avgDollarMove: 0,
         medianDollarMove: 0,
-        avgPercentMove: 7.5,
-        medianPercentMove: 6.0,
+        avgPercentMove: isHighCap ? 5.5 : 7.5,
+        medianPercentMove: isHighCap ? 4.5 : 6.0,
         p25: 0,
         p75: 0,
         p90: 0,
@@ -663,8 +785,8 @@ export class LiveVelocityCalculator {
       '14D': {
         avgDollarMove: 0,
         medianDollarMove: 0,
-        avgPercentMove: 10.0,
-        medianPercentMove: 8.0,
+        avgPercentMove: isHighCap ? 8.0 : 10.0,
+        medianPercentMove: isHighCap ? 6.5 : 8.0,
         p25: 0,
         p75: 0,
         p90: 0,
@@ -674,8 +796,8 @@ export class LiveVelocityCalculator {
       '21D': {
         avgDollarMove: 0,
         medianDollarMove: 0,
-        avgPercentMove: 12.5,
-        medianPercentMove: 10.0,
+        avgPercentMove: isHighCap ? 10.0 : 12.5,
+        medianPercentMove: isHighCap ? 8.0 : 10.0,
         p25: 0,
         p75: 0,
         p90: 0,
@@ -685,8 +807,8 @@ export class LiveVelocityCalculator {
       '30D': {
         avgDollarMove: 0,
         medianDollarMove: 0,
-        avgPercentMove: 15.0,
-        medianPercentMove: 12.0,
+        avgPercentMove: isHighCap ? 12.0 : 15.0,
+        medianPercentMove: isHighCap ? 9.5 : 12.0,
         p25: 0,
         p75: 0,
         p90: 0,

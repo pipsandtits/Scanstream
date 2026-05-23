@@ -22,3 +22,4 @@ checkpoints/
 /data
 /.replit
 /data/cache/
+.env

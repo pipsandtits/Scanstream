@@ -7,8 +7,8 @@
  * Updates via WebSocket with new trades
  */
 
-import React, { useState, useMemo } from 'react';
-import { BarChart, Bar, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, PieChart, Pie, Cell } from 'recharts';
+import React, { useState, useMemo, Suspense, lazy } from 'react';
+const SignalHistoryCharts = lazy(() => import('@/components/SignalHistoryCharts'));
 import { ChevronDown, Filter, TrendingUp, TrendingDown } from 'lucide-react';
 
 export interface SignalHistoryEntry {
@@ -228,76 +228,11 @@ const SignalHistory: React.FC<SignalHistoryProps> = ({ signals, onSourceFilterCh
         </div>
       </div>
 
-      {/* CHARTS ROW */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 bg-gray-50 p-4 rounded-lg">
-        {/* Quality Accuracy */}
-        <div className="bg-white rounded p-4 border border-gray-200">
-          <p className="font-bold text-sm mb-3">Signal Quality vs Accuracy</p>
-          {qualityAccuracyData.length > 0 ? (
-            <ResponsiveContainer width="100%" height={250}>
-              <BarChart data={qualityAccuracyData}>
-                <CartesianGrid strokeDasharray="3 3" />
-                <XAxis dataKey="quality" angle={-45} textAnchor="end" height={80} />
-                <YAxis />
-                <Tooltip />
-                <Bar dataKey="accuracy" fill="#3b82f6" />
-              </BarChart>
-            </ResponsiveContainer>
-          ) : (
-            <p className="text-center text-gray-500 py-8">No closed signals data</p>
-          )}
-        </div>
-
-        {/* P&L by Confidence */}
-        <div className="bg-white rounded p-4 border border-gray-200">
-          <p className="font-bold text-sm mb-3">P&L by Confidence Level</p>
-          {confidencePnLData.length > 0 ? (
-            <ResponsiveContainer width="100%" height={250}>
-              <LineChart data={confidencePnLData}>
-                <CartesianGrid strokeDasharray="3 3" />
-                <XAxis dataKey="confidence" angle={-45} textAnchor="end" height={80} />
-                <YAxis />
-                <Tooltip />
-                <Line
-                  type="monotone"
-                  dataKey="avgPnL"
-                  stroke="#8b5cf6"
-                  strokeWidth={2}
-                  dot={{ fill: '#8b5cf6', r: 4 }}
-                />
-              </LineChart>
-            </ResponsiveContainer>
-          ) : (
-            <p className="text-center text-gray-500 py-8">No P&L data</p>
-          )}
-        </div>
-
-        {/* Source Distribution */}
-        <div className="bg-white rounded p-4 border border-gray-200">
-          <p className="font-bold text-sm mb-3">Signals by Source</p>
-          {sourceDistribution.length > 0 ? (
-            <ResponsiveContainer width="100%" height={250}>
-              <PieChart>
-                <Pie
-                  data={sourceDistribution}
-                  cx="50%"
-                  cy="50%"
-                  labelLine={false}
-                  label={({ name, value }) => `${name} (${value})`}
-                  outerRadius={80}
-                  fill="#8884d8"
-                  dataKey="value"
-                >
-                  {sourceDistribution.map((entry) => (
-                    <Cell key={`cell-${entry.name}`} fill={COLORS[entry.name as keyof typeof COLORS] || '#ccc'} />
-                  ))}
-                </Pie>
-              </PieChart>
-            </ResponsiveContainer>
-          ) : (
-            <p className="text-center text-gray-500 py-8">No signals</p>
-          )}
-        </div>
+      {/* CHARTS ROW (lazy-loaded) */}
+      <div>
+        <Suspense fallback={<div className="h-64 flex items-center justify-center">Loading charts…</div>}>
+          <SignalHistoryCharts qualityAccuracyData={qualityAccuracyData} confidencePnLData={confidencePnLData} sourceDistribution={sourceDistribution} COLORS={COLORS} />
+        </Suspense>
       </div>
 
       {/* FILTER CONTROLS */}

@@ -16,6 +16,7 @@
  */
 
 import { MarketFrame } from '@shared/schema';
+import RL_DEFAULT_CONFIG, { RLConfig } from './config/rl-config';
 
 export interface PositionSizingAction {
   sizeMultiplier: number; // 0.5 to 2.0 (50% to 200% of base size)
@@ -86,6 +87,11 @@ export interface RLState {
   volSpike?: number; // Recent volatility change multiplier (0.5-2.0)
   patternDecay?: number; // Confidence decay of pattern (0-1)
   marketDrift?: number; // Drift in regime volatility (-1 to 1)
+  // Velocity-derived features (percent moves)
+  velocityShort?: number; // e.g., avg percent move over ~7 bars
+  velocityLong?: number;  // e.g., avg percent move over ~30 bars
+  vwVelocityShort?: number; // volume-weighted short velocity
+  volatilityAdjustedVelocity?: number; // percent normalized by ATR%
 }
 
 export interface Experience {
@@ -104,6 +110,7 @@ export interface DomainExperience extends Experience {
 
 export class RLPositionAgent {
   // Q-tables: global + per-regime
+  // legacy global table kept for compatibility but deprecated — prefer domainQTables
   private qTable: Map<string, Map<string, number>> = new Map();
   private regimeQTables: Map<string, Map<string, Map<string, number>>> = new Map(); // regime → state → action → Q-value
   
@@ -129,12 +136,12 @@ export class RLPositionAgent {
   private domainExperienceCounts: Map<string, number> = new Map(); // "DOMAIN_REGIME" → count
   
   private experienceBuffer: Experience[] = [];
-  private readonly bufferSize = 10000;
-  private readonly learningRate = 0.1;
-  private readonly discountFactor = 0.95;
-  private epsilon = 0.2; // Exploration rate
-  private readonly epsilonDecay = 0.995;
-  private readonly epsilonMin = 0.05;
+  private bufferSize: number;
+  private learningRate: number;
+  private discountFactor: number;
+  private epsilon: number; // Exploration rate
+  private epsilonDecay: number;
+  private epsilonMin: number;
   
   // Regime-specific learning rates
   private regimeLearningRates: Map<string, number> = new Map([
@@ -147,9 +154,13 @@ export class RLPositionAgent {
   // Discretized action spaces (populated at construction)
   private readonly actionSpace: PositionSizingAction[] = this.generateActionSpace();
   private readonly entryTimingActionSpace: EntryTimingAction[] = this.generateEntryTimingSpace();
-  private readonly sourceWeightActionSpace: SourceWeightAction[] = this.generateSourceWeightSpace();
+  // Source weight action space is configurable at runtime so we initialize in constructor
+  private sourceWeightActionSpace: SourceWeightAction[];
   private readonly exitSequenceActionSpace: ExitSequenceAction[] = this.generateExitSequenceSpace();
   private readonly clusterThresholdActionSpace: ClusterThresholdAction[] = this.generateClusterThresholdSpace();
+
+  // Optional runtime-configurable presets (can be overridden via admin API)
+  private sourceWeightPresets: RLConfig['sourceWeightPresets'] | null = null;
   
   // Action space map (populated in constructor)
   private domainActionSpaces: Map<RLDecisionDomain, RLAction[]> = new Map();
@@ -157,7 +168,25 @@ export class RLPositionAgent {
   // Regime performance tracking
   private regimePerformance: Map<string, { wins: number; trades: number }> = new Map();
   
-  constructor() {
+  constructor(opts?: Partial<{ bufferSize: number; learningRate: number; discountFactor: number; epsilon: number; epsilonDecay: number; epsilonMin: number }>) {
+    // allow hyperparameters to be configured for testing/production
+    this.bufferSize = opts?.bufferSize ?? 10000;
+    this.learningRate = opts?.learningRate ?? 0.1;
+    this.discountFactor = opts?.discountFactor ?? 0.95;
+    this.epsilon = opts?.epsilon ?? 0.2;
+    this.epsilonDecay = opts?.epsilonDecay ?? 0.995;
+    this.epsilonMin = opts?.epsilonMin ?? 0.05;
+
+    // Load initial presets from config if available
+    try {
+      this.sourceWeightPresets = RL_DEFAULT_CONFIG.sourceWeightPresets ?? null;
+    } catch (e) {
+      this.sourceWeightPresets = null;
+    }
+
+    // Initialize the source weight action space using presets (or defaults)
+    this.sourceWeightActionSpace = this.generateSourceWeightSpace();
+
     this.loadQTable();
     this.initializeRegimeQTables();
     this.initializeRegimeTracking();
@@ -234,38 +263,47 @@ export class RLPositionAgent {
    * Convert continuous state to discrete state key
    */
   private stateToKey(state: RLState): string {
-    const vol = Math.floor(state.volatility * 10);
-    const trend = Math.floor((state.trend + 1) * 5); // -1 to 1 → 0 to 10
-    const mom = Math.floor((state.momentum + 1) * 5);
-    const rsi = Math.floor(state.rsi / 10);
-    const conf = Math.floor(state.confidence * 10);
-    
-    return `${vol}-${trend}-${mom}-${rsi}-${conf}-${state.regime}`;
+    // finer-grained binning and include additional features for better discrimination
+    const vol = Math.floor(Math.max(0, Math.min(1, state.volatility)) * 20); // 0-20
+    const trend = Math.floor(Math.max(-1, Math.min(1, state.trend)) * 10 + 10); // -1..1 -> 0..20
+    const mom = Math.floor(Math.max(-1, Math.min(1, state.momentum)) * 10 + 10);
+    const rsi = Math.floor(Math.max(0, Math.min(100, state.rsi)) / 10); // 0-10
+    const conf = Math.floor(Math.max(0, Math.min(1, state.confidence)) * 10); // 0-10
+    const volSpike = Math.floor((state.volSpike ?? 1) * 10); // 5-20 range typically
+    const eqSlope = Math.floor(((state.equitySlope ?? 0) + 1) * 5); // -1..1 -> 0..10
+    const lossStreak = Math.min(10, Math.floor(state.lossStreak ?? 0));
+    const velShortNorm = Math.floor(Math.max(0, Math.min(1, (state.velocityShort ?? 0) / 10)) * 10); // normalize 0-10
+    const velLongNorm = Math.floor(Math.max(0, Math.min(1, (state.velocityLong ?? 0) / 10)) * 10);
+
+    return `${vol}-${trend}-${mom}-${rsi}-${conf}-${volSpike}-${eqSlope}-${lossStreak}-${velShortNorm}-${velLongNorm}-${state.regime}`;
   }
   
   /**
    * Convert action to key (supports all action types)
    */
-  private actionToKey(action: PositionSizingAction | RLAction): string {
-    // For PositionSizingAction (backward compat)
+  private actionToKey(action: RLAction): string {
+    // Position sizing canonical key
     if ('sizeMultiplier' in action) {
-      return `${action.sizeMultiplier}-${action.stopLossMultiplier}-${action.takeProfitMultiplier}`;
+      return `PS:${action.sizeMultiplier}-${action.stopLossMultiplier}-${action.takeProfitMultiplier}`;
     }
-    // For all other action types, use JSON hash
-    return JSON.stringify(action);
+
+    // Deterministic serialization for other action shapes
+    const keys = Object.keys(action as any).sort();
+    return keys.map(k => `${k}:${String((action as any)[k])}`).join('|');
   }
   
   /**
    * Get Q-value for state-action pair
    */
   private getQValue(state: RLState, action: PositionSizingAction): number {
+    // Deprecated: prefer regime/domain Q-tables. Keep for backward compat.
     const stateKey = this.stateToKey(state);
-    const actionKey = this.actionToKey(action);
-    
+    const actionKey = this.actionToKey(action as any as RLAction);
+
     if (!this.qTable.has(stateKey)) {
       this.qTable.set(stateKey, new Map());
     }
-    
+
     const stateActions = this.qTable.get(stateKey)!;
     return stateActions.get(actionKey) || 0;
   }
@@ -274,39 +312,23 @@ export class RLPositionAgent {
    * Set Q-value for state-action pair
    */
   private setQValue(state: RLState, action: PositionSizingAction, value: number): void {
+    // Deprecated: prefer learnDomain to update domain tables.
     const stateKey = this.stateToKey(state);
-    const actionKey = this.actionToKey(action);
-    
+    const actionKey = this.actionToKey(action as any as RLAction);
+
     if (!this.qTable.has(stateKey)) {
       this.qTable.set(stateKey, new Map());
     }
-    
+
     this.qTable.get(stateKey)!.set(actionKey, value);
   }
   
   /**
    * Select action using epsilon-greedy policy (globally)
    */
+  // Backward-compatible global selector — forwards to domain-aware selector for POSITION_SIZING
   selectAction(state: RLState, explore: boolean = true): PositionSizingAction {
-    // Epsilon-greedy exploration
-    if (explore && Math.random() < this.epsilon) {
-      // Random action
-      return this.actionSpace[Math.floor(Math.random() * this.actionSpace.length)];
-    }
-    
-    // Greedy action (exploit)
-    let bestAction = this.actionSpace[0];
-    let bestValue = this.getQValue(state, bestAction);
-    
-    for (const action of this.actionSpace) {
-      const value = this.getQValue(state, action);
-      if (value > bestValue) {
-        bestValue = value;
-        bestAction = action;
-      }
-    }
-    
-    return bestAction;
+    return this.selectActionForDomain('POSITION_SIZING', state, explore) as PositionSizingAction;
   }
 
   /**
@@ -403,26 +425,19 @@ export class RLPositionAgent {
    * Update Q-values using Q-learning (global)
    */
   learn(experience: Experience): void {
+    // Route legacy position-sizing experiences into the domain learning pipeline
     const { state, action, reward, nextState, done } = experience;
-    
-    // Current Q-value
-    const currentQ = this.getQValue(state, action);
-    
-    // Maximum Q-value for next state
-    let maxNextQ = 0;
-    if (!done) {
-      for (const nextAction of this.actionSpace) {
-        const nextQ = this.getQValue(nextState, nextAction);
-        maxNextQ = Math.max(maxNextQ, nextQ);
-      }
-    }
-    
-    // Q-learning update: Q(s,a) = Q(s,a) + α[r + γ·max Q(s',a') - Q(s,a)]
-    const newQ = currentQ + this.learningRate * (
-      reward + this.discountFactor * maxNextQ - currentQ
-    );
-    
-    this.setQValue(state, action, newQ);
+    const domainExp: DomainExperience = {
+      domain: 'POSITION_SIZING',
+      state,
+      action,
+      domainAction: action as any,
+      reward,
+      nextState,
+      done
+    };
+
+    this.learnDomain(domainExp);
   }
 
   /**
@@ -480,7 +495,30 @@ export class RLPositionAgent {
     for (const exp of batch) {
       this.learn(exp);
     }
-    
+
+    // Capture a small signed hash of the RL Q-table state for auditing
+    try {
+      const { createHash } = require('crypto');
+      const replayId = (require('uuid').v4)();
+      const statsMap = this.getDomainStats();
+      const statsObj: any = {};
+      for (const [domain, s] of statsMap.entries()) {
+        statsObj[domain] = s;
+      }
+      const json = JSON.stringify({ replayId, stats: statsObj, timestamp: Date.now() });
+      const hash = createHash('sha256').update(json).digest('hex');
+      try {
+        const db = require('./db-storage').db;
+        if (db && typeof db.createDecisionEvent === 'function') {
+          db.createDecisionEvent({ correlationId: null, phase: 'RL_REPLAY', domain: 'RL', actionPayload: { replayId }, metrics: { stats: statsObj, hash }, timestamp: Date.now() });
+        }
+      } catch (e) {
+        // ignore persistence errors
+      }
+    } catch (e) {
+      // ignore hashing errors
+    }
+
     // Decay epsilon
     this.epsilon = Math.max(this.epsilonMin, this.epsilon * this.epsilonDecay);
   }
@@ -522,7 +560,37 @@ export class RLPositionAgent {
     regime: string,
     currentDrawdown: number
   ): RLState {
-    if (frames.length < 20) {
+    // Adjust ML confidence via mode-aware scorer before using in RL state
+    try {
+      const scorerMod = require('./services/market-data/confidence-scorer') as any;
+      if (scorerMod && typeof scorerMod.getConfidenceScorer === 'function') {
+        const scorer = scorerMod.getConfidenceScorer();
+        const scored = scorer.scoreWithCurrentMode(mlConfidence, 'rl');
+        mlConfidence = scored.adjusted;
+      }
+    } catch (e) {
+      // ignore
+    }
+
+    // Blend in TruthEngine consensus confidence when available for this symbol
+    try {
+      const latestFrame = frames[frames.length - 1] as any;
+      const symbol = latestFrame?.symbol;
+      const truth = (global as any).truthEngine as any;
+      if (symbol && truth && typeof truth.getConsensus === 'function') {
+        const cons = truth.getConsensus(symbol);
+        if (cons && typeof cons.confidence === 'number') {
+          const consConf = Math.max(0, Math.min(1, cons.confidence / 100));
+          // conservative blending: mostly trust ML but allow consensus to influence
+          mlConfidence = Math.min(1, (mlConfidence * 0.8) + (consConf * 0.2));
+        }
+      }
+    } catch (e) {
+      // ignore truth integration errors
+    }
+
+    // Basic validation: ensure frames contain numeric price/volume
+    if (!Array.isArray(frames) || frames.length === 0) {
       return {
         volatility: 0.5,
         trend: 0,
@@ -534,10 +602,25 @@ export class RLPositionAgent {
         drawdown: currentDrawdown
       };
     }
-    
+
+    const take = Math.min(20, frames.length);
     const latest = frames[frames.length - 1] as any;
-    const prices = frames.slice(-20).map(f => (f as any).price?.close ?? (f as any).close ?? 0);
-    const volumes = frames.slice(-20).map(f => (f as any).volume ?? 0);
+    const slice = frames.slice(-take);
+    const prices = slice.map(f => Number((f as any).price?.close ?? (f as any).close ?? NaN)).filter(n => !Number.isNaN(n));
+    const volumes = slice.map(f => Number((f as any).volume ?? NaN)).filter(n => !Number.isNaN(n));
+
+    if (prices.length < 2) {
+      return {
+        volatility: 0.5,
+        trend: 0,
+        momentum: 0,
+        volumeRatio: 1,
+        rsi: 50,
+        confidence: mlConfidence,
+        regime,
+        drawdown: currentDrawdown
+      };
+    }
     
     // Calculate volatility
     const returns = prices.slice(1).map((p, i) => (p - prices[i]) / prices[i]);
@@ -553,9 +636,51 @@ export class RLPositionAgent {
     // Calculate momentum
     const momentum = (prices[prices.length - 1] - prices[0]) / prices[0];
     
-    // Volume ratio
-    const avgVolume = volumes.reduce((a, b) => a + b, 0) / volumes.length;
-    const volumeRatio = latest.volume / avgVolume;
+    // Volume ratio (robust fallback)
+    const avgVolume = volumes.length > 0 ? (volumes.reduce((a, b) => a + b, 0) / volumes.length) : 1;
+    const latestVolume = Number((latest as any).volume ?? avgVolume);
+    const volumeRatio = avgVolume > 0 ? latestVolume / avgVolume : 1;
+
+    // Compute simple velocity features from frames (short & long percent moves)
+    const computeAvgPercentMove = (window: number) => {
+      const w = Math.min(window, prices.length - 1);
+      if (w < 1) return 0;
+      let sum = 0;
+      for (let i = prices.length - w - 1; i < prices.length - 1; i++) {
+        const start = prices[i];
+        const end = prices[i + 1];
+        if (!start || start === 0) continue;
+        sum += Math.abs((end - start) / start) * 100;
+      }
+      return sum / Math.max(1, w);
+    };
+
+    const velocityShort = computeAvgPercentMove(7);
+    const velocityLong = computeAvgPercentMove(Math.min(30, prices.length - 1));
+
+    // Volume-weighted short velocity
+    const computeVWShort = (window: number) => {
+      const w = Math.min(window, prices.length - 1);
+      if (w < 1) return 0;
+      let volSum = 0;
+      let weighted = 0;
+      for (let i = prices.length - w - 1; i < prices.length - 1; i++) {
+        const start = prices[i];
+        const end = prices[i + 1];
+        const vol = volumes[i] || 0;
+        const pct = start ? Math.abs((end - start) / start) * 100 : 0;
+        weighted += pct * vol;
+        volSum += vol;
+      }
+      return volSum > 0 ? weighted / volSum : 0;
+    };
+
+    const vwVelocityShort = computeVWShort(7);
+
+    // Volatility-adjusted velocity: normalize by ATR percent if available from indicators
+    const atr = (latest.indicators?.atr as number) ?? (prices[prices.length - 1] * 0.02);
+    const atrPercent = (atr / prices[prices.length - 1]) * 100;
+    const volatilityAdjustedVelocity = atrPercent > 0 ? (velocityShort / atrPercent) : velocityShort;
     
     return {
       volatility: Math.min(1, volatility * 50), // Normalize to 0-1
@@ -566,6 +691,11 @@ export class RLPositionAgent {
       confidence: mlConfidence,
       regime,
       drawdown: currentDrawdown
+      ,
+      velocityShort,
+      velocityLong,
+      vwVelocityShort,
+      volatilityAdjustedVelocity
     };
   }
   
@@ -576,20 +706,21 @@ export class RLPositionAgent {
     state: RLState,
     baseSize: number,
     atr: number,
-    currentPrice: number
+    currentPrice: number,
+    explore: boolean = false
   ): {
     positionSize: number;
     stopLoss: number;
     takeProfit: number;
     riskReward: number;
   } {
-    const action = this.selectAction(state, false); // No exploration for production
-    
+    const action = this.selectAction(state, explore); // allow optional exploration
+
     return {
-      positionSize: baseSize * action.sizeMultiplier,
-      stopLoss: currentPrice - (atr * action.stopLossMultiplier),
-      takeProfit: currentPrice + (atr * action.takeProfitMultiplier),
-      riskReward: action.riskRewardRatio
+      positionSize: baseSize * (('sizeMultiplier' in action) ? (action as any).sizeMultiplier : 1),
+      stopLoss: currentPrice - (atr * (('stopLossMultiplier' in action) ? (action as any).stopLossMultiplier : 1)),
+      takeProfit: currentPrice + (atr * (('takeProfitMultiplier' in action) ? (action as any).takeProfitMultiplier : 1)),
+      riskReward: ('riskRewardRatio' in action) ? (action as any).riskRewardRatio : 1
     };
   }
   
@@ -607,6 +738,16 @@ export class RLPositionAgent {
   private async loadQTable(): Promise<void> {
     // In production, load from database or file
     console.log('[RL Agent] Q-table loaded');
+  }
+
+  /** Persist domain Q-tables and buffers (stub) */
+  async saveDomainState(): Promise<void> {
+    console.log('[RL Agent] domain Q-tables persisted (stub)');
+  }
+
+  /** Load domain Q-tables and buffers (stub) */
+  async loadDomainState(): Promise<void> {
+    console.log('[RL Agent] domain Q-tables loaded (stub)');
   }
   
   /**
@@ -706,15 +847,18 @@ export class RLPositionAgent {
 
     const current = stateActions.get(actionKey) ?? 0;
 
-    // Get maximum Q-value for next state
+    // Get maximum Q-value for next state by iterating the canonical action space
     let maxNext = 0;
     if (!done) {
       const actionSpace = this.domainActionSpaces.get(domain);
       if (actionSpace) {
         const nextRegimeMap = qTable.get(regime) || new Map();
         const nextStateActions = nextRegimeMap.get(nextStateKey) || new Map();
-        const nextValues = Array.from(nextStateActions.values()) as number[];
-        maxNext = nextValues.length > 0 ? Math.max(...nextValues, 0) : 0;
+        for (const a of actionSpace) {
+          const ak = this.actionToKey(a as RLAction);
+          const v = nextStateActions.get(ak) ?? 0;
+          if (v > maxNext) maxNext = v;
+        }
       }
     }
 
@@ -768,6 +912,28 @@ export class RLPositionAgent {
   }
 
   /**
+   * Get the currently active source weight presets
+   */
+  public getSourceWeightPresets(): SourceWeightAction[] {
+    // Return the normalized action space as presets representation
+    return this.sourceWeightActionSpace.map(p => ({ ...p }));
+  }
+
+  /**
+   * Replace source weight presets at runtime (validated + normalized)
+   */
+  public setSourceWeightPresets(presets: { scannerWeight: number; mlWeight: number; rlWeight: number }[]): void {
+    if (!Array.isArray(presets) || presets.length === 0) {
+      throw new Error('Presets must be a non-empty array');
+    }
+    // store raw presets for persistence/inspection
+    this.sourceWeightPresets = presets.map(p => ({ scannerWeight: p.scannerWeight, mlWeight: p.mlWeight, rlWeight: p.rlWeight }));
+    // regenerate action space
+    this.sourceWeightActionSpace = this.generateSourceWeightSpace();
+    console.log('[RL Agent] Source weight presets updated at runtime. Presets count:', this.sourceWeightActionSpace.length);
+  }
+
+  /**
    * Get domain-specific epsilon (exploration rate)
    * Explores more heavily when domain has few samples in this regime
    */
@@ -801,15 +967,50 @@ export class RLPositionAgent {
    * Pre-computed combinations that sum to 1.0
    */
   private generateSourceWeightSpace(): SourceWeightAction[] {
-    return [
-      { scannerWeight: 0.40, mlWeight: 0.35, rlWeight: 0.25 }, // Default balanced
-      { scannerWeight: 0.50, mlWeight: 0.30, rlWeight: 0.20 }, // Scanner heavy
-      { scannerWeight: 0.30, mlWeight: 0.45, rlWeight: 0.25 }, // ML heavy
-      { scannerWeight: 0.30, mlWeight: 0.30, rlWeight: 0.40 }, // RL heavy
-      { scannerWeight: 0.33, mlWeight: 0.33, rlWeight: 0.34 }, // Equal weight
-      { scannerWeight: 0.20, mlWeight: 0.50, rlWeight: 0.30 }, // Volatile preset (ML dominant)
-      { scannerWeight: 0.45, mlWeight: 0.35, rlWeight: 0.20 }, // Trending preset (Scanner dominant)
-    ];
+    // Use runtime-configured presets when available
+    const presetsFromConfig = this.sourceWeightPresets;
+    const rawPresets = Array.isArray(presetsFromConfig) && presetsFromConfig.length > 0
+      ? presetsFromConfig
+      : [
+          { scannerWeight: 0.40, mlWeight: 0.35, rlWeight: 0.25 }, // Default balanced
+          { scannerWeight: 0.50, mlWeight: 0.30, rlWeight: 0.20 }, // Scanner heavy
+          { scannerWeight: 0.30, mlWeight: 0.45, rlWeight: 0.25 }, // ML heavy
+          { scannerWeight: 0.30, mlWeight: 0.30, rlWeight: 0.40 }, // RL heavy
+          { scannerWeight: 0.33, mlWeight: 0.33, rlWeight: 0.34 }, // Equal weight
+          { scannerWeight: 0.20, mlWeight: 0.50, rlWeight: 0.30 }, // Volatile preset (ML dominant)
+          { scannerWeight: 0.45, mlWeight: 0.35, rlWeight: 0.20 }, // Trending preset (Scanner dominant)
+        ];
+
+    // Normalize + validate presets
+    const normalized = rawPresets.map((p) => {
+      const s = Number(p.scannerWeight || 0) + Number(p.mlWeight || 0) + Number(p.rlWeight || 0);
+      if (!isFinite(s) || s <= 0) {
+        return { scannerWeight: 0.33, mlWeight: 0.33, rlWeight: 0.34 };
+      }
+      // ensure non-negative
+      const sc = Math.max(0, Number(p.scannerWeight));
+      const ml = Math.max(0, Number(p.mlWeight));
+      const rl = Math.max(0, Number(p.rlWeight));
+      const total = sc + ml + rl;
+      if (total <= 0) return { scannerWeight: 0.33, mlWeight: 0.33, rlWeight: 0.34 };
+      const scannerWeight = Math.round((sc / total) * 100) / 100;
+      const mlWeight = Math.round((ml / total) * 100) / 100;
+      const rlWeight = Math.round((rl / total) * 100) / 100;
+      // Last element adjust to ensure sum is exactly 1.00 when possible
+      return { scannerWeight, mlWeight, rlWeight };
+    });
+
+    // If rounding produced a sum != 1.0 due to rounding, fix it by adjusting the largest weight
+    return normalized.map((p) => {
+      const sum = Number(p.scannerWeight) + Number(p.mlWeight) + Number(p.rlWeight);
+      const diff = Math.round((1 - sum) * 100) / 100;
+      if (Math.abs(diff) < 0.001) return p;
+      // find largest weight and add diff
+      const keys = ['scannerWeight', 'mlWeight', 'rlWeight'] as const;
+      type K = typeof keys[number];
+      const maxKey = keys.reduce((a: K, b: K) => ((p as any)[a] > (p as any)[b] ? a : b));
+      return { ...p, [maxKey]: Math.round((Number((p as any)[maxKey]) + diff) * 100) / 100 } as SourceWeightAction;
+    });
   }
 
   /**

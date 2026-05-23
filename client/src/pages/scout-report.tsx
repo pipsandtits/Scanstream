@@ -6,7 +6,7 @@
  */
 
 import React, { useState, useCallback } from 'react';
-import { useParams, useLocation } from 'wouter';
+import { useParams, useNavigate } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
 import { ArrowLeft, Download, RefreshCw, Share2, Settings } from 'lucide-react';
 import ScoutReportViewer from '../../components/scout/ScoutReportViewer';
@@ -15,7 +15,7 @@ interface ScoutReportPageProps {}
 
 export default function ScoutReportPage({}: ScoutReportPageProps) {
   const { symbol = '' } = useParams<{ symbol?: string }>();
-  const [, navigate] = useLocation();
+  const navigate = useNavigate();
   const [viewMode, setViewMode] = useState<'executive' | 'opportunities' | 'consensus' | 'risk' | 'sources' | 'details'>('executive');
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [refreshInterval, setRefreshInterval] = useState(30000); // 30 seconds default
@@ -23,8 +23,8 @@ export default function ScoutReportPage({}: ScoutReportPageProps) {
   // Fetch scout report data
   const { data, isLoading, error, refetch, isFetching } = useQuery({
     queryKey: ['scout-report', symbol],
-    queryFn: async () => {
-      const response = await fetch(`/api/scout/report/${symbol}`);
+    queryFn: async ({ signal }: any) => {
+      const response = await fetch(`/api/scout/report/${symbol}`, { signal });
       if (!response.ok) throw new Error('Failed to fetch scout report');
       return response.json();
     },

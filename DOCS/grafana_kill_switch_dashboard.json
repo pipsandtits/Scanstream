@@ -1,0 +1,31 @@
+{
+  "dashboard": {
+    "title": "Kill Switch & Risk Overview",
+    "panels": [
+      {
+        "type": "stat",
+        "title": "Kill Switch Active",
+        "targets": [{ "expr": "kill_switch_active" }],
+        "gridPos": { "x": 0, "y": 0, "w": 6, "h": 4 }
+      },
+      {
+        "type": "graph",
+        "title": "Portfolio Drawdown %",
+        "targets": [{ "expr": "portfolio_drawdown_percent" }],
+        "gridPos": { "x": 6, "y": 0, "w": 12, "h": 6 }
+      },
+      {
+        "type": "graph",
+        "title": "Daily Loss %",
+        "targets": [{ "expr": "portfolio_daily_loss_percent" }],
+        "gridPos": { "x": 0, "y": 4, "w": 6, "h": 4 }
+      },
+      {
+        "type": "graph",
+        "title": "Open Exposure %",
+        "targets": [{ "expr": "portfolio_open_exposure_percent" }],
+        "gridPos": { "x": 6, "y": 6, "w": 12, "h": 4 }
+      }
+    ]
+  }
+}

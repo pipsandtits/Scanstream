@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { signalQualityEngine, type SignalMetrics } from '../lib/signal-quality';
-import { PrismaClient } from '@prisma/client';
+import pkg from '@prisma/client';
+const { PrismaClient } = pkg as any;
 
 const prisma = new PrismaClient();
 const router = Router();
@@ -17,9 +18,11 @@ router.post('/analyze-quality', async (req: Request, res: Response) => {
       return res.status(400).json({ error: 'Signals must be an array' });
     }
 
+    // Preload historical accuracies to avoid N+1 DB queries inside scoring
+    const accuracyMap = await signalQualityEngine.preloadHistoricalAccuracy(signals);
     const qualityResults = await Promise.all(
       signals.map(async (signal: SignalMetrics) => {
-        const quality = await signalQualityEngine.calculateQualityScore(signal, signals);
+        const quality = await signalQualityEngine.calculateQualityScore(signal, signals, accuracyMap);
         return { signal, quality };
       })
     );
@@ -140,10 +143,11 @@ router.get('/high-quality', async (req: Request, res: Response) => {
 
     const qualified = await signalQualityEngine.filterByQuality(signals, parseInt(minScore as string));
 
+    // Reuse same accuracy map to annotate qualified signals
     const withQuality = await Promise.all(
       qualified.map(async (signal) => ({
         signal,
-        quality: await signalQualityEngine.calculateQualityScore(signal, signals)
+        quality: await signalQualityEngine.calculateQualityScore(signal, signals, accuracyMap)
       }))
     );
 

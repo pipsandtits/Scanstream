@@ -1,0 +1,21 @@
+{
+  "enableRL": true,
+  "minExperienceForRL": 50,
+  "defaultWeights": {
+    "scannerWeight": 0.4,
+    "mlWeight": 0.35,
+    "rlWeight": 0.25
+  },
+  "defaultThresholds": {
+    "minClusterStrength": 0.7,
+    "minFollowThrough": 0.4,
+    "minDirectionalRatio": 0.6
+  },
+  "rlGuard": {
+    "windowSize": 50,
+    "varianceThreshold": 8,
+    "minExperience": 50
+  },
+  "logLevel": "info"
+}
+

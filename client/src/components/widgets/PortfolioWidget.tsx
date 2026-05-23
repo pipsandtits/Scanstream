@@ -22,8 +22,8 @@ export default function PortfolioWidget({
 }: PortfolioWidgetProps) {
   const { data: portfolio } = useQuery<PortfolioSummary>({
     queryKey: ['portfolio-summary'],
-    queryFn: async () => {
-      const response = await fetch('/api/portfolio/summary');
+    queryFn: async ({ signal }: any) => {
+      const response = await fetch('/api/portfolio/summary', { signal });
       if (!response.ok) throw new Error('Failed to fetch portfolio');
       return response.json();
     },

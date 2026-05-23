@@ -6,7 +6,7 @@
  * Date: January 6, 2026
  */
 
-import { PRODUCTION_CONFIG } from './live-deployment-config.ts';
+import { PRODUCTION_CONFIG } from './live-deployment-config';
 
 export interface LiveTradingState {
   isConnected: boolean;

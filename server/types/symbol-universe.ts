@@ -227,6 +227,15 @@ export interface Symbol {
      * Custom metadata (flags, indicators, tags)
      */
     tags?: string[];
+    /**
+     * Correlation group name (optional) — e.g. "BTC ecosystem", "majors forex"
+     */
+    correlationGroup?: string;
+
+    /**
+     * Risk classification hint for UI and strategy heuristics
+     */
+    riskClassification?: 'high-vol' | 'safe-haven' | 'speculative' | 'stable' | 'leveraged';
   };
 
   /**

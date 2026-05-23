@@ -23,6 +23,10 @@ export interface HoldingAnalysisInput {
   technicalScore: number; // 0-100
   mlProbability: number; // 0-1
   microstructureSignals: string[]; // Recent signals
+  // Optional clustering inputs
+  clusterStrength?: number; // 0-1, derived cluster strength
+  avgClusterSize?: number; // average cluster size in bars
+  trendFormation?: boolean; // whether trend formation detected
 }
 
 export interface HoldingAnalysisOutput {
@@ -134,6 +138,22 @@ export class AdaptiveHoldingIntegration {
     signal: any, // AggregatedSignal (avoid circular dependency)
     input: HoldingAnalysisInput
   ): void {
+    // If clustering info is attached to signal metadata, merge it into input
+    try {
+      if (signal && signal.metadata) {
+        const meta = signal.metadata;
+        if (meta.clusterValidation) {
+          input.clusterStrength = (meta.clusterValidation.final_entry_quality as any) || input.clusterStrength;
+          input.avgClusterSize = (meta.clusterValidation.cluster_validation?.formation_strength as any) || input.avgClusterSize;
+        }
+        if (meta.clusterMetrics) {
+          input.clusterStrength = input.clusterStrength ?? meta.clusterMetrics.cluster_strength;
+          input.avgClusterSize = input.avgClusterSize ?? meta.clusterMetrics.avg_cluster_size;
+          input.trendDirection = input.trendDirection || (meta.clusterMetrics.directional_ratio && meta.clusterMetrics.directional_ratio > 0.5 ? 'BULLISH' : input.trendDirection);
+        }
+      }
+    } catch (e) {}
+
     const result = this.analyzeHolding(input);
     const decision = result.holdingDecision;
 

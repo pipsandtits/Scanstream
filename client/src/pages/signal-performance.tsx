@@ -34,8 +34,8 @@ export default function SignalPerformance() {
   // Fetch performance stats
   const { data: stats } = useQuery<PerformanceStats>({
     queryKey: ['signal-performance-stats'],
-    queryFn: async () => {
-      const response = await fetch('/api/gateway/signals/performance/stats');
+    queryFn: async ({ signal }: any) => {
+      const response = await fetch('/api/gateway/signals/performance/stats', { signal });
       if (!response.ok) throw new Error('Failed to fetch stats');
       return response.json();
     },
@@ -45,8 +45,8 @@ export default function SignalPerformance() {
   // Fetch recent performance
   const { data: recentPerformance } = useQuery<SignalPerformance[]>({
     queryKey: ['signal-performance-recent'],
-    queryFn: async () => {
-      const response = await fetch('/api/gateway/signals/performance/recent?limit=50');
+    queryFn: async ({ signal }: any) => {
+      const response = await fetch('/api/gateway/signals/performance/recent?limit=50', { signal });
       if (!response.ok) throw new Error('Failed to fetch performance');
       return response.json();
     },

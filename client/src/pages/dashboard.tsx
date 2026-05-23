@@ -1,4 +1,8 @@
 import { useState, useMemo, useEffect, useRef } from 'react';
+import OverviewView from './OverviewView';
+import ScannerView from './ScannerView';
+import PositionsView from './PositionsView';
+import { AgentPips, VoteBar, Sparkline } from './dashboardHelpers';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { 
   Search, 
@@ -34,17 +38,7 @@ import ExtendedAgentLeaderboard from '../components/ExtendedAgentLeaderboard';
 import SignalHistory from '../components/SignalHistory';
 import RegimeDisplay from '../components/RegimeDisplay';
 
-interface ChartDataPoint {
-  timestamp: number;
-  open: number;
-  high: number;
-  low: number;
-  close: number;
-  volume?: number;
-  rsi?: number | null;
-  macd?: number | null;
-  ema?: number | null;
-}
+import type { ChartDataPoint } from '@/types/chart';
 
 interface CandleSignals {
   timestamp: number;
@@ -169,6 +163,7 @@ export default function DashboardPage() {
   const [tempSettings, setTempSettings] = useState(paperTradingMode);
   const [showAssetDetail, setShowAssetDetail] = useState(false);
   const [detailAsset, setDetailAsset] = useState<AssetConsensus | null>(null);
+  const [activeTab, setActiveTab] = useState<'overview'|'scanner'|'positions'|'backtest'|'ml'|'portfolio'>('overview');
   
   // Interactive features state
   const [hoveredAgent, setHoveredAgent] = useState<AgentSignal | null>(null);
@@ -350,6 +345,25 @@ export default function DashboardPage() {
     return (sum / assetsArray.length).toFixed(0);
   }, [assets]);
 
+  // Aggregate agent votes across assets for UI components
+  const aggregateVotes = useMemo(() => {
+    const assetsArray = (assets as AssetConsensus[] | null | undefined) || [];
+    const buy = assetsArray.reduce((s: number, a: AssetConsensus) => s + (a.buyAgents || 0), 0);
+    const hold = assetsArray.reduce((s: number, a: AssetConsensus) => s + (a.holdAgents || 0), 0);
+    const sell = assetsArray.reduce((s: number, a: AssetConsensus) => s + (a.sellAgents || 0), 0);
+    return { buy, hold, sell };
+  }, [assets]);
+
+  // Scale votes to the 13-pip AgentPips display
+  const scaledAgentPips = useMemo(() => {
+    const totalVotes = aggregateVotes.buy + aggregateVotes.hold + aggregateVotes.sell || 1;
+    const scale = 13;
+    const b = Math.round((aggregateVotes.buy / totalVotes) * scale);
+    const h = Math.round((aggregateVotes.hold / totalVotes) * scale);
+    const s = Math.max(0, scale - b - h);
+    return { buy: b, hold: h, sell: s };
+  }, [aggregateVotes]);
+
   // Calculate performance metrics
   const performanceMetrics = useMemo(() => {
     const positionsArray = (positions as PaperTradingPosition[] | null | undefined) || [];
@@ -406,6 +420,19 @@ export default function DashboardPage() {
         <div className="text-center">
           <Zap className="w-12 h-12 animate-spin mx-auto mb-4 text-blue-400" />
           <p>Loading market intelligence...</p>
+        </div>
+
+        {/* Top tabs */}
+        <div className="hidden md:flex gap-2 mt-4">
+          {(['overview','scanner','positions','backtest','ml','portfolio'] as const).map(tab => (
+            <button
+              key={tab}
+              onClick={() => setActiveTab(tab)}
+              className={`text-sm px-2 py-1 rounded ${activeTab === tab ? 'bg-blue-500/20 text-blue-300' : 'text-slate-400 hover:text-white'}`}
+            >
+              {tab.charAt(0).toUpperCase() + tab.slice(1)}
+            </button>
+          ))}
         </div>
       </div>
     );
@@ -504,6 +531,12 @@ export default function DashboardPage() {
               <div className="text-2xl font-bold">
                 {avgConfidence}%
               </div>
+              <div className="mt-2">
+                <VoteBar buy={aggregateVotes.buy} hold={aggregateVotes.hold} sell={aggregateVotes.sell} total={Math.max(13, aggregateVotes.buy + aggregateVotes.hold + aggregateVotes.sell)} />
+                <div className="mt-2 flex justify-end">
+                  <AgentPips buy={scaledAgentPips.buy} hold={scaledAgentPips.hold} sell={scaledAgentPips.sell} />
+                </div>
+              </div>
             </CardContent>
           </Card>
           <Card className="bg-slate-900/50 border-slate-800">
@@ -569,404 +602,70 @@ export default function DashboardPage() {
       </div>
 
       {/* Main Content - 3 Column Layout */}
-      <div className="grid grid-cols-12 gap-6 mb-6">
-        
-        {/* LEFT: Asset Watchlist (25%) */}
-        <div className="col-span-3 space-y-4">
-          <Card className="bg-slate-900/50 border-slate-800">
-            <CardHeader className="pb-3">
-              <CardTitle className="text-lg">Market Watch</CardTitle>
-              <CardDescription>Asset Selection</CardDescription>
-            </CardHeader>
-            <CardContent className="space-y-4">
-              {/* Search */}
-              <div className="relative">
-                <Search className="absolute left-3 top-3 w-4 h-4 text-slate-500" />
-                <Input
-                  placeholder="Search assets..."
-                  value={searchQuery}
-                  onChange={(e) => setSearchQuery(e.target.value)}
-                  className="pl-10 bg-slate-800 border-slate-700"
-                />
-              </div>
-
-              {/* List Filters */}
-              <div className="grid grid-cols-2 gap-2">
-                <Button
-                  variant={listFilter === 'top-volume' ? 'default' : 'outline'}
-                  size="sm"
-                  onClick={() => setListFilter('top-volume')}
-                >
-                  Top Volume
-                </Button>
-                <Button
-                  variant={listFilter === 'top-confidence' ? 'default' : 'outline'}
-                  size="sm"
-                  onClick={() => setListFilter('top-confidence')}
-                >
-                  Top Conf
-                </Button>
-                <Button
-                  variant={listFilter === 'high-conviction' ? 'default' : 'outline'}
-                  size="sm"
-                  onClick={() => setListFilter('high-conviction')}
-                  className="col-span-2"
-                >
-                  High Conviction
-                </Button>
-              </div>
-
-              {/* Asset List */}
-              <div className="space-y-2 max-h-[600px] overflow-y-auto">
-                {filteredAssets.map((asset: AssetConsensus) => (
-                  <div
-                    key={asset.symbol}
-                    className={`p-3 rounded-lg transition-all border ${
-                      selectedAsset === asset.symbol
-                        ? 'bg-blue-500/20 border-blue-500/50'
-                        : 'bg-slate-800 border-slate-700 hover:border-slate-600'
-                    }`}
-                  >
-                    <div className="flex items-center justify-between mb-2">
-                      <div 
-                        onClick={() => setSelectedAsset(asset.symbol)}
-                        className="flex-1 cursor-pointer"
-                      >
-                        <span className="font-semibold text-sm">{asset.symbol}</span>
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <Badge 
-                          variant="outline" 
-                          className={`text-xs ${getConsensusColor(asset.consensusSignal)}`}
-                        >
-                          {asset.consensusSignal}
-                        </Badge>
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          onClick={() => {
-                            setDetailAsset(asset);
-                            setShowAssetDetail(true);
-                          }}
-                          className="p-0 h-auto w-auto hover:bg-slate-700"
-                          title="View asset details"
-                        >
-                          <Eye className="w-4 h-4 text-blue-400" />
-                        </Button>
-                      </div>
-                    </div>
-                    <div className="text-xs text-slate-400 space-y-1">
-                      <div className="flex justify-between">
-                        <span>Price:</span>
-                        <span className="text-white">${asset.price.toFixed(2)}</span>
-                      </div>
-                      <div className="flex justify-between">
-                        <span>Agents:</span>
-                        <span className="text-green-400">{asset.buyAgents}/13</span>
-                      </div>
-                      <div className="flex justify-between">
-                        <span>Conf:</span>
-                        <span>{asset.avgConfidence.toFixed(0)}%</span>
-                      </div>
-                    </div>
+      {activeTab !== 'overview' ? (
+        <div className="flex-1 flex overflow-hidden mb-6">
+          <div className="flex-1 overflow-auto p-4">
+            {activeTab === 'scanner' && <ScannerView assets={filteredAssets} onSelect={setSelectedAsset} />}
+            {activeTab === 'positions' && <PositionsView positions={positions} />}
+            {activeTab === 'backtest' && <div className="p-8 text-center text-slate-400">Backtest Engine Coming Soon</div>}
+            {activeTab === 'ml' && <div className="p-8 text-center text-slate-400">ML Lab & Model Monitoring</div>}
+            {activeTab === 'portfolio' && <div className="p-8 text-center text-slate-400">Portfolio Overview</div>}
+          </div>
+          {selectedAssetData && (
+            <div className="w-96 border-l border-slate-700 bg-slate-900 overflow-auto">
+              <div className="p-4 text-slate-300 text-sm">
+                <div className="flex items-center justify-between">
+                  <div>Selected asset: {selectedAssetData?.symbol}</div>
+                  <div className="ml-2">
+                    <Sparkline asset={selectedAssetData} width={120} height={36} />
                   </div>
-                ))}
+                </div>
               </div>
-            </CardContent>
-          </Card>
-        </div>
-
-        {/* CENTER: 13-Agent Signals (50%) */}
-        <div className="col-span-6 space-y-4">
-          {selectedAssetData ? (
-            <>
-              {/* Consensus Summary */}
-              <Card className="bg-slate-900/50 border-slate-800">
-                <CardHeader className="pb-3">
-                  <div className="flex items-center justify-between">
-                    <div>
-                      <CardTitle className="text-2xl">{selectedAssetData.symbol}</CardTitle>
-                      <CardDescription>
-                        ${selectedAssetData.price.toFixed(2)} 
-                        <span className={selectedAssetData.priceChange > 0 ? 'text-green-400 ml-2' : 'text-red-400 ml-2'}>
-                          {selectedAssetData.priceChange > 0 ? '+' : ''}{selectedAssetData.priceChange.toFixed(2)}%
-                        </span>
-                      </CardDescription>
-                    </div>
-                    <Button size="sm" variant="outline">
-                      <Eye className="w-4 h-4 mr-2" />
-                      Details
-                    </Button>
-                  </div>
-                </CardHeader>
-                <CardContent>
-                  <div className="grid grid-cols-2 gap-4">
-                    {/* Consensus Type */}
-                    <div className="p-4 bg-slate-800 rounded-lg border border-slate-700">
-                      <div className="text-sm text-slate-400 mb-2">Consensus Signal</div>
-                      <div className={`text-3xl font-bold ${getConsensusColor(selectedAssetData.consensusSignal)}`}>
-                        {selectedAssetData.consensusSignal}
-                      </div>
-                      <div className="text-xs text-slate-400 mt-2">
-                        {selectedAssetData.buyAgents}/13 agents bullish
-                      </div>
-                    </div>
-
-                    {/* Risk & Confidence */}
-                    <div className="space-y-2">
-                      <div className="p-4 bg-slate-800 rounded-lg border border-slate-700">
-                        <div className="text-sm text-slate-400 mb-1">Risk Level</div>
-                        <Badge className={`${getRiskColor(selectedAssetData.riskScore)} border-0`}>
-                          {selectedAssetData.riskScore}
-                        </Badge>
-                      </div>
-                      <div className="p-4 bg-slate-800 rounded-lg border border-slate-700">
-                        <div className="text-sm text-slate-400 mb-1">Avg Confidence</div>
-                        <div className="text-xl font-bold text-blue-400">
-                          {selectedAssetData.avgConfidence.toFixed(0)}%
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-
-                  {/* Vote Distribution */}
-                  <div className="mt-4 p-4 bg-slate-800 rounded-lg border border-slate-700">
-                    <div className="text-sm text-slate-400 mb-3">Agent Distribution</div>
-                    <div className="flex items-end gap-2 h-16">
-                      <div className="flex-1 bg-green-500/30 rounded-t flex flex-col items-center justify-end pb-2">
-                        <div className="text-xs text-green-400 font-bold">{selectedAssetData.buyAgents}</div>
-                        <div className="text-xs text-slate-400">BUY</div>
-                      </div>
-                      <div className="flex-1 bg-yellow-500/30 rounded-t flex flex-col items-center justify-end pb-2">
-                        <div className="text-xs text-yellow-400 font-bold">{selectedAssetData.holdAgents}</div>
-                        <div className="text-xs text-slate-400">HOLD</div>
-                      </div>
-                      <div className="flex-1 bg-red-500/30 rounded-t flex flex-col items-center justify-end pb-2">
-                        <div className="text-xs text-red-400 font-bold">{selectedAssetData.sellAgents}</div>
-                        <div className="text-xs text-slate-400">SELL</div>
-                      </div>
-                    </div>
-                  </div>
-                </CardContent>
-              </Card>
-
-              {/* Agent Cards Grid */}
-              <div className="grid grid-cols-2 gap-3">
-                {selectedAssetData?.signals.map((signal: AgentSignal) => (
-                  <Card
-                    key={signal.agentName}
-                    className={`border cursor-pointer hover:shadow-lg transition-all ${
-                      AGENT_COLORS[signal.agentType]
-                    } ${hoveredAgent?.agentName === signal.agentName ? 'ring-2 ring-blue-400' : ''}`}
-                    onMouseEnter={() => setHoveredAgent(signal)}
-                    onMouseLeave={() => setHoveredAgent(null)}
-                    onClick={() => {
-                      setSelectedAgentDetail(signal);
-                      setShowAgentInspector(true);
-                    }}
-                  >
-                    <CardContent className="p-4">
-                      {/* Agent Header */}
-                      <div className="flex items-start justify-between mb-3">
-                        <div className="flex items-center gap-2">
-                          <span className="text-2xl">{AGENT_ICONS[signal.agentType]}</span>
-                          <div>
-                            <div className="font-semibold text-sm">{signal.agentName}</div>
-                            <div className="text-xs text-slate-400">{signal.agentType}</div>
-                          </div>
-                        </div>
-                      </div>
-
-                      {/* Signal */}
-                      <div className="mb-3">
-                        <div className="text-xs text-slate-400 mb-1">Signal</div>
-                        <Badge
-                          className={`text-xs font-bold border-0 ${
-                            signal.signal === 'BUY'
-                              ? 'bg-green-500/30 text-green-400'
-                              : signal.signal === 'SELL'
-                              ? 'bg-red-500/30 text-red-400'
-                              : 'bg-yellow-500/30 text-yellow-400'
-                          }`}
-                        >
-                          {signal.signal} ({signal.confidence.toFixed(0)}%)
-                        </Badge>
-                      </div>
-
-                      {/* Primary Insight */}
-                      <div className="mb-3">
-                        <div className="text-xs text-slate-400 mb-1">Why</div>
-                        <p className="text-xs text-slate-300">{signal.insights.primary}</p>
-                      </div>
-
-                      {/* Accuracy */}
-                      <div className="pt-2 border-t border-slate-700/50">
-                        <div className="flex justify-between items-center">
-                          <span className="text-xs text-slate-400">Accuracy: {(signal.accuracy || 0).toFixed(0)}%</span>
-                          <span className="text-xs text-blue-400 opacity-0 group-hover:opacity-100">Click to inspect →</span>
-                        </div>
-                      </div>
-                    </CardContent>
-                  </Card>
-                ))}
-              </div>
-
-              {/* Action Buttons */}
-              <div className="grid grid-cols-2 gap-3">
-                <Button 
-                  className="bg-green-600 hover:bg-green-700" 
-                  size="lg"
-                  onClick={() => {
-                    if (selectedAssetData) {
-                      setEntryAsset(selectedAssetData);
-                      setEntrySide('LONG');
-                      setShowEntryDialog(true);
-                    }
-                  }}
-                >
-                  <Plus className="w-4 h-4 mr-2" />
-                  Long Entry
-                </Button>
-                <Button 
-                  className="bg-red-600 hover:bg-red-700" 
-                  size="lg"
-                  onClick={() => {
-                    if (selectedAssetData) {
-                      setEntryAsset(selectedAssetData);
-                      setEntrySide('SHORT');
-                      setShowEntryDialog(true);
-                    }
-                  }}
-                >
-                  <Plus className="w-4 h-4 mr-2" />
-                  Short Entry
-                </Button>
-              </div>
-            </>
-          ) : (
-            <Card className="bg-slate-900/50 border-slate-800">
-              <CardContent className="pt-6">
-                <div className="text-center text-slate-400">Select an asset to view signals</div>
-              </CardContent>
-            </Card>
+            </div>
           )}
         </div>
+      ) : (
+      <OverviewView
+        showAdminPanel={false}
+        setShowAdminPanel={() => {}}
+        adminStatus={undefined}
+        handleAdminSecretChange={() => {}}
+        showAdminSecret={false}
+        adminSecret={''}
+        clearKillMutation={{ status: 'idle' } as any}
+        metrics_dailyPnlPercent={undefined}
+        metrics_exposurePercent={undefined}
+        diagnostics={undefined}
+        wsLastMessageAt={undefined}
+        openPositions={positions || []}
+        avgConfidence={avgConfidence}
+        assets={assets}
+        selectedAssetData={selectedAssetData}
+        setEntryAsset={setEntryAsset}
+        setEntrySide={setEntrySide}
+        setShowEntryDialog={setShowEntryDialog}
+        setSelectedAgentDetail={setSelectedAgentDetail}
+        setShowAgentInspector={setShowAgentInspector}
+        positionsLoading={positionsLoading}
+        positions={positions}
+        filteredAlerts={filteredAlerts}
+        alertFilter={alertFilter}
+        setAlertFilter={setAlertFilter}
+        criticalCount={0}
+        filteredAssets={filteredAssets}
+        setSelectedAsset={setSelectedAsset}
+        showWatchlist={false}
+        setShowWatchlist={() => {}}
+        listFilter={listFilter}
+        setListFilter={setListFilter}
+        searchQuery={searchQuery}
+        setSearchQuery={setSearchQuery}
+        openEntryFromAlert={() => {}}
+        showError={showError}
+        setShowError={setShowError}
+      />
 
-        {/* RIGHT: Alerts & Notifications (25%) */}
-        <div className="col-span-3 space-y-4">
-          <Card className="bg-slate-900/50 border-slate-800">
-            <CardHeader className="pb-3">
-              <div className="flex items-center justify-between">
-                <CardTitle className="text-lg">Alerts Center</CardTitle>
-                <Filter className="w-4 h-4 text-slate-400" />
-              </div>
-              <CardDescription>Real-time Trading Signals</CardDescription>
-            </CardHeader>
-            <CardContent className="space-y-4">
-              {/* Alert Filters */}
-              <div className="flex flex-col gap-2 text-xs">
-                <Button
-                  variant={alertFilter === 'ALL' ? 'default' : 'outline'}
-                  size="sm"
-                  onClick={() => setAlertFilter('ALL')}
-                  className="justify-start"
-                >
-                  All Alerts
-                </Button>
-                <Button
-                  variant={alertFilter === 'HIGH_CONVICTION' ? 'default' : 'outline'}
-                  size="sm"
-                  onClick={() => setAlertFilter('HIGH_CONVICTION')}
-                  className="justify-start"
-                >
-                  High Conviction
-                </Button>
-                <Button
-                  variant={alertFilter === 'ENTRY_READY' ? 'default' : 'outline'}
-                  size="sm"
-                  onClick={() => setAlertFilter('ENTRY_READY')}
-                  className="justify-start"
-                >
-                  Entry Ready
-                </Button>
-                <Button
-                  variant={alertFilter === 'LIQUIDITY_WARNING' ? 'default' : 'outline'}
-                  size="sm"
-                  onClick={() => setAlertFilter('LIQUIDITY_WARNING')}
-                  className="justify-start"
-                >
-                  Liquidity Warnings
-                </Button>
-              </div>
-
-              {/* Alerts List */}
-              <div className="space-y-2 max-h-[700px] overflow-y-auto">
-                {filteredAlerts.length > 0 ? (
-                  filteredAlerts.map((alert) => (
-                    <div
-                      key={alert.id}
-                      className={`p-3 rounded-lg border-l-4 ${
-                        alert.severity === 'CRITICAL'
-                          ? 'bg-red-500/10 border-l-red-500'
-                          : alert.severity === 'WARNING'
-                          ? 'bg-yellow-500/10 border-l-yellow-500'
-                          : 'bg-blue-500/10 border-l-blue-500'
-                      }`}
-                    >
-                      <div className="flex items-start justify-between mb-1">
-                        <div className="font-semibold text-sm">{alert.symbol}</div>
-                        <Badge variant="outline" className="text-xs">
-                          {alert.type.replace(/_/g, ' ')}
-                        </Badge>
-                      </div>
-                      <p className="text-xs text-slate-300 mb-2">{alert.message}</p>
-                      {alert.actionable && (
-                        <Button size="sm" variant="outline" className="w-full text-xs" onClick={() => {
-                          // Open Entry dialog prefilled from alert
-                          const sym = alert.symbol;
-                          const stored = localStorage.getItem('latestScanResults');
-                          let found: any = null;
-                          if (stored) {
-                            try {
-                              const data = JSON.parse(stored);
-                              found = (data.signals || []).find((s: any) => s.symbol === sym) || null;
-                            } catch (e) { found = null; }
-                          }
-                          const asset = found ? {
-                            symbol: found.symbol,
-                            currentPrice: found.price || found.currentPrice || 0,
-                            consensusSignal: found.consensus?.signal || found.signal || 'HOLD',
-                            avgConfidence: (found.consensus?.confidence || (found.strength || 0) / 100) * 100,
-                            riskScore: found.consensus?.riskScore || 'MEDIUM',
-                            suggestedStopLoss: found.risk_reward?.stop_loss || found.suggestedStopLoss,
-                            suggestedTakeProfit: found.risk_reward?.take_profit || found.suggestedTakeProfit
-                          } : {
-                            symbol: sym,
-                            currentPrice: 0,
-                            consensusSignal: 'HOLD',
-                            avgConfidence: 0,
-                            riskScore: 'MEDIUM'
-                          };
-                          setEntryAsset(asset);
-                          setEntrySide(asset.consensusSignal === 'SELL' ? 'SHORT' : 'LONG');
-                          setShowEntryDialog(true);
-                        }}>
-                          <Zap className="w-3 h-3 mr-1" />
-                          Act Now
-                        </Button>
-                      )}
-                    </div>
-                  ))
-                ) : (
-                  <div className="text-center text-slate-400 text-sm py-8">
-                    No alerts matching this filter
-                  </div>
-                )}
-              </div>
-            </CardContent>
-          </Card>
-        </div>
-      </div>
+      )}
 
       {/* Entry Dialog for Dashboard */}
       {entryAsset && (

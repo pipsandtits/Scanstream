@@ -1,5 +1,5 @@
 import React, { useState, useMemo } from 'react';
-import { useLocation } from 'wouter';
+import { useNavigate } from 'react-router-dom';
 import {
   Trophy, Star, Lock, Unlock, Filter, Search, ChevronDown, ArrowLeft,
   Zap, Target, Heart, TrendingUp, Award, Shield, Flame, Crown, Users,
@@ -271,7 +271,7 @@ type FilterCategory = 'all' | 'milestone' | 'combat' | 'strategy' | 'evolution' 
 type FilterStatus = 'all' | 'unlocked' | 'locked';
 
 const AchievementTracker: React.FC = () => {
-  const [, navigate] = useLocation();
+  const navigate = useNavigate();
   const [searchTerm, setSearchTerm] = useState('');
   const [filterCategory, setFilterCategory] = useState<FilterCategory>('all');
   const [filterStatus, setFilterStatus] = useState<FilterStatus>('all');

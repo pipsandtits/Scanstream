@@ -1,5 +1,5 @@
 
-import { useState } from 'react';
+import { useState, useRef, useEffect } from 'react';
 import { Card } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
@@ -19,24 +19,37 @@ interface VotingPanelProps {
 export default function AgentVotingPanel({ signal, onVoteComplete }: VotingPanelProps) {
   const [voting, setVoting] = useState(false);
   const [voteResult, setVoteResult] = useState<any>(null);
+  const controllerRef = useRef<AbortController | null>(null);
 
   const initiateVote = async () => {
     setVoting(true);
     try {
+      controllerRef.current?.abort();
+      const controller = new AbortController();
+      controllerRef.current = controller;
+
       const res = await fetch('/api/rpg-agents/vote-signal', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(signal)
+        body: JSON.stringify(signal),
+        signal: controller.signal,
       });
       const result = await res.json();
       setVoteResult(result);
       onVoteComplete?.(result);
     } catch (error) {
+      if ((error as any)?.name === 'AbortError') return;
       console.error('Voting failed:', error);
     } finally {
       setVoting(false);
     }
   };
+
+  useEffect(() => {
+    return () => {
+      controllerRef.current?.abort();
+    };
+  }, []);
 
   return (
     <Card className="p-4 bg-gradient-to-br from-indigo-900/20 to-purple-900/20 border-indigo-500/30">

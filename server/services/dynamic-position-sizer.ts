@@ -15,6 +15,7 @@
  */
 
 import { RLPositionAgent, type RLState } from '../rl-position-agent';
+import { getRLAgent } from '../../src/agents/rl-agent.singleton';
 import { signalPerformanceTracker } from './signal-performance-tracker';
 import { assetVelocityProfiler } from './asset-velocity-profile';
 import { OrderFlowAnalyzer, type OrderFlowData } from './order-flow-analyzer';
@@ -55,7 +56,7 @@ export class DynamicPositionSizer {
   private currentDrawdown: number = 0; // Track current drawdown
 
   constructor() {
-    this.rlAgent = new RLPositionAgent();
+    this.rlAgent = getRLAgent();
   }
 
   /**

@@ -49,14 +49,14 @@ export interface ReversalDetectorConfig {
 }
 
 const DEFAULT_CONFIG: ReversalDetectorConfig = {
-  mild_threshold: 0.1,
-  moderate_threshold: 0.3,
-  severe_threshold: 0.5,
-  base_reversal_probability: 0.4,
-  decline_bonus_multiplier: 0.4,
-  formation_loss_bonus: 0.2,
-  lookback_periods: 20,
-  minimum_decline_for_detection: 0.05
+  mild_threshold: 0.12,
+  moderate_threshold: 0.32,
+  severe_threshold: 0.52,
+  base_reversal_probability: 0.42,
+  decline_bonus_multiplier: 0.45,
+  formation_loss_bonus: 0.25,
+  lookback_periods: 25,
+  minimum_decline_for_detection: 0.08
 };
 
 export class ReversalDetector {
@@ -74,7 +74,8 @@ export class ReversalDetector {
    */
   detectBreakdown(
     previousSnapshot: ClusterSnapshot,
-    currentSnapshot: ClusterSnapshot
+    currentSnapshot: ClusterSnapshot,
+    extras?: { volume_confirmation?: number; order_flow_score?: number; timeSinceLastBreakdownBars?: number }
   ): ClusterBreakdown {
     const prev_strength = previousSnapshot.cluster_strength;
     const curr_strength = currentSnapshot.cluster_strength;
@@ -95,7 +96,12 @@ export class ReversalDetector {
     // Calculate reversal probability
     const reversal_probability = this.calculateReversalProbability(
       strength_decline,
-      formation_loss
+      formation_loss,
+      {
+        volume_confirmation: extras?.volume_confirmation,
+        order_flow_score: extras?.order_flow_score,
+        timeSinceLastBreakdownBars: extras?.timeSinceLastBreakdownBars
+      }
     );
     
     // Determine confidence
@@ -164,21 +170,47 @@ export class ReversalDetector {
    */
   private calculateReversalProbability(
     decline: number,
-    formation_loss: boolean
+    formation_loss: boolean,
+    extras?: { volume_confirmation?: number; order_flow_score?: number; timeSinceLastBreakdownBars?: number }
   ): number {
     let probability = this.config.base_reversal_probability;
 
-    // Decline bonus (up to 40%)
-    const decline_bonus = Math.min(decline, 1.0) * this.config.decline_bonus_multiplier;
+    // Non-linear decline bonus (exponent 1.3) to emphasize larger drops
+    const decline_power = Math.pow(Math.min(Math.max(decline, 0), 1), 1.3);
+    const decline_bonus = decline_power * this.config.decline_bonus_multiplier;
     probability += decline_bonus;
 
-    // Formation loss bonus (20%)
+    // Formation loss bonus
     if (formation_loss) {
       probability += this.config.formation_loss_bonus;
     }
 
-    // Cap at 95%
-    return Math.min(probability, 0.95);
+    // Volume confirmation boosts probability (strong volume on breakdown)
+    if (extras?.volume_confirmation && extras.volume_confirmation > 0) {
+      const volBoost = Math.min(0.5, extras.volume_confirmation) * 0.15;
+      probability += volBoost;
+    }
+
+    // Order flow / microstructure booster
+    if (extras?.order_flow_score && extras.order_flow_score > 0) {
+      const ofBoost = Math.min(0.8, extras.order_flow_score) * 0.12;
+      probability += ofBoost;
+    }
+
+    // Time since last breakdown: if too recent, reduce probability to avoid choppy triggers
+    if (typeof extras?.timeSinceLastBreakdownBars === 'number') {
+      const bars = extras.timeSinceLastBreakdownBars;
+      if (bars < 3) {
+        probability -= 0.18; // suppress very recent breakdowns
+      } else if (bars < 6) {
+        probability -= 0.08;
+      }
+    }
+
+    // Bound and cap
+    if (!Number.isFinite(probability)) probability = this.config.base_reversal_probability;
+    probability = Math.max(0, Math.min(probability, 0.95));
+    return probability;
   }
 
   /**

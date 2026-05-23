@@ -1,5 +1,6 @@
 import { Router, Request, Response } from 'express';
 import axios from 'axios';
+import { coinGeckoService } from '../services/coingecko';
 
 const router = Router();
 
@@ -181,21 +182,11 @@ async function fetchCryptoSymbols(): Promise<any[]> {
     return cache[cacheKey].data;
   }
 
-  try {
+    try {
     console.log('[CoinGecko] Fetching cryptocurrency markets...');
-    const response = await axios.get('https://api.coingecko.com/api/v3/coins/markets', {
-      params: {
-        vs_currency: 'usd',
-        order: 'market_cap_desc',
-        per_page: 250,
-        page: 1,
-        sparkline: false,
-        price_change_percentage: '1h,24h,7d,30d',
-      },
-      timeout: 10000,
-    });
+    const response = await coinGeckoService.getMarketData('usd', 1, 250);
 
-    const symbols = response.data.map((coin: any) => ({
+    const symbols = response.map((coin: any) => ({
       id: coin.id,
       symbol: coin.symbol.toUpperCase(),
       name: coin.name,
@@ -233,36 +224,16 @@ async function fetchCryptoSymbols(): Promise<any[]> {
 async function fetchSymbolFromCoingecko(symbol: string): Promise<any | null> {
   try {
     // First, search for the coin by symbol
-    const searchResponse = await axios.get(
-      `https://api.coingecko.com/api/v3/search`,
-      {
-        params: { query: symbol },
-        timeout: 10000,
-      }
-    );
+    const searchResponse = await coinGeckoService.searchCoins(symbol);
 
-    if (!searchResponse.data.coins || searchResponse.data.coins.length === 0) {
+    if (!searchResponse.coins || searchResponse.coins.length === 0) {
       return null;
     }
 
-    const coin = searchResponse.data.coins[0];
+    const coin = searchResponse.coins[0];
 
     // Get detailed market data
-    const detailResponse = await axios.get(
-      `https://api.coingecko.com/api/v3/coins/${coin.id}`,
-      {
-        params: {
-          localization: false,
-          tickers: true,
-          market_data: true,
-          community_data: false,
-          developer_data: false,
-        },
-        timeout: 10000,
-      }
-    );
-
-    const data = detailResponse.data;
+    const data = await coinGeckoService.getCoinDetails(coin.id);
 
     return {
       id: data.id,

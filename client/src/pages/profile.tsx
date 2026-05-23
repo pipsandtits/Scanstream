@@ -24,7 +24,7 @@ import {
   Trash2,
   Loader2
 } from "lucide-react";
-import { Link } from "wouter";
+import { Link } from 'react-router-dom';
 
 export default function ProfilePage() {
   const { user, isLoading, isAuthenticated } = useAuth();
@@ -362,7 +362,7 @@ export default function ProfilePage() {
                   </DialogContent>
                 </Dialog>
 
-                <Link href="/settings">
+                <Link to="/settings">
                   <Button variant="outline" className="w-full justify-start" data-testid="button-goto-settings">
                     <Settings className="h-4 w-4 mr-2" />
                     Account Settings

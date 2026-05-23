@@ -62,11 +62,12 @@ export default function SignalsPage() {
   // Fetch Scanner Signals
   const { data: scannerSignals, refetch: refetchScanner } = useQuery<UnifiedSignal[]>({
     queryKey: ['scanner-signals'],
-    queryFn: async () => {
-      const response = await fetch('/api/scanner/signals');
+    queryFn: async ({ signal }: any) => {
+      const response = await fetch('/api/scanner/signals', { signal });
       if (!response.ok) return [];
       const data = await response.json();
-      return (data.signals || []).map((s: any) => ({ ...s, source: 'scanner' as const, sourceLabel: '🔍 Scanner' }));
+      const list = (await import('@/lib/api')).default.normalizeResponse(data);
+      return list;
     },
     refetchInterval: 30000,
   });
@@ -74,8 +75,8 @@ export default function SignalsPage() {
   // Fetch Strategy Signals
   const { data: strategySignals, refetch: refetchStrategies } = useQuery<UnifiedSignal[]>({
     queryKey: ['strategy-signals'],
-    queryFn: async () => {
-      const response = await fetch('/api/strategies/signals');
+    queryFn: async ({ signal }: any) => {
+      const response = await fetch('/api/strategies/signals', { signal });
       if (!response.ok) return [];
       const data = await response.json();
       return (data.signals || []).map((s: any) => ({ ...s, source: 'strategy' as const, sourceLabel: '🎯 Strategy' }));
@@ -86,8 +87,8 @@ export default function SignalsPage() {
   // Fetch ML Predictions
   const { data: mlSignals, refetch: refetchML } = useQuery<UnifiedSignal[]>({
     queryKey: ['ml-signals'],
-    queryFn: async () => {
-      const response = await fetch('/api/ml-engine/predictions');
+    queryFn: async ({ signal }: any) => {
+      const response = await fetch('/api/ml-engine/predictions', { signal });
       if (!response.ok) return [];
       const data = await response.json();
       return (data.predictions || []).map((p: any) => ({
@@ -109,8 +110,8 @@ export default function SignalsPage() {
   // Fetch RL Agent Signals
   const { data: rlSignals, refetch: refetchRL } = useQuery<UnifiedSignal[]>({
     queryKey: ['rl-signals'],
-    queryFn: async () => {
-      const response = await fetch('/api/rl-agent/signals');
+    queryFn: async ({ signal }: any) => {
+      const response = await fetch('/api/rl-agent/signals', { signal });
       if (!response.ok) return [];
       const data = await response.json();
       return (data.signals || []).map((s: any) => ({

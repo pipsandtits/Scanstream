@@ -15,6 +15,8 @@ from typing import Optional, List, Dict
 import json
 import threading
 import ccxt.async_support as ccxt_async
+from collections import Counter
+from workers.task_store import load_task, save_runtime, load_runtime
 
 # Set up logging
 logging.basicConfig(
@@ -22,6 +24,34 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Metrics collector
+from metrics_collector import get_collector
+metrics = get_collector()
+
+# Global uncaught exception hook
+def _handle_uncaught_exception(exc_type, exc_value, exc_tb):
+    logger.exception('Uncaught exception', exc_info=(exc_type, exc_value, exc_tb))
+    try:
+        metrics.inc('uncaught_exceptions')
+    except Exception:
+        pass
+
+import sys
+sys.excepthook = _handle_uncaught_exception
+
+# Asyncio loop exception handler
+try:
+    loop = asyncio.get_event_loop()
+    def _loop_exception_handler(loop, context):
+        try:
+            logger.error('Asyncio loop exception: %s', context)
+            metrics.inc('async_loop_exceptions')
+        except Exception:
+            pass
+    loop.set_exception_handler(_loop_exception_handler)
+except Exception:
+    pass
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for all routes
@@ -36,29 +66,21 @@ last_scan_timestamp: Optional[datetime] = None
 
 
 async def initialize_exchange(exchange_id: str = 'kucoinfutures'):
-    """Initialize and return a ccxt exchange instance"""
+    """Get exchange from centralized pool."""
     try:
-        exchange_class = getattr(ccxt_async, exchange_id)
-        exchange = exchange_class({
-            'enableRateLimit': True,
-            'timeout': 30000,
-            'options': {
-                'defaultType': 'future',  # or 'spot'
-                'recvWindow': 10000
-            }
-        })
-        await exchange.load_markets()
-        logger.info(f"Exchange {exchange_id} initialized successfully")
-        return exchange
+        from exchange_pool import get_exchange
+        ex = await get_exchange(exchange_id)
+        logger.info(f"Exchange {exchange_id} retrieved from pool")
+        return ex
     except Exception as e:
-        logger.error(f"Failed to initialize exchange {exchange_id}: {e}")
+        logger.error(f"Failed to get exchange {exchange_id} from pool: {e}")
         raise
 
 
 def get_scanner(loop, exchange_id='kucoinfutures'):
     """Create a fresh scanner instance for the given event loop"""
     try:
-        # Initialize exchange synchronously with the provided loop
+        # Initialize exchange synchronously with the provided loop (from pool)
         exchange = loop.run_until_complete(initialize_exchange(exchange_id))
         config = get_dynamic_config()
         
@@ -87,7 +109,7 @@ async def scan_single_exchange_async(exchange_id: str, timeframe: str, full_anal
     try:
         logger.info(f"⚡ Starting async scan for {exchange_id}")
         
-        # Initialize exchange
+        # Initialize exchange (from pool)
         init_start = datetime.now()
         exchange = await initialize_exchange(exchange_id)
         init_duration = (datetime.now() - init_start).total_seconds()
@@ -112,8 +134,7 @@ async def scan_single_exchange_async(exchange_id: str, timeframe: str, full_anal
         )
         scan_duration = (datetime.now() - scan_start).total_seconds()
         
-        # Clean up
-        await exchange.close()
+        # Note: Do not close pooled exchange here; pool manages lifecycle
         
         total_duration = (datetime.now() - start_time).total_seconds()
         
@@ -149,9 +170,20 @@ async def scan_multiple_exchanges_parallel(exchanges: List[str], timeframe: str,
     logger.info(f"   Start Time: {parallel_start.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}")
     logger.info("="*80)
     
-    # Run all exchanges in parallel
+    # Run all exchanges in parallel (capture exceptions)
     tasks = [scan_single_exchange_async(ex, timeframe, full_analysis) for ex in exchanges]
-    results = await asyncio.gather(*tasks, return_exceptions=False)
+    results_raw = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Normalize results and ensure exceptions are logged
+    results = []
+    for r in results_raw:
+        if isinstance(r, Exception):
+            logger.exception('Parallel scan task raised exception')
+            metrics.inc('parallel_scan_task_exceptions')
+            # record a failed placeholder
+            results.append((None, pd.DataFrame(), 0.0, str(r)))
+        else:
+            results.append(r)
     
     parallel_end = datetime.now()
     total_duration = (parallel_end - parallel_start).total_seconds()
@@ -286,237 +318,53 @@ def health_check():
     })
 
 
-def _run_scan_background(data):
-    """
-    Background thread function to execute scan asynchronously
-    This avoids HTTP timeout and keeps API responsive
-    Data dict is passed in (not request object)
-    """
-    global last_scan_results, last_scan_timestamp
-    
-    # Track scan timing
-    scan_start_time = datetime.now()
-    
+@app.route('/metrics', methods=['GET'])
+def metrics_endpoint():
     try:
-        
-        # Extract parameters
-        timeframe = data.get('timeframe', 'medium')
-        exchange_param = data.get('exchange', 'kucoinfutures')
-        signal_filter = data.get('signal', 'all')
-        min_strength = data.get('minStrength', 50) / 100  # Convert to 0-1 range
-        full_analysis = data.get('fullAnalysis', True)
-        parallel_mode = data.get('parallel', False)
-        
-        # Determine if parallel scanning (exchange is list or parallel=true)
-        if isinstance(exchange_param, list):
-            exchanges = exchange_param
-            parallel_mode = True
-        else:
-            exchanges = [exchange_param]
-            
-        # Auto-enable parallel if multiple exchanges
-        if len(exchanges) > 1:
-            parallel_mode = True
-        
-        # Auto-initialize scanner if not already initialized (for single exchange scans)
-        global scanner
-        if not parallel_mode and scanner is None:
-            logger.info(f"Auto-initializing scanner for {exchanges[0]}")
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                scanner = get_scanner(loop, exchanges[0])
-                logger.info(f"Auto-initialized scanner for {exchanges[0]}")
-            except Exception as e:
-                logger.error(f"Failed to auto-initialize scanner: {e}")
-                raise
-            finally:
-                loop.close()
-        
-        # === PARALLEL SCANNING MODE ===
-        if parallel_mode and len(exchanges) > 1:
-            logger.info("="*80)
-            logger.info(f"🚀 PARALLEL SCAN REQUESTED")
-            logger.info(f"   Exchanges: {', '.join(exchanges)}")
-            logger.info(f"   Timeframe: {timeframe}")
-            logger.info(f"   Signal Filter: {signal_filter}")
-            logger.info(f"   Min Strength: {min_strength * 100}%")
-            logger.info(f"   Full Analysis: {full_analysis}")
-            logger.info(f"   Start Time: {scan_start_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}")
-            logger.info("="*80)
-            
-            # Create event loop for parallel scanning
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            
-            try:
-                # Run parallel scan
-                parallel_result = loop.run_until_complete(
-                    scan_multiple_exchanges_parallel(exchanges, timeframe, full_analysis)
-                )
-            finally:
-                loop.close()
-            
-            # Process and aggregate results from all exchanges
-            all_results = []
-            filter_start = datetime.now()
-            
-            for exchange_id, df in parallel_result['results']:
-                if not df.empty:
-                    # Filter by signal strength
-                    filtered = df[df['signal_strength'] >= min_strength]
-                    
-                    # Filter by signal type
-                    if signal_filter != 'all':
-                        signal_mapping = {
-                            'BUY': ['Strong Buy', 'Buy', 'Weak Buy'],
-                            'SELL': ['Strong Sell', 'Sell', 'Weak Sell'],
-                            'HOLD': ['Neutral']
-                        }
-                        if signal_filter in signal_mapping:
-                            filtered = filtered[filtered['signal'].isin(signal_mapping[signal_filter])]
-                    
-                    # Format signals
-                    for _, row in filtered.iterrows():
-                        formatted = format_signal_for_api(row, exchange_id)
-                        if formatted:
-                            all_results.append(formatted)
-            
-            filter_duration = (datetime.now() - filter_start).total_seconds()
-            scan_end_time = datetime.now()
-            total_duration = (scan_end_time - scan_start_time).total_seconds()
-            
-            # Store aggregated results
-            last_scan_timestamp = scan_end_time
-            
-            logger.info(f"⏱️  Filtering and formatting took: {filter_duration:.2f} seconds")
-            logger.info(f"Parallel scan background task completed: {len(all_results)} signals found")
-        
-        # === SINGLE EXCHANGE SCANNING MODE ===
-        exchange = exchanges[0]
-        
-        # LOG: Scan start
-        logger.info("="*80)
-        logger.info(f"🚀 SCAN STARTED")
-        logger.info(f"   Exchange: {exchange}")
-        logger.info(f"   Timeframe: {timeframe}")
-        logger.info(f"   Signal Filter: {signal_filter}")
-        logger.info(f"   Min Strength: {min_strength * 100}%")
-        logger.info(f"   Full Analysis: {full_analysis}")
-        logger.info(f"   Start Time: {scan_start_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}")
-        logger.info("="*80)
-        
-        # Create a new event loop for this scan
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
-        # Track initialization time
-        init_start = datetime.now()
-        
+        # ensure latest sample before returning
         try:
-            # Create fresh scanner instance with this loop and selected exchange
-            scanner_instance = get_scanner(loop, exchange_id=exchange)
-            init_duration = (datetime.now() - init_start).total_seconds()
-            logger.info(f"⏱️  Exchange initialization took: {init_duration:.2f} seconds")
-            
-            # Track scan execution time
-            scan_exec_start = datetime.now()
-            
-            # Run async scan
-            results = loop.run_until_complete(
-                scanner_instance.scan_market(
-                    timeframe=timeframe,
-                    full_analysis=full_analysis,
-                    save_results=False
-                )
-            )
-            
-            scan_exec_duration = (datetime.now() - scan_exec_start).total_seconds()
-            logger.info(f"⏱️  Market scan execution took: {scan_exec_duration:.2f} seconds")
-            
-            # Clean up exchange connection
-            if hasattr(scanner_instance, 'exchange') and scanner_instance.exchange:
-                try:
-                    loop.run_until_complete(scanner_instance.exchange.close())
-                except Exception as e:
-                    logger.warning(f"Error closing exchange: {e}")
-        finally:
-            loop.close()
-        
-        if results.empty:
-            scan_end_time = datetime.now()
-            total_duration = (scan_end_time - scan_start_time).total_seconds()
-            
-            logger.warning("="*80)
-            logger.warning(f"⚠️  SCAN COMPLETED - NO RESULTS")
-            logger.warning(f"   End Time: {scan_end_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}")
-            logger.warning(f"   Total Duration: {total_duration:.2f} seconds")
-            logger.warning("="*80)
-        
-        # Store results
-        last_scan_results = results
-        last_scan_timestamp = datetime.now()
-        
-        # Track filtering time
-        filter_start = datetime.now()
-        
-        # Filter by signal strength
-        filtered_results = results[results['signal_strength'] >= min_strength]
-        
-        # Filter by signal type
-        if signal_filter != 'all':
-            signal_mapping = {
-                'BUY': ['Strong Buy', 'Buy', 'Weak Buy'],
-                'SELL': ['Strong Sell', 'Sell', 'Weak Sell'],
-                'HOLD': ['Neutral']
-            }
-            if signal_filter in signal_mapping:
-                filtered_results = filtered_results[
-                    filtered_results['signal'].isin(signal_mapping[signal_filter])
-                ]
-        
-        # Format results for API
-        signals = []
-        for _, row in filtered_results.iterrows():
-            formatted = format_signal_for_api(row, exchange)
-            if formatted:
-                signals.append(formatted)
-        
-        filter_duration = (datetime.now() - filter_start).total_seconds()
-        logger.info(f"⏱️  Filtering and formatting took: {filter_duration:.2f} seconds")
-        
-        # Calculate total duration
-        scan_end_time = datetime.now()
-        total_duration = (scan_end_time - scan_start_time).total_seconds()
-        
-        # LOG: Scan completion summary
-        logger.info("="*80)
-        logger.info(f"✅ SCAN COMPLETED SUCCESSFULLY")
-        logger.info(f"   Exchange: {exchange}")
-        logger.info(f"   Timeframe: {timeframe}")
-        logger.info(f"   Total Symbols Scanned: {len(results)}")
-        logger.info(f"   Signals After Filtering: {len(signals)}")
-        logger.info(f"   End Time: {scan_end_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}")
-        logger.info(f"   Total Duration: {total_duration:.2f} seconds")
-        logger.info(f"   Performance Breakdown:")
-        logger.info(f"     - Initialization: {init_duration:.2f}s ({(init_duration/total_duration*100):.1f}%)")
-        logger.info(f"     - Scan Execution: {scan_exec_duration:.2f}s ({(scan_exec_duration/total_duration*100):.1f}%)")
-        logger.info(f"     - Filtering: {filter_duration:.2f}s ({(filter_duration/total_duration*100):.1f}%)")
-        logger.info("="*80)
-        
+            metrics.sample()
+        except Exception:
+            pass
+        data = metrics.get_metrics()
+        return jsonify({'metrics': data, 'timestamp': datetime.now().isoformat()})
     except Exception as e:
-        scan_end_time = datetime.now()
-        total_duration = (scan_end_time - scan_start_time).total_seconds()
-        
-        logger.error("="*80)
-        logger.error(f"❌ SCAN FAILED")
-        logger.error(f"   Exchange: {data.get('exchange', 'kucoinfutures')}")
-        logger.error(f"   Timeframe: {data.get('timeframe', 'medium')}")
-        logger.error(f"   Error: {str(e)}")
-        logger.error(f"   End Time: {scan_end_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}")
-        logger.error(f"   Duration Before Failure: {total_duration:.2f} seconds")
-        logger.error("="*80)
-        logger.error(f"Stack trace:", exc_info=True)
+        logger.exception('Failed to return metrics')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/client/error', methods=['POST'])
+def client_error():
+    try:
+        data = request.get_json() or {}
+        logger.warning('Client-side error reported: %s', data)
+        try:
+            metrics.inc('client_errors')
+        except Exception:
+            pass
+        return jsonify({'status': 'ok'}), 200
+    except Exception as e:
+        logger.exception('Failed to accept client error')
+        return jsonify({'error': str(e)}), 500
+
+
+def _run_scan_background(data):
+    # Delegate to centralized scan runner
+    try:
+        from scan_runner import run_scan
+        res = run_scan(data)
+        # If running in-process (fallback thread), update in-memory results for quick API access
+        try:
+            # Persist a small runtime summary (signals list + timestamp) to Redis-backed runtime store
+            if res and isinstance(res, dict) and 'signals' in res:
+                signals = res.get('signals') or []
+                # store signals (list of dicts) and ISO timestamp
+                save_runtime('last_scan_signals', signals)
+                save_runtime('last_scan_timestamp', datetime.now().isoformat())
+        except Exception:
+            pass
+    except Exception:
+        logger.exception('Background scan runner failed')
 
 
 @app.route('/api/scanner/scan', methods=['POST'])
@@ -553,18 +401,30 @@ def trigger_scan():
         mode_str = "parallel" if parallel_mode else "single"
         logger.info(f"Scan request queued: {mode_str} mode, exchanges: {exchanges}")
         
-        # Spawn background thread to run scan
-        scan_thread = threading.Thread(target=_run_scan_background, args=(data,), daemon=True)
-        scan_thread.start()
+        # Enqueue scan job to Celery worker if available, else fallback to background thread
+        try:
+            from workers.tasks import run_scan_task
+            # enqueue and return task id
+            res = run_scan_task.apply_async(args=[data])
+            task_id = res.id
+            logger.info(f"Enqueued scan task to Celery (task_id={task_id})")
+            queued_via = 'celery'
+        except Exception:
+            logger.warning("Celery not available, falling back to background thread")
+            scan_thread = threading.Thread(target=_run_scan_background, args=(data,), daemon=True)
+            scan_thread.start()
+            task_id = None
+            queued_via = 'thread'
         
         # Return immediately with 202 Accepted
         return jsonify({
             'status': 'accepted',
-            'message': f'Scan queued in background ({mode_str} mode)',
+            'message': f'Scan queued ({mode_str} mode) via {queued_via}',
             'mode': mode_str,
             'exchanges': exchanges,
             'timeframe': data.get('timeframe', 'medium'),
             'timestamp': datetime.now().isoformat(),
+            'task_id': task_id,
             'note': 'Poll /api/scanner/status to check progress. Results will be available in /api/scanner/signals'
         }), 202
         
@@ -589,10 +449,18 @@ def get_signals():
     global last_scan_results
     
     try:
-        if last_scan_results is None or last_scan_results.empty:
-            # Return empty results
+        # If process-local DataFrame not set, try runtime store (Redis) for last scan summary
+        runtime_signals = None
+        try:
+            runtime_signals = load_runtime('last_scan_signals')
+            runtime_timestamp = load_runtime('last_scan_timestamp')
+        except Exception:
+            runtime_signals = None
+
+        if (last_scan_results is None or (hasattr(last_scan_results, 'empty') and last_scan_results.empty)) and runtime_signals:
+            # Return persisted runtime signals
             return jsonify({
-                'signals': [],
+                'signals': runtime_signals or [],
                 'filters': {
                     'exchanges': ['binance', 'kucoinfutures', 'coinbase', 'kraken'],
                     'timeframes': ['1m', '5m', '15m', '1h', '4h', '1d'],
@@ -601,8 +469,8 @@ def get_signals():
                     'maxStrength': 100
                 },
                 'metadata': {
-                    'count': 0,
-                    'message': 'No scan results available. Please trigger a scan first.'
+                    'count': len(runtime_signals or []),
+                    'last_scan': runtime_timestamp
                 }
             })
         
@@ -630,6 +498,31 @@ def get_signals():
         if timeframe_filter != 'all':
             results = results[results['timeframe'] == timeframe_filter]
         
+        # If a task_id is provided, try to load results from task store
+        task_id_q = request.args.get('task_id')
+        if task_id_q:
+            try:
+                from workers.task_store import load_task
+                task_data = load_task(task_id_q)
+                if task_data and task_data.get('status') == 'completed':
+                    return jsonify({
+                        'signals': task_data['payload'].get('signals', []),
+                        'filters': {
+                            'exchanges': ['binance', 'kucoinfutures', 'coinbase', 'kraken'],
+                            'timeframes': ['1m', '5m', '15m', '1h', '4h', '1d'],
+                            'signals': ['BUY', 'SELL', 'HOLD'],
+                            'minStrength': 0,
+                            'maxStrength': 100
+                        },
+                        'metadata': {
+                            'count': len(task_data['payload'].get('signals', [])),
+                            'task_id': task_id_q,
+                            'task_status': task_data.get('status')
+                        }
+                    })
+            except Exception:
+                pass
+
         # Format results
         signals = []
         for _, row in results.iterrows():
@@ -666,12 +559,19 @@ def get_status():
     global scanner
     is_initialized = scanner is not None
     is_active = is_initialized  # Only active if properly initialized
-    
+    # Prefer runtime persisted last-scan metadata when available
+    try:
+        rt_ts = load_runtime('last_scan_timestamp')
+        rt_signals = load_runtime('last_scan_signals') or []
+    except Exception:
+        rt_ts = None
+        rt_signals = []
+
     return jsonify({
         'status': 'active' if is_active else 'inactive',
         'scanner_initialized': is_initialized,
-        'last_scan': last_scan_timestamp.isoformat() if last_scan_timestamp else None,
-        'results_count': len(last_scan_results) if last_scan_results is not None else 0,
+        'last_scan': rt_ts or (last_scan_timestamp.isoformat() if last_scan_timestamp else None),
+        'results_count': len(rt_signals) if rt_signals is not None else (len(last_scan_results) if last_scan_results is not None else 0),
         'timestamp': datetime.now().isoformat()
     })
 
@@ -718,16 +618,24 @@ def initialize_scanner():
             }), 200
         
         logger.info(f"Queueing scanner initialization for exchange: {exchange_id}")
-        
-        # Spawn background thread to initialize
-        init_thread = threading.Thread(target=_initialize_scanner_background, args=(exchange_id,), daemon=True)
-        init_thread.start()
-        
-        # Return immediately with 202 Accepted
+        try:
+            from workers.tasks import run_initialize_task
+            res = run_initialize_task.apply_async(args=[{'exchange': exchange_id}])
+            task_id = res.id
+            queued_via = 'celery'
+            logger.info(f"Enqueued initialize task (task_id={task_id})")
+        except Exception:
+            # Fallback: run in background thread
+            init_thread = threading.Thread(target=_initialize_scanner_background, args=(exchange_id,), daemon=True)
+            init_thread.start()
+            task_id = None
+            queued_via = 'thread'
+
         return jsonify({
             'status': 'accepted',
-            'message': f'Scanner initialization queued for {exchange_id}',
+            'message': f'Scanner initialization queued for {exchange_id} via {queued_via}',
             'exchange': exchange_id,
+            'task_id': task_id,
             'timestamp': datetime.now().isoformat(),
             'note': 'Poll /api/scanner/status to check when scanner_initialized is true'
         }), 202
@@ -753,10 +661,16 @@ def reset_scanner():
                     asyncio.run(scanner.exchange.close())
                 except:
                     pass
-        
+        # Clear process-local and runtime persisted state
         scanner = None
         last_scan_results = None
         last_scan_timestamp = None
+        try:
+            from workers.task_store import delete_runtime
+            delete_runtime('last_scan_signals')
+            delete_runtime('last_scan_timestamp')
+        except Exception:
+            pass
         
         logger.info("Scanner reset successfully")
         
@@ -772,6 +686,36 @@ def reset_scanner():
             'error': str(e),
             'message': 'Failed to reset scanner'
         }), 500
+
+
+@app.route('/api/train/models', methods=['POST'])
+def trigger_training():
+    """Enqueue a model training job (non-blocking)."""
+    try:
+        data = request.get_json() or {}
+        try:
+            from workers.tasks import run_train_task
+            res = run_train_task.apply_async(args=[data])
+            task_id = res.id
+            queued_via = 'celery'
+        except Exception:
+            # Fallback: run training in background thread (not ideal)
+            import threading
+            from scan_runner import run_train
+            t = threading.Thread(target=run_train, args=(None,), daemon=True)
+            t.start()
+            task_id = None
+            queued_via = 'thread'
+
+        return jsonify({
+            'status': 'accepted',
+            'message': f'Training job queued via {queued_via}',
+            'task_id': task_id,
+            'timestamp': datetime.now().isoformat()
+        }), 202
+    except Exception as e:
+        logger.error(f"Error queueing training job: {str(e)}", exc_info=True)
+        return jsonify({'error': str(e), 'message': 'Failed to queue training job'}), 500
 
 
 @app.route('/api/scanner/multi-timeframe', methods=['POST'])
@@ -792,61 +736,142 @@ def multi_timeframe_confluence():
         min_opportunity = data.get('minOpportunity', 65)
         
         logger.info(f"Multi-timeframe analysis for {symbol}: {timeframes}")
-        
-        scanner_instance = get_scanner()
-        
-        # Run scans for each timeframe
+
+        def normalize_symbol(s: str) -> str:
+            if not s:
+                return ''
+            return s.upper().replace('-', '/').replace('\\\u002F\\\u002F', '/').strip()
+
+        norm_symbol = normalize_symbol(symbol)
+
+        # Create scanner instance bound to a new loop
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        
+
+        exchange_id = data.get('exchange', 'kucoinfutures')
         try:
-            all_results = []
-            for tf in timeframes:
-                results = loop.run_until_complete(
-                    scanner_instance.scan_market(
-                        timeframe=tf,
-                        full_analysis=True,
-                        save_results=False
-                    )
-                )
-                if not results.empty:
-                    symbol_result = results[results['symbol'] == symbol]
-                    if not symbol_result.empty:
-                        all_results.append({
-                            'timeframe': tf,
-                            'data': symbol_result.iloc[0].to_dict()
-                        })
-        finally:
+            scanner_instance = get_scanner(loop, exchange_id=exchange_id)
+        except Exception as e:
             loop.close()
-        
+            logger.error(f"Failed to create scanner for multi-timeframe: {e}")
+            return jsonify({'error': 'Failed to initialize scanner', 'message': str(e)}), 500
+
+        try:
+            # Prepare coroutines for each timeframe
+            coros = [scanner_instance.scan_market(timeframe=tf, full_analysis=True, save_results=False) for tf in timeframes]
+
+            # Run all timeframe scans in parallel with a timeout and isolate errors per timeframe
+            try:
+                results_list = loop.run_until_complete(asyncio.wait_for(asyncio.gather(*coros, return_exceptions=True), timeout=30))
+            except asyncio.TimeoutError:
+                # Partial results may be available; collect what finished
+                results_list = loop.run_until_complete(asyncio.gather(*coros, return_exceptions=True))
+
+            all_results = []
+            errors = []
+
+            for idx, res in enumerate(results_list):
+                tf = timeframes[idx]
+                if isinstance(res, Exception):
+                    logger.warning(f"Timeframe {tf} scan failed: {res}")
+                    errors.append({'timeframe': tf, 'error': str(res)})
+                    continue
+
+                df = res
+                if df is None or df.empty:
+                    logger.info(f"No data for timeframe {tf}")
+                    continue
+
+                # Normalize symbols in df for robust matching
+                try:
+                    df = df.copy()
+                    df['__norm_symbol'] = df['symbol'].astype(str).apply(normalize_symbol)
+                except Exception:
+                    # If symbol column missing or other issue, skip this timeframe
+                    logger.warning(f"Skipping timeframe {tf} due to invalid result format")
+                    continue
+
+                matched = df[df['__norm_symbol'] == norm_symbol]
+                if matched.empty:
+                    # try relaxed match by replacing '/' with '' etc
+                    matched = df[df['__norm_symbol'] == norm_symbol.replace('/', '')]
+
+                if matched.empty:
+                    logger.info(f"Symbol {symbol} not found in timeframe {tf}")
+                    continue
+
+                row = matched.iloc[0].to_dict()
+                all_results.append({'timeframe': tf, 'data': row})
+
+        finally:
+            # Attempt to close exchange connection held by scanner_instance
+            try:
+                if 'scanner_instance' in locals() and hasattr(scanner_instance, 'exchange') and hasattr(scanner_instance.exchange, 'close'):
+                    try:
+                        loop.run_until_complete(scanner_instance.exchange.close())
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            loop.close()
+
         if not all_results:
             return jsonify({
                 'symbol': symbol,
                 'confluence': False,
                 'message': f'No data found for {symbol} across timeframes',
-                'timeframes_analyzed': timeframes
+                'timeframes_analyzed': timeframes,
+                'errors': errors
             })
-        
-        # Analyze confluence
+
+        # Collect scores, signals, regimes
         opportunity_scores = [r['data'].get('opportunity_score', 0) for r in all_results]
         signals = [r['data'].get('signal', 'Neutral') for r in all_results]
         regimes = [r['data'].get('market_regime', 'unknown') for r in all_results]
-        
-        # Check for bullish confluence
-        bullish_count = sum(1 for s in signals if s in ['Strong Buy', 'Buy', 'Weak Buy'])
-        bearish_count = sum(1 for s in signals if s in ['Strong Sell', 'Sell', 'Weak Sell'])
-        
-        has_confluence = (bullish_count >= 2 or bearish_count >= 2) and min(opportunity_scores) >= min_opportunity
+
+        # Weighted scoring: give more weight to larger timeframes (later in list)
+        n = len(all_results)
+        # Determine weights based on original timeframes order: larger index -> more weight
+        weights = []
+        for i in range(n):
+            weights.append(i + 1)
+        total = sum(weights)
+        weights = [w / total for w in weights]
+
+        # align weights to the order of all_results (which follows timeframes order)
+        weighted_score = sum(score * weights[idx] for idx, score in enumerate(opportunity_scores))
+
+        # Direction counts
+        bullish_set = set(['Strong Buy', 'Buy', 'Weak Buy'])
+        bearish_set = set(['Strong Sell', 'Sell', 'Weak Sell'])
+        bullish_count = sum(1 for s in signals if s in bullish_set)
+        bearish_count = sum(1 for s in signals if s in bearish_set)
+
+        # Majority directional alignment: require dominant direction > half of timeframes
+        dominant_direction = 'NEUTRAL'
+        if bullish_count > bearish_count and bullish_count > (n / 2):
+            dominant_direction = 'BULLISH'
+        elif bearish_count > bullish_count and bearish_count > (n / 2):
+            dominant_direction = 'BEARISH'
+
+        # Use Counter to determine dominant regime safely
+        dominant_regime = Counter(regimes).most_common(1)[0][0] if regimes else 'unknown'
+
+        # Determine confluence: require majority alignment and weighted score threshold
+        has_confluence = (dominant_direction in ('BULLISH', 'BEARISH')) and (weighted_score >= min_opportunity)
+
         avg_opportunity = sum(opportunity_scores) / len(opportunity_scores) if opportunity_scores else 0
-        
+
         return jsonify({
             'symbol': symbol,
             'confluence': has_confluence,
+            'dominant_direction': dominant_direction,
+            'weighted_score': round(weighted_score, 2),
             'timeframes_analyzed': len(all_results),
             'average_opportunity': round(avg_opportunity, 2),
             'bullish_timeframes': bullish_count,
             'bearish_timeframes': bearish_count,
-            'dominant_regime': max(set(regimes), key=regimes.count) if regimes else 'unknown',
+            'dominant_regime': dominant_regime,
             'timeframe_results': [
                 {
                     'timeframe': r['timeframe'],
@@ -858,7 +883,8 @@ def multi_timeframe_confluence():
                 }
                 for r in all_results
             ],
-            'recommendation': 'STRONG' if has_confluence and avg_opportunity > 75 else 'MODERATE' if has_confluence else 'WEAK'
+            'errors': errors,
+            'recommendation': 'STRONG' if has_confluence and weighted_score > 75 else 'MODERATE' if has_confluence else 'WEAK'
         })
         
     except Exception as e:
@@ -944,39 +970,25 @@ def start_continuous_scanner():
         exchanges = data.get('exchanges', ['binance', 'kucoinfutures'])
         config_dict = data.get('config', {})
         
-        # Create config
-        config = StreamConfig(**config_dict) if config_dict else StreamConfig()
-        
-        # Create continuous scanner
-        continuous_scanner = ContinuousMultiTimeframeScanner(config)
-        
-        # Start in background thread with its own event loop
-        def run_scanner_loop():
-            global continuous_scanner_loop
-            continuous_scanner_loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(continuous_scanner_loop)
-            
-            try:
-                continuous_scanner_loop.run_until_complete(
-                    continuous_scanner.start(symbols, exchanges)
-                )
-            except Exception as e:
-                logger.error(f"Continuous scanner error: {e}", exc_info=True)
-            finally:
-                continuous_scanner_loop.close()
-        
-        scanner_thread = threading.Thread(target=run_scanner_loop, daemon=True)
-        scanner_thread.start()
-        
-        logger.info(f"Started continuous scanner for {len(symbols)} symbols")
-        
-        return jsonify({
-            'status': 'started',
+        # Persist start command into runtime store; a separate `scanner_service.py` should pick this up
+        cmd = {
+            'action': 'start',
             'symbols': symbols,
             'exchanges': exchanges,
-            'timeframes': config.timeframes,
-            'message': 'Continuous scanner started successfully'
-        })
+            'config': config_dict
+        }
+        try:
+            save_runtime('continuous_scanner:command', cmd)
+            logger.info(f"Queued continuous scanner start command for {len(symbols)} symbols")
+            return jsonify({
+                'status': 'queued',
+                'symbols': symbols,
+                'exchanges': exchanges,
+                'message': 'Continuous scanner start queued (external service should handle)'
+            })
+        except Exception as e:
+            logger.error(f"Failed to queue continuous scanner start: {e}", exc_info=True)
+            return jsonify({'error': str(e), 'message': 'Failed to queue continuous scanner start'}), 500
         
     except Exception as e:
         logger.error(f"Error starting continuous scanner: {str(e)}", exc_info=True)
@@ -998,18 +1010,14 @@ def stop_continuous_scanner():
                 'message': 'Continuous scanner is not running'
             })
         
-        # Stop the scanner
-        if continuous_scanner_loop:
-            continuous_scanner_loop.call_soon_threadsafe(
-                lambda: asyncio.create_task(continuous_scanner.stop())
-            )
-        
-        logger.info("Stopped continuous scanner")
-        
-        return jsonify({
-            'status': 'stopped',
-            'message': 'Continuous scanner stopped successfully'
-        })
+        # Signal external scanner service to stop
+        try:
+            save_runtime('continuous_scanner:command', {'action': 'stop'})
+            logger.info('Queued continuous scanner stop command')
+            return jsonify({'status': 'queued', 'message': 'Stop command queued for continuous scanner'})
+        except Exception as e:
+            logger.error(f"Failed to queue stop command: {e}", exc_info=True)
+            return jsonify({'error': str(e), 'message': 'Failed to queue stop command'}), 500
         
     except Exception as e:
         logger.error(f"Error stopping continuous scanner: {str(e)}", exc_info=True)
@@ -1025,23 +1033,11 @@ def continuous_scanner_status():
     global continuous_scanner
     
     try:
-        if not continuous_scanner:
-            return jsonify({
-                'running': False,
-                'message': 'Scanner not initialized'
-            })
-        
-        market_state = continuous_scanner.get_market_state()
-        
-        return jsonify({
-            'running': continuous_scanner.running,
-            'market_state': market_state,
-            'buffer_stats': {
-                'ticks': len(continuous_scanner.tick_buffers),
-                'candles': len(continuous_scanner.candle_buffers),
-                'signals': sum(len(s) for s in continuous_scanner.signal_history.values())
-            }
-        })
+        # Read status from runtime store (populated by external scanner service)
+        status = load_runtime('continuous_scanner:status') or {}
+        if not status:
+            return jsonify({'running': False, 'message': 'Scanner service not responding or not started'})
+        return jsonify(status)
         
     except Exception as e:
         logger.error(f"Error getting continuous scanner status: {str(e)}", exc_info=True)

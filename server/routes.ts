@@ -5,9 +5,12 @@ import rateLimit from 'express-rate-limit';
 import { createServer, type Server } from "http";
 import { WebSocketServer, WebSocket } from "ws";
 import { storage } from "./storage";
+import { rlGuard } from './rl-guard';
 import { z } from 'zod';
-import { PrismaClient } from '@prisma/client';
+import pkg from '@prisma/client';
+const { PrismaClient } = pkg as any;
 import axios from 'axios'; // Import axios for CoinGecko API calls
+import { coinGeckoService } from './services/coingecko';
 import { Router } from 'express'; // Import Router for dynamic route registration
 
 // Import strategy routes and paper trading routes
@@ -51,6 +54,7 @@ import sourceAnalyticsRouter from './routes/source-analytics';
 
 // Import audit logs and model drift routes
 import auditLogsRoutes from "./routes/audit-logs";
+import adaptiveRoutes from "./routes/adaptive";
 import modelDriftRoutes from "./routes/model-drift";
 
 // Import diagnostics routes
@@ -78,6 +82,7 @@ import correlationBoostRouter from './routes/correlation-boost';
 import strategyDeploymentRouter from './routes/strategy-deployment';
 // Import agent signal insights router
 import agentSignalInsightsRouter from './routes/agent-signal-insights';
+import { apiRegistry } from './services/api-registry';
 // Import scanner signal router
 import scannerSignalRouter from './routes/scanner-signal';
 
@@ -226,6 +231,12 @@ try {
       res.json(mockUser);
     });
 
+    try {
+      apiRegistry.registerEndpoint({ method: 'GET', path: '/api/auth/user', category: 'CORE', name: 'Get Current User', description: 'Return current authenticated user (mock)', version: '1.0.0', tags: ['auth','user'], isDeprecated: false, authentication: 'NONE', cacheable: false, isActive: true });
+    } catch (e) {
+      console.warn('[APIRegistry] Failed to register /api/auth/user', e);
+    }
+
     app.get('/api/user/preferences', async (req: any, res: Response) => {
       res.json(mockUser.preferences);
     });
@@ -248,6 +259,46 @@ try {
 
     app.get('/api/user/watchlist', async (req: any, res: Response) => {
       res.json([]);
+    });
+
+    // RL Guard status for monitoring
+    app.get('/api/rl/guard-status', async (_req: Request, res: Response) => {
+      try {
+        const status = rlGuard.getStatus();
+        res.json({ ok: true, status });
+      } catch (err: any) {
+        res.status(500).json({ ok: false, error: err.message });
+      }
+    });
+
+    // Diagnostics: LiveEpoch and TimeAnchor dump
+    app.get('/api/diagnostics/time-anchors', async (_req: Request, res: Response) => {
+      try {
+        const { dumpLiveEpochDiagnostics } = await import('./services/market-data/integrity-gate');
+        const { getTimeAnchorManager } = await import('./services/market-data/time-anchor');
+        const { getModeDetector } = await import('./services/market-data/mode-detector');
+
+        const live = dumpLiveEpochDiagnostics();
+        const anchorMgr = getTimeAnchorManager();
+        const anchors = typeof anchorMgr.diagnostics === 'function' ? anchorMgr.diagnostics() : { note: 'no diagnostics available' };
+        const mode = getModeDetector().getMetrics ? getModeDetector().getMetrics() : { backfillComplete: 'unknown' };
+
+        res.json({ ok: true, liveEpoch: live, anchors, mode });
+      } catch (err: any) {
+        res.status(500).json({ ok: false, error: (err as any)?.message || err });
+      }
+    });
+
+    // Trace retrieval: return full artifact chain for a given trace id
+    app.get('/api/trace/:traceId', async (req: Request, res: Response) => {
+      try {
+        const traceId = Array.isArray(req.params.traceId) ? req.params.traceId[0] : req.params.traceId;
+        if (!traceId) return res.status(400).json({ ok: false, error: 'traceId required' });
+        const trace = await storage.getTraceChain(traceId);
+        res.json({ ok: true, trace });
+      } catch (err: any) {
+        res.status(500).json({ ok: false, error: (err as any).message || err });
+      }
     });
 
     app.post('/api/user/watchlist', async (req: any, res: Response) => {
@@ -674,8 +725,6 @@ try {
 app.get('/api/assets/performance', async (req: Request, res: Response) => {
   const db = new PrismaClient();
   try {
-    const { PrismaClient } = require('@prisma/client');
-    const db = new PrismaClient();
     // Query params
     const {
       symbol,
@@ -932,10 +981,8 @@ app.get('/api/assets/performance', async (req: Request, res: Response) => {
       // Fetch comprehensive CoinGecko global data
       let coingeckoGlobalData: any = null;
       try {
-        const response = await axios.get('https://api.coingecko.com/api/v3/global');
-        if (response.data && response.data.data) {
-          coingeckoGlobalData = response.data.data;
-        }
+        const data = await coinGeckoService.getGlobalMarket({ timeout: 8000, retries: 3 });
+        coingeckoGlobalData = data;
       } catch (error: any) {
         console.warn('[MarketIntel] CoinGecko global data fetch failed:', error.message);
       }
@@ -943,19 +990,7 @@ app.get('/api/assets/performance', async (req: Request, res: Response) => {
       // Fetch top 100 coins with multi-timeframe price changes for gainers/losers
       let marketData: any[] = [];
       try {
-        const response = await axios.get('https://api.coingecko.com/api/v3/coins/markets', {
-          params: {
-            vs_currency: 'usd',
-            order: 'market_cap_desc',
-            per_page: 100,
-            page: 1,
-            sparkline: false,
-            price_change_percentage: '1h,24h,7d,30d,1y'
-          }
-        });
-        if (response.data) {
-          marketData = response.data;
-        }
+        marketData = await coinGeckoService.getMarketData('usd', 1, 100);
       } catch (error: any) {
         console.warn('[MarketIntel] CoinGecko market data fetch failed:', error.message);
       }
@@ -963,18 +998,16 @@ app.get('/api/assets/performance', async (req: Request, res: Response) => {
       // Fetch trending coins
       let trendingCoins: any[] = [];
       try {
-        const response = await axios.get('https://api.coingecko.com/api/v3/search/trending');
-        if (response.data && response.data.coins) {
-          trendingCoins = response.data.coins.map((coin: any) => ({
-            id: coin.item.id,
-            name: coin.item.name,
-            symbol: coin.item.symbol.toUpperCase(),
-            marketCapRank: coin.item.market_cap_rank,
-            thumb: coin.item.thumb,
-            score: coin.item.score,
-            priceChange24h: coin.item.data?.price_change_percentage_24h?.usd || 0
-          }));
-        }
+        const trending = await coinGeckoService.getTrendingCoins();
+        trendingCoins = (trending || []).map((coin: any) => ({
+          id: coin.item.id,
+          name: coin.item.name,
+          symbol: coin.item.symbol.toUpperCase(),
+          marketCapRank: coin.item.market_cap_rank,
+          thumb: coin.item.thumb,
+          score: coin.item.score,
+          priceChange24h: coin.item.data?.price_change_percentage_24h?.usd || 0
+        }));
       } catch (error: any) {
         console.warn('[MarketIntel] Trending coins fetch failed:', error.message);
       }
@@ -1130,21 +1163,8 @@ app.get('/api/assets/performance', async (req: Request, res: Response) => {
   app.get('/api/coingecko/all', async (req: Request, res: Response) => {
     try {
       // Fetch data for all coins (limited to 250 by default by CoinGecko, can be increased)
-      const response = await axios.get('https://api.coingecko.com/api/v3/coins/markets', {
-        params: {
-          vs_currency: 'usd',
-          order: 'market_cap_desc',
-          per_page: 250, // Adjust as needed
-          page: 1,
-          sparkline: false
-        }
-      });
-
-      if (response.data) {
-        res.json(response.data);
-      } else {
-        res.status(500).json({ error: 'Failed to fetch CoinGecko data' });
-      }
+      const data = await coinGeckoService.getMarketData('usd', 1, 250);
+      res.json(data);
     } catch (error: any) {
       console.error('Error fetching CoinGecko all data:', error);
       res.status(500).json({ error: error.message });
@@ -1155,22 +1175,11 @@ app.get('/api/assets/performance', async (req: Request, res: Response) => {
   app.get('/api/coingecko/coin/:id', async (req: Request, res: Response) => {
     try {
       const { id } = req.params;
+      const idStr = Array.isArray(id) ? id[0] : id;
       const { vs_currency = 'usd' } = req.query;
-
-      const response = await axios.get(`https://api.coingecko.com/api/v3/coins/${id}`, {
-        params: {
-          vs_currency: vs_currency,
-          localization: 'false',
-          tickers: 'true',
-          market_data: 'true',
-          community_data: 'true',
-          developer_data: 'true',
-          sparkline: 'true',
-        }
-      });
-
-      if (response.data) {
-        res.json(response.data);
+      const details = await coinGeckoService.getCoinDetails(idStr);
+      if (details) {
+        res.json(details);
       } else {
         res.status(404).json({ error: 'Coin not found' });
       }
@@ -1183,39 +1192,19 @@ app.get('/api/assets/performance', async (req: Request, res: Response) => {
   // This endpoint will fetch CoinGecko categories and their related coins
   app.get('/api/coingecko/categories', async (req: Request, res: Response) => {
     try {
-      const response = await axios.get('https://api.coingecko.com/api/v3/coins/categories', {
-        params: {
-          order: 'market_cap',
-          item_count: 10 // Number of coins to show per category
-        }
-      });
-
-      if (response.data) {
-        res.json(response.data);
-      } else {
-        res.status(500).json({ error: 'Failed to fetch CoinGecko categories' });
-      }
+      const data = await coinGeckoService.getCategories();
+      res.json(data);
     } catch (error: any) {
       console.error('Error fetching CoinGecko categories:', error);
       res.status(500).json({ error: error.message });
     }
-  });
+    });
 
   // This endpoint will fetch CoinGecko exchanges
   app.get('/api/coingecko/exchanges', async (req: Request, res: Response) => {
     try {
-      const response = await axios.get('https://api.coingecko.com/api/v3/exchanges', {
-        params: {
-          per_page: 250, // Adjust as needed
-          page: 1
-        }
-      });
-
-      if (response.data) {
-        res.json(response.data);
-      } else {
-        res.status(500).json({ error: 'Failed to fetch CoinGecko exchanges' });
-      }
+      const data = await coinGeckoService.getExchanges(1, 250);
+      res.json(data);
     } catch (error: any) {
       console.error('Error fetching CoinGecko exchanges:', error);
       res.status(500).json({ error: error.message });
@@ -1225,18 +1214,8 @@ app.get('/api/assets/performance', async (req: Request, res: Response) => {
   // This endpoint will fetch CoinGecko indices
   app.get('/api/coingecko/indices', async (req: Request, res: Response) => {
     try {
-      const response = await axios.get('https://api.coingecko.com/api/v3/indices', {
-        params: {
-          currency: 'usd',
-          order: 'market_cap_desc'
-        }
-      });
-
-      if (response.data) {
-        res.json(response.data);
-      } else {
-        res.status(500).json({ error: 'Failed to fetch CoinGecko indices' });
-      }
+      const data = await coinGeckoService.getIndices();
+      res.json(data);
     } catch (error: any) {
       console.error('Error fetching CoinGecko indices:', error);
       res.status(500).json({ error: error.message });
@@ -1254,10 +1233,8 @@ app.get('/api/assets/performance', async (req: Request, res: Response) => {
       // Fetch some market data to determine regime (example: using CoinGecko global data)
       let coingeckoGlobalData = null;
       try {
-        const cgResponse = await axios.get('https://api.coingecko.com/api/v3/global');
-        if (cgResponse.data && cgResponse.data.data) {
-          coingeckoGlobalData = cgResponse.data.data;
-        }
+        const cgData = await coinGeckoService.getGlobalMarket({ timeout: 8000, retries: 3 });
+        coingeckoGlobalData = cgData;
       } catch (cgError) {
         console.warn('Could not fetch CoinGecko global data for regime analysis:', cgError);
       }
@@ -1572,6 +1549,12 @@ app.get('/api/assets/performance', async (req: Request, res: Response) => {
     res.status(200).json({ status: 'UP', timestamp: new Date().toISOString() });
   });
 
+  try {
+    apiRegistry.registerEndpoint({ method: 'GET', path: '/api/health', category: 'CORE', name: 'Health Check', description: 'Service health check', version: '1.0.0', tags: ['core','health'], isDeprecated: false, authentication: 'NONE', cacheable: false, isActive: true });
+  } catch (e) {
+    console.warn('[APIRegistry] Failed to register /api/health', e);
+  }
+
   // Read-only regime analysis endpoint
   // Example: GET /api/analysis/regime?symbol=BTC/USDT&timeframe=60
   app.get('/api/analysis/regime', async (req: Request, res: Response) => {
@@ -1594,6 +1577,12 @@ app.get('/api/assets/performance', async (req: Request, res: Response) => {
     }
   });
 
+  try {
+    apiRegistry.registerEndpoint({ method: 'GET', path: '/api/analysis/regime', category: 'ANALYTICS', name: 'Regime Analysis', description: 'Compute market regime for a symbol/timeframe', version: '1.0.0', tags: ['analysis','regime'], isDeprecated: false, authentication: 'NONE', cacheable: true, cacheTTLSeconds: 5, isActive: true });
+  } catch (e) {
+    console.warn('[APIRegistry] Failed to register /api/analysis/regime', e);
+  }
+
   // Register MTF confirmation routes
   app.use('/api/mtf-confirmation', mtfConfirmationRouter);
   // Mount position sizing v2 endpoint
@@ -1610,6 +1599,7 @@ app.get('/api/assets/performance', async (req: Request, res: Response) => {
   app.use("/api/strategy-deployment", strategyDeploymentRouter);
   app.use("/api/correlation-boost", correlationBoostRouter);
   app.use("/api/audit-logs", auditLogsRoutes);
+  app.use('/api/adaptive', adaptiveRoutes);
   app.use("/api/model-drift", modelDriftRoutes);
   
   // 🔄 Register mode diagnostics routes

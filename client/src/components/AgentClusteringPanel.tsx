@@ -4,7 +4,7 @@
  * UI Component for displaying agent clustering analysis and specialist routing
  */
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import styles from './AgentClusteringPanel.module.css';
 import Card from './Card';
 
@@ -87,6 +87,7 @@ const AgentClusteringPanel: React.FC = () => {
   const [report, setReport] = useState<ClusteringReport | null>(null);
   const [agents, setAgents] = useState<Agent[]>([]);
   const [comparison, setComparison] = useState<any>(null);
+  const controllerRef = useRef<{ run?: AbortController; compare?: AbortController; load?: AbortController }>({});
 
   // Fetch clustering analysis
   const handleRunAnalysis = async () => {
@@ -94,6 +95,11 @@ const AgentClusteringPanel: React.FC = () => {
     setError(null);
 
     try {
+      // Abort any previous run request
+      controllerRef.current.run?.abort();
+      const controller = new AbortController();
+      controllerRef.current.run = controller;
+
       const response = await fetch('/api/backtest/agent-clustering/run', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -104,6 +110,7 @@ const AgentClusteringPanel: React.FC = () => {
           initialCapital: 10000,
           timeframe: '1h',
         }),
+        signal: controller.signal,
       });
 
       if (!response.ok) {
@@ -113,6 +120,7 @@ const AgentClusteringPanel: React.FC = () => {
       const data = await response.json();
       setReport(data);
     } catch (err) {
+      if ((err as any)?.name === 'AbortError') return;
       setError(err instanceof Error ? err.message : 'Unknown error');
     } finally {
       setLoading(false);
@@ -125,6 +133,10 @@ const AgentClusteringPanel: React.FC = () => {
     setError(null);
 
     try {
+      controllerRef.current.compare?.abort();
+      const controller = new AbortController();
+      controllerRef.current.compare = controller;
+
       const response = await fetch('/api/backtest/agent-clustering/compare-routing', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -133,6 +145,7 @@ const AgentClusteringPanel: React.FC = () => {
           startDate: '2024-01-01',
           endDate: '2024-12-31',
         }),
+        signal: controller.signal,
       });
 
       if (!response.ok) {
@@ -142,6 +155,7 @@ const AgentClusteringPanel: React.FC = () => {
       const data = await response.json();
       setComparison(data);
     } catch (err) {
+      if ((err as any)?.name === 'AbortError') return;
       setError(err instanceof Error ? err.message : 'Unknown error');
     } finally {
       setLoading(false);
@@ -154,7 +168,11 @@ const AgentClusteringPanel: React.FC = () => {
     setError(null);
 
     try {
-      const response = await fetch('/api/backtest/agent-clustering/agents');
+      controllerRef.current.load?.abort();
+      const controller = new AbortController();
+      controllerRef.current.load = controller;
+
+      const response = await fetch('/api/backtest/agent-clustering/agents', { signal: controller.signal });
       if (!response.ok) {
         throw new Error('Failed to load agents');
       }
@@ -162,6 +180,7 @@ const AgentClusteringPanel: React.FC = () => {
       const data = await response.json();
       setAgents(data.agents);
     } catch (err) {
+      if ((err as any)?.name === 'AbortError') return;
       setError(err instanceof Error ? err.message : 'Unknown error');
     } finally {
       setLoading(false);
@@ -170,6 +189,12 @@ const AgentClusteringPanel: React.FC = () => {
 
   useEffect(() => {
     handleLoadAgents();
+    return () => {
+      // Abort inflight requests when component unmounts
+      controllerRef.current.run?.abort();
+      controllerRef.current.compare?.abort();
+      controllerRef.current.load?.abort();
+    };
   }, []);
 
   return (

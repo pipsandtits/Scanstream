@@ -3,7 +3,8 @@
  * Business logic and validation for user settings operations
  */
 
-import { PrismaClient } from '@prisma/client';
+import pkg from '@prisma/client';
+const { PrismaClient } = pkg as any;
 import crypto from 'crypto';
 
 export interface PreferencesData {

@@ -6,7 +6,7 @@
  */
 
 import React, { useState, useMemo } from 'react';
-import { useLocation } from 'wouter';
+import { useNavigate } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
 import { Search, TrendingUp, AlertCircle, Zap, ArrowRight, Plus } from 'lucide-react';
 
@@ -22,7 +22,7 @@ interface ScoutReportMeta {
 }
 
 export default function ScoutReportsPage() {
-  const [, navigate] = useLocation();
+  const navigate = useNavigate();
   const [searchTerm, setSearchTerm] = useState('');
   const [sortBy, setSortBy] = useState<'confidence' | 'opportunities' | 'updated' | 'name'>('confidence');
 

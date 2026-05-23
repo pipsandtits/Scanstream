@@ -85,8 +85,8 @@ export default function AnalyticsDashboard() {
   // Fetch market intelligence data
   const { data: marketIntel, isLoading: loadingMarketIntel } = useQuery({
     queryKey: ['market-intelligence'],
-    queryFn: async () => {
-      const response = await fetch('/api/market-intelligence');
+    queryFn: async ({ signal }: any) => {
+      const response = await fetch('/api/market-intelligence', { signal });
       if (!response.ok) throw new Error('Failed to fetch market intelligence');
       return response.json() as Promise<MarketIntelligence>;
     },
@@ -95,8 +95,8 @@ export default function AnalyticsDashboard() {
   // Fetch strategies data
   const { data: strategiesData, isLoading: loadingStrategies } = useQuery({
     queryKey: ['strategies', selectedSymbol],
-    queryFn: async () => {
-      const response = await fetch(`/api/strategies/list?symbol=${selectedSymbol}`);
+    queryFn: async ({ signal }: any) => {
+      const response = await fetch(`/api/strategies/list?symbol=${selectedSymbol}`, { signal });
       if (!response.ok) throw new Error('Failed to fetch strategies');
       return response.json() as Promise<{ strategies: Strategy[]; regime: MarketRegime }>;
     },
@@ -105,8 +105,8 @@ export default function AnalyticsDashboard() {
   // Fetch ML models data
   const { data: modelsData, isLoading: loadingModels } = useQuery({
     queryKey: ['ml-models', selectedSymbol],
-    queryFn: async () => {
-      const response = await fetch(`/api/ml/models?symbol=${selectedSymbol}`);
+    queryFn: async ({ signal }: any) => {
+      const response = await fetch(`/api/ml/models?symbol=${selectedSymbol}`, { signal });
       if (!response.ok) throw new Error('Failed to fetch ML models');
       return response.json() as Promise<{ models: MLModel[] }>;
     },

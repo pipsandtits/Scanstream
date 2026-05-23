@@ -40,42 +40,79 @@ export class CCXTScanner {
       limit = 100,
       parallel = true,
       useCache = true,
-      minConfidence = 70
+      minConfidence = 70,
+      progressCb,
+      prioritySymbols
     } = options;
 
     const results: ScanResult[] = [];
 
+    // Allow callers to prioritize symbols (e.g., major pairs first)
+    const orderedSymbols = (() => {
+      if (!prioritySymbols || prioritySymbols.length === 0) return symbols;
+      const seen = new Set<string>();
+      const out: string[] = [];
+      for (const s of prioritySymbols) {
+        if (symbols.includes(s) && !seen.has(s)) {
+          out.push(s);
+          seen.add(s);
+        }
+      }
+      for (const s of symbols) {
+        if (!seen.has(s)) {
+          out.push(s);
+          seen.add(s);
+        }
+      }
+      return out;
+    })();
+
+    let completed = 0;
+    const total = orderedSymbols.length;
+    if (progressCb) progressCb(0, total);
+
     if (parallel) {
-      // Parallel scanning with Gateway rate limiting
-      const scanPromises = symbols.map(symbol => 
+      // Parallel scanning with Gateway rate limiting; report progress as each finishes
+      const scanPromises = orderedSymbols.map(symbol =>
         this.scanSingleSymbol(symbol, timeframe, limit, useCache, minConfidence)
+          .then(res => {
+            completed += 1;
+            if (progressCb) progressCb(completed, total, symbol);
+            return { symbol, res };
+          })
+          .catch(err => {
+            completed += 1;
+            if (progressCb) progressCb(completed, total, symbol, err);
+            return { symbol, res: null };
+          })
       );
 
-      const settled = await Promise.allSettled(scanPromises);
+      const settled = await Promise.all(scanPromises);
 
-      settled.forEach((result, index) => {
-        if (result.status === 'fulfilled' && result.value) {
-          results.push(result.value);
-        } else if (result.status === 'rejected') {
-          console.warn(`[CCXT Scanner] Failed to scan ${symbols[index]}:`, result.reason);
-        }
-      });
+      for (const item of settled) {
+        if (item && (item as any).res) results.push((item as any).res);
+      }
     } else {
       // Sequential scanning
-      for (const symbol of symbols) {
+      for (const symbol of orderedSymbols) {
         try {
           const result = await this.scanSingleSymbol(
-            symbol, 
-            timeframe, 
-            limit, 
-            useCache, 
+            symbol,
+            timeframe,
+            limit,
+            useCache,
             minConfidence
           );
+
+          completed += 1;
+          if (progressCb) progressCb(completed, total, symbol);
 
           if (result) {
             results.push(result);
           }
         } catch (error: any) {
+          completed += 1;
+          if (progressCb) progressCb(completed, total, symbol, error);
           console.warn(`[CCXT Scanner] Error scanning ${symbol}:`, error.message);
         }
       }
@@ -109,8 +146,48 @@ export class CCXTScanner {
     this.activeScanSymbols.add(symbol);
 
     try {
-      // Step 1: Get aggregated price through Gateway
-      const priceData = await this.aggregator.getAggregatedPrice(symbol);
+      // Step 1: Prefer PriceCache (authoritative fallback)
+      let priceData: any = null;
+      if (useCache) {
+        const cachedTicker = priceCache.get(symbol);
+        if (cachedTicker && (Date.now() - (cachedTicker.timestamp || 0) < 60_000)) {
+          priceData = {
+            symbol,
+            price: cachedTicker.price,
+            confidence: cachedTicker.confidence ?? 100,
+            sources: cachedTicker.exchange ? [cachedTicker.exchange] : [],
+            timestamp: new Date(cachedTicker.timestamp || Date.now())
+          } as PriceData;
+        } else {
+          // Attempt to refresh cache once (best-effort)
+          try {
+            await priceCache.refresh(symbol);
+            const refreshed = priceCache.get(symbol);
+            if (refreshed) {
+              priceData = {
+                symbol,
+                price: refreshed.price,
+                confidence: refreshed.confidence ?? 100,
+                sources: refreshed.exchange ? [refreshed.exchange] : [],
+                timestamp: new Date(refreshed.timestamp || Date.now())
+              } as PriceData;
+            }
+          } catch (e) {
+            // ignore and fallback to aggregator
+          }
+        }
+      }
+
+      if (!priceData) {
+        // Fallback to aggregator when cache missing or stale
+        priceData = await this.aggregator.getAggregatedPrice(symbol);
+        try {
+          // Update lightweight cache for others
+          priceCache.set(symbol, { symbol, price: priceData.price, timestamp: Date.now(), exchange: priceData.sources?.[0], confidence: priceData.confidence });
+        } catch (e) {
+          // noop
+        }
+      }
 
       // Filter by confidence
       if (priceData.confidence < minConfidence) {
@@ -118,8 +195,18 @@ export class CCXTScanner {
         return null;
       }
 
-      // Step 2: Get OHLCV data through Gateway
-      const ohlcv = await this.aggregator.getOHLCV(symbol, timeframe, limit);
+      // Step 2: Prefer cached candles when available
+      let ohlcv: any[] | null = null;
+      if (useCache) {
+        const cachedCandles = priceCache.getCandles(symbol, timeframe);
+        if (cachedCandles && cachedCandles.length >= Math.min(20, limit)) {
+          ohlcv = cachedCandles.map(c => [c[0], c[1], c[2], c[3], c[4], c[5]]);
+        }
+      }
+
+      if (!ohlcv) {
+        ohlcv = await this.aggregator.getOHLCV(symbol, timeframe, limit);
+      }
 
       if (!ohlcv || ohlcv.length < 20) {
         console.warn(`[CCXT Scanner] Insufficient OHLCV data for ${symbol}`);
@@ -152,7 +239,9 @@ export class CCXTScanner {
           close: (f.price as any)?.close ?? 0,
           volume: f.volume ?? 0,
           isFinal: true,
-          source: 'ccxt',
+          // These frames originate from REST/CCXT scans (backfill/historical)
+          source: 'historical',
+          origin: 'ccxt',
           venue: 'scanner',
           // Enrichment payloads (optional)
           price: f.price ?? undefined,
@@ -166,15 +255,15 @@ export class CCXTScanner {
         const timeframeSeconds = this.parseTimeframeToSeconds(timeframe);
 
         // Validate through integrity layer
-        const result = await gate.storeValidatedCandles(
-          symbol,
-          timeframeSeconds,
-          candles
-        );
+          const result = await gate.storeValidatedCandles(
+            symbol,
+            timeframeSeconds,
+            candles
+          );
 
         console.log(
           `[CCXT Scanner] Integrity check for ${symbol}/${timeframe}: ` +
-          `${result.stored.length} valid, ${result.rejected.length} rejected, ${result.gaps.length} gaps`
+            `${result.stored.length} valid, ${result.rejected.length} rejected, ${result.gaps.length} gaps`
         );
 
         // ✅ Integrity gate already stored validated candles
@@ -192,7 +281,7 @@ export class CCXTScanner {
       } catch (integrityError) {
         console.warn('[CCXT Scanner] Integrity gate check failed, falling back to direct storage:', integrityError);
 
-        // Fallback: store directly if integrity gate fails
+        // Fallback: store directly if integrity gate fails (rare). Keep this as a last-resort path.
         try {
           const { storage } = await import('../../storage');
           for (const frame of frames) {
@@ -218,6 +307,10 @@ export class CCXTScanner {
       // Step 5: Calculate basic metrics
       const metrics = this.calculateMetrics(frames, priceData);
 
+      const dataQuality = this.assessDataQuality(frames, priceData);
+      // Health score blends data quality and price confidence (0-100)
+      const healthScore = Math.round(Math.min(100, (dataQuality * 0.6) + (Number(priceData.confidence || 0) * 0.4)));
+
       const result: ScanResult = {
         symbol,
         timeframe,
@@ -227,7 +320,8 @@ export class CCXTScanner {
         deviation: priceData.deviation,
         metrics,
         timestamp: new Date(),
-        dataQuality: this.assessDataQuality(frames, priceData)
+        dataQuality,
+        healthScore
       };
 
       // Cache result for 3 minutes (180 seconds)
@@ -270,6 +364,9 @@ export class CCXTScanner {
     // Volatility
     const volatility = atr / price;
 
+    // Cross-exchange deviation: provided by aggregator as `priceData.deviation` (fraction)
+    const crossExchangeDeviation = typeof priceData.deviation === 'number' ? priceData.deviation : 0;
+
     // Trend strength
     const trendStrength = this.calculateTrendStrength(frames);
 
@@ -284,6 +381,7 @@ export class CCXTScanner {
       adx,
       atr,
       momentum,
+      crossExchangeDeviation,
       volumeRatio,
       volatility,
       trendStrength
@@ -344,8 +442,9 @@ export class CCXTScanner {
     // Source diversity (max 20 points)
     quality += Math.min(20, priceData.sources.length * 5);
 
-    // Low deviation bonus (max 10 points)
-    const deviationPenalty = Math.min(10, priceData.deviation * 5);
+    // Low deviation bonus (max 10 points) - smaller deviation is better
+    const deviation = typeof priceData.deviation === 'number' ? priceData.deviation : 0;
+    const deviationPenalty = Math.min(10, deviation * 5);
     quality += 10 - deviationPenalty;
 
     return Math.min(100, quality);
@@ -387,16 +486,14 @@ export class CCXTScanner {
    * Parse timeframe string to seconds (e.g., "1h" -> 3600)
    */
   private parseTimeframeToSeconds(timeframe: string): number {
-    const m = timeframe.match(/(\d+)([mhd])/i);
-    if (!m) return 60;
+    const match = timeframe.match(/^(\d+)([mhd])$/i);
+    if (!match) return 60;
 
-    const amount = parseInt(m[1]);
-    const unit = m[2].toLowerCase();
+    const [, amount, unit] = match as any;
+    const value = parseInt(amount, 10);
 
-    if (unit === 'm') return amount * 60;
-    if (unit === 'h') return amount * 3600;
-    if (unit === 'd') return amount * 86400;
-    return 60;
+    return unit.toLowerCase() === 'm' ? value * 60 :
+           unit.toLowerCase() === 'h' ? value * 3600 : value * 86400;
   }
 
   /**
@@ -413,9 +510,14 @@ interface ScanOptions {
   parallel?: boolean;
   useCache?: boolean;
   minConfidence?: number;
+  // Progress callback (completed, total, symbol?, error?) -> void
+  progressCb?: (completed: number, total: number, symbol?: string, error?: any) => void;
+  // Optional list of symbols to prioritize (scanned first)
+  prioritySymbols?: string[];
 }
 
-interface ScanResult {
+// Core result returned by scanner; kept compact for programmatic consumers
+interface CoreScanResult {
   symbol: string;
   timeframe: string;
   price: number;
@@ -425,6 +527,21 @@ interface ScanResult {
   metrics: ScanMetrics;
   timestamp: Date;
   dataQuality: number;
+  healthScore?: number;
+}
+
+// Full ScanResult includes UI/diagnostic extensions
+interface ScanResult extends CoreScanResult {
+  symbol: string;
+  timeframe: string;
+  price: number;
+  confidence: number;
+  sources: string[];
+  deviation: number;
+  metrics: ScanMetrics;
+  timestamp: Date;
+  dataQuality: number;
+  healthScore?: number;
   // Optional runtime fields used by UI and downstream services
   id?: string;
   exchange?: string;
@@ -476,6 +593,8 @@ interface ScanMetrics {
   momentum: number;
   volumeRatio: number;
   volatility: number;
+  // Deviation across venues (fractional, e.g., 0.02 = 2%)
+  crossExchangeDeviation?: number;
   trendStrength: number;
 }
 

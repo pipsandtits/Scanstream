@@ -1,14 +1,7 @@
 import { useState, useEffect } from 'react';
-import { LineChart, Line, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
+import { LineChartCore, BarChartCore } from './charts';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-
-interface ChartDataPoint {
-  time: string;
-  price: number;
-  volume?: number;
-  ma20?: number;
-  ma50?: number;
-}
+import type { ChartDataPoint } from '@/types/chart';
 
 interface BasicChartProps {
   symbol: string;
@@ -27,10 +20,12 @@ export function BasicChart({
   showMA = true,
   chartType = 'line'
 }: BasicChartProps) {
-  const [filteredData, setFilteredData] = useState<ChartDataPoint[]>(data);
+  // normalize incoming ChartDataPoint to the small-chart shape
+  const normalized = data.map(d => ({ time: new Date(d.timestamp).toISOString(), price: d.close, volume: d.volume, ma20: d.ema ?? undefined, ma50: undefined }));
+  const [filteredData, setFilteredData] = useState<any[]>(normalized);
 
   useEffect(() => {
-    setFilteredData(data);
+    setFilteredData(data.map((d: ChartDataPoint) => ({ time: new Date(d.timestamp).toISOString(), price: d.close, volume: d.volume, ma20: d.ema ?? undefined, ma50: undefined })));
   }, [data]);
 
   if (!data || data.length === 0) {
@@ -63,75 +58,31 @@ export function BasicChart({
       </CardHeader>
       <CardContent>
         {chartType === 'line' ? (
-          <ResponsiveContainer width="100%" height={height}>
-            <LineChart data={filteredData}>
-              <CartesianGrid strokeDasharray="3 3" />
-              <XAxis dataKey="time" />
-              <YAxis domain={yAxisDomain} />
-              <Tooltip 
-                formatter={(value) => typeof value === 'number' ? value.toFixed(2) : value}
-              />
-              <Legend />
-              <Line 
-                type="monotone" 
-                dataKey="price" 
-                stroke="#3b82f6" 
-                dot={false}
-                isAnimationActive={false}
-                name={`${symbol} Price`}
-              />
-              {showMA && (
-                <>
-                  <Line 
-                    type="monotone" 
-                    dataKey="ma20" 
-                    stroke="#10b981" 
-                    dot={false}
-                    isAnimationActive={false}
-                    name="MA20"
-                  />
-                  <Line 
-                    type="monotone" 
-                    dataKey="ma50" 
-                    stroke="#f59e0b" 
-                    dot={false}
-                    isAnimationActive={false}
-                    name="MA50"
-                  />
-                </>
-              )}
-            </LineChart>
-          </ResponsiveContainer>
+          <LineChartCore
+            data={filteredData}
+            height={height}
+            lines={[
+              { key: 'price', color: '#3b82f6', name: `${symbol} Price` },
+              ...(showMA ? [
+                { key: 'ma20', color: '#10b981', name: 'MA20' },
+                { key: 'ma50', color: '#f59e0b', name: 'MA50' }
+              ] : [])
+            ]}
+            yDomain={yAxisDomain}
+          />
         ) : (
-          <ResponsiveContainer width="100%" height={height}>
-            <BarChart data={filteredData}>
-              <CartesianGrid strokeDasharray="3 3" />
-              <XAxis dataKey="time" />
-              <YAxis yAxisId="left" domain={yAxisDomain} />
-              {showVolume && <YAxis yAxisId="right" orientation="right" />}
-              <Tooltip 
-                formatter={(value) => typeof value === 'number' ? value.toFixed(2) : value}
-              />
-              <Legend />
-              <Bar 
-                yAxisId="left"
-                dataKey="price" 
-                fill="#3b82f6" 
-                name={`${symbol} Price`}
-                isAnimationActive={false}
-              />
+          <BarChartCore
+            data={filteredData}
+            height={height}
+          >
+            {/* children will be rendered by BarChartCoreImpl via `children` prop */}
+            <>
+              <Bar dataKey="price" fill="#3b82f6" name={`${symbol} Price`} isAnimationActive={false} />
               {showVolume && (
-                <Bar 
-                  yAxisId="right"
-                  dataKey="volume" 
-                  fill="#8b5cf6" 
-                  name="Volume"
-                  isAnimationActive={false}
-                  opacity={0.5}
-                />
+                <Bar dataKey="volume" fill="#8b5cf6" name="Volume" isAnimationActive={false} opacity={0.5} />
               )}
-            </BarChart>
-          </ResponsiveContainer>
+            </>
+          </BarChartCore>
         )}
       </CardContent>
     </Card>

@@ -1,8 +1,8 @@
-import React, { useState } from 'react';
-import { useLocation } from 'wouter';
+import React, { useState, Suspense, lazy } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { ArrowLeft, Settings, Play, Download, Target, TrendingUp, BarChart3, Zap, Activity } from 'lucide-react';
 import { useQuery } from '@tanstack/react-query';
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
+const OptimizePerformanceChart = lazy(() => import('@/components/OptimizePerformanceChart'));
 
 // The optimize page now prefers real API data. When the backend has no
 // optimization report available we return empty arrays and show the
@@ -66,7 +66,7 @@ interface OptimizationData {
 }
 
 export default function OptimizePage() {
-  const [, setLocation] = useLocation();
+  const navigate = useNavigate();
   const [selectedStrategy, setSelectedStrategy] = useState('');
   const [isOptimizing, setIsOptimizing] = useState(false);
 
@@ -398,24 +398,13 @@ export default function OptimizePage() {
             <Activity className="w-5 h-5 mr-2 text-blue-400" />
             Optimization Performance
           </h2>
-          <ResponsiveContainer width="100%" height={300}>
-            <LineChart data={Array.from({length: 15}, (_, i) => ({
+          <Suspense fallback={<div className="h-72 flex items-center justify-center">Loading chart…</div>}>
+            <OptimizePerformanceChart data={Array.from({length: 15}, (_, i) => ({
               iteration: i + 1,
               performance: 50 + Math.random() * 30 + i * 2,
               bestPerformance: 50 + i * 2.5
-            }))}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-              <XAxis dataKey="iteration" stroke="#94a3b8" />
-              <YAxis stroke="#94a3b8" />
-              <Tooltip 
-                contentStyle={{ backgroundColor: '#1e293b', border: '1px solid #475569', borderRadius: '8px' }}
-                labelStyle={{ color: '#e2e8f0' }}
-              />
-              <Legend />
-              <Line type="monotone" dataKey="performance" stroke="#3b82f6" strokeWidth={2} name="Current Performance" />
-              <Line type="monotone" dataKey="bestPerformance" stroke="#22c55e" strokeWidth={2} strokeDasharray="5 5" name="Best Performance" />
-            </LineChart>
-          </ResponsiveContainer>
+            }))} />
+          </Suspense>
         </div>
 
         {/* Feature Importance */}

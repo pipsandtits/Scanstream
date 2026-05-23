@@ -2,6 +2,9 @@ import { Router, Request, Response } from 'express';
 import { CacheManager } from '../services/gateway/cache-manager';
 import { RateLimiter } from '../services/gateway/rate-limiter';
 import { ExchangeAggregator } from '../services/gateway/exchange-aggregator';
+import { initAggregator, getAggregator } from '../../src/core/aggregator.singleton';
+import { symbolRegistry } from '../../src/core/SymbolRegistry';
+import { priceCache } from '../../src/core/PriceCache';
 import { CCXTScanner } from '../services/gateway/ccxt-scanner';
 import { LiquidityMonitor } from '../services/gateway/liquidity-monitor';
 import { GasProvider } from '../services/gateway/gas-provider';
@@ -23,67 +26,85 @@ router.use('/metrics', gatewayMetricsRouter);
 // Initialize services
 const cacheManager = new CacheManager(5000);
 const rateLimiter = new RateLimiter();
-const aggregator = new ExchangeAggregator(cacheManager, rateLimiter);
-const ccxtScanner = new CCXTScanner(aggregator, cacheManager, rateLimiter);
-
-// Phase 3: Intelligence Layer
-const liquidityMonitor = new LiquidityMonitor(aggregator, cacheManager);
+let aggregator: ExchangeAggregator | null = null;
+let ccxtScanner: CCXTScanner | null = null;
+let liquidityMonitor: LiquidityMonitor | null = null;
+let securityValidator: SecurityValidator | null = null;
 const gasProvider = new GasProvider(cacheManager);
-const securityValidator = new SecurityValidator(aggregator, liquidityMonitor);
 const signalEngine = new SignalEngine(defaultTradingConfig);
-
-// Initialize aggregator with CCXT and warm cache (non-blocking)
 let isGatewayReady = false;
 
-aggregator.initialize().then(async () => {
-  console.log('[Gateway] Aggregator ready');
-
-  // Initialize TickerCache with exchange list
+async function initializeGateway() {
   try {
-    const { initTickerCache } = await import('../services/ticker-snapshot-cache');
-    const exchanges = (aggregator as any).exchangeDataFeed?.exchanges || new Map();
-    initTickerCache(exchanges, 5000); // 5 second TTL
-    console.log('[Gateway] TickerCache initialized');
-  } catch (err) {
-    console.warn('[Gateway] TickerCache initialization failed:', err);
-    // Continue anyway - ticker cache is optional
-  }
+    aggregator = await initAggregator(cacheManager, rateLimiter);
+    console.log('[Gateway] Aggregator ready (singleton)');
 
-  // Don't block on cache warming - do it in background
-  (async () => {
+    symbolRegistry.populateFromExchanges(aggregator.getExchangeInstances());
+    console.log(`[Gateway] Symbol registry populated: ${symbolRegistry.getAll().length} symbols`);
+
+    ccxtScanner = new CCXTScanner(aggregator, cacheManager, rateLimiter);
+    liquidityMonitor = new LiquidityMonitor(aggregator, cacheManager);
+    securityValidator = new SecurityValidator(aggregator, liquidityMonitor);
+
+    // Initialize TickerCache with exchange list
     try {
-      const { CacheWarmer } = await import('../services/gateway/cache-warmer');
-      const warmer = new CacheWarmer(aggregator);
-
-      // Warm cache on startup (non-blocking)
-      await warmer.warmCache();
-      isGatewayReady = true;
-      console.log('[Gateway] Cache warming complete');
-
-      // Start continuous warming (every 60 seconds)
-      warmer.startContinuousWarming(60000);
+      const { initTickerCache } = await import('../services/ticker-snapshot-cache');
+      const exchanges = aggregator.getExchangeInstances();
+      initTickerCache(exchanges, 5000); // 5 second TTL
+      console.log('[Gateway] TickerCache initialized');
     } catch (err) {
-      console.error('[Gateway] Cache warming failed:', err);
-      // Still mark as ready even if warming fails
-      isGatewayReady = true;
+      console.warn('[Gateway] TickerCache initialization failed:', err);
     }
-  })();
 
-}).catch(err => {
-  console.error('[Gateway] Aggregator initialization failed:', err);
-  isGatewayReady = true; // Mark ready anyway to serve requests
-});
+    // Warm cache in background and keep it refreshed
+    (async () => {
+      try {
+        const { CacheWarmer } = await import('../services/gateway/cache-warmer');
+        const warmer = new CacheWarmer(aggregator);
+        await warmer.warmCache();
+        console.log('[Gateway] Cache warming complete');
+        warmer.startContinuousWarming(60000);
+      } catch (err) {
+        console.error('[Gateway] Cache warming failed:', err);
+      }
+    })();
 
-// Health check endpoint
-router.get('/health', (req: Request, res: Response) => {
-  res.json({
-    status: 'ok',
-    gatewayReady: isGatewayReady,
-    uptime: process.uptime(),
-    memory: process.memoryUsage(),
-    timestamp: new Date().toISOString()
-  });
-});
+    const coreSymbols = [
+      'BTC/USDT','ETH/USDT','SOL/USDT','AVAX/USDT','ADA/USDT',
+      'DOT/USDT','LINK/USDT','XRP/USDT','DOGE/USDT','ATOM/USDT',
+      'ARB/USDT','OP/USDT','AAVE/USDT','UNI/USDT','NEAR/USDT'
+    ].filter(symbol => symbolRegistry.has(symbol));
+
+    const extendedSymbols = symbolRegistry.getAll()
+      .map(cfg => cfg.symbol)
+      .filter(symbol => !coreSymbols.includes(symbol))
+      .slice(0, 50);
+
+    const refreshCoreCache = async () => {
+      await Promise.allSettled(coreSymbols.map(async symbol => {
+        await priceCache.refresh(symbol);
+        await priceCache.refreshCandles(symbol, '1h', 100);
+      }));
+    };
+
+    const refreshExtendedCache = async () => {
+      await Promise.allSettled(extendedSymbols.map(symbol => priceCache.refresh(symbol)));
+    };
+
+    await refreshCoreCache();
+    await refreshExtendedCache();
+
+    setInterval(() => refreshCoreCache().catch(err => console.warn('[Gateway] Core price cache refresh failed:', err)), 30_000);
+    setInterval(() => refreshExtendedCache().catch(err => console.warn('[Gateway] Extended price cache refresh failed:', err)), 60_000);
+
+    isGatewayReady = true;
+  } catch (err) {
+    console.error('[Gateway] Aggregator initialization failed:', err);
+    isGatewayReady = true; // Ensure gateway still responds in degraded mode
+  }
+}
+
+initializeGateway();
 
 // Initialize rate limits for exchanges
 rateLimiter.initExchange('binance', 400);
@@ -105,13 +126,17 @@ setInterval(() => {
   gatewayAlertSystem.checkCachePerformance(cacheStats.hitRate);
 
   // Check exchange health and rate limits
-  const healthStatus = aggregator.getHealthStatus();
-  Object.entries(healthStatus).forEach(([exchange, health]) => {
+  try {
+    const healthStatus = getAggregator().getHealthStatus();
+    Object.entries(healthStatus).forEach(([exchange, health]) => {
     gatewayAlertSystem.checkExchangeHealth(exchange, health);
     if (health.latency > 0) {
       gatewayAlertSystem.checkLatency(exchange, health.latency);
     }
-  });
+    });
+  } catch (e) {
+    // Aggregator not initialized or unavailable — skip health checks
+  }
 
   // Check rate limit usage
   ['binance', 'coinbase', 'kraken', 'kucoinfutures', 'okx', 'bybit'].forEach(exchange => {
@@ -143,14 +168,23 @@ router.get('/health', async (req: Request, res: Response) => {
       bybit: rateLimiter.getStats('bybit')
     };
 
+    if (!aggregator) {
+      return res.status(503).json({
+        status: 'degraded',
+        message: 'Gateway aggregator is not ready',
+        timestamp: new Date().toISOString()
+      });
+    }
+
     const exchangeHealth = aggregator.getHealthStatus();
 
     const healthyCount = Object.values(exchangeHealth).filter(e => e.healthy).length;
     const status = healthyCount === 0 ? 'down' :
-                   healthyCount < 3 ? 'degraded' : 'healthy';
+                 healthyCount < 3 ? 'degraded' : 'healthy';
 
     res.json({
       status,
+      gatewayReady: isGatewayReady,
       exchanges: exchangeHealth,
       rateLimits: rateLimitStats,
       cache: {
@@ -168,7 +202,6 @@ router.get('/health', async (req: Request, res: Response) => {
     });
   }
 });
-
 /**
  * GET /api/gateway/signals
  * Get aggregated signals from gateway with filtering
@@ -193,7 +226,13 @@ router.get('/signals', async (req: Request, res: Response) => {
     }
 
     // Get scanner results and convert to signals
-    const scanResults = await ccxtScanner.scanSymbols(['BTC/USDT', 'ETH/USDT', 'SOL/USDT'], '1h', {});
+    let scanResults: any[] = [];
+    if (ccxtScanner) {
+      scanResults = await ccxtScanner.scanSymbols(['BTC/USDT', 'ETH/USDT', 'SOL/USDT'], '1h', {});
+    } else {
+      console.warn('[Gateway] CCXTScanner unavailable, returning empty scan results');
+      scanResults = [];
+    }
 
     let signals = scanResults
       .filter((result: any) => result.price > 0)
@@ -371,7 +410,8 @@ router.get('/price/:symbol', async (req: Request, res: Response) => {
     symbol = decodeURIComponent(symbol).replace(/%2F/gi, '/');
 
     console.log(`[Gateway] Fetching price for ${symbol}`);
-    const priceData = await aggregator.getAggregatedPrice(symbol);
+    const cached = priceCache.get(symbol);
+    const priceData = cached ?? await aggregator!.getAggregatedPrice(symbol);
 
     // Broadcast price update via WebSocket
     signalWebSocketService.broadcastPriceUpdate(symbol, priceData);
@@ -397,11 +437,15 @@ router.get('/ohlcv/:symbol', async (req: Request, res: Response) => {
 
     console.log(`[Gateway] Fetching OHLCV for ${symbol}, timeframe: ${timeframe}, limit: ${limit}`);
 
-    const ohlcv = await aggregator.getOHLCV(
-      symbol,
-      timeframe as string,
-      parseInt(limit as string)
-    );
+    let ohlcv = priceCache.getCandles(symbol, timeframe as string);
+
+    if (!ohlcv || ohlcv.length === 0) {
+      ohlcv = await aggregator!.getOHLCV(
+        symbol,
+        timeframe as string,
+        parseInt(limit as string)
+      );
+    }
 
     // Add technical indicators to each candle
     // Convert OHLCV data to array format if needed
@@ -2137,7 +2181,8 @@ router.get('/dataframe-validated/:symbol', async (req: Request, res: Response) =
         close: f.price?.close || 0,
         volume: f.volume || 0,
         isFinal: true,
-        source: 'ccxt',
+        source: 'historical',
+        origin: 'ccxt',
         venue: 'gateway'
       }));
 

@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useRef, useEffect } from 'react';
 import { X, Play, BarChart3, TrendingUp, AlertCircle, Download, Settings, Calendar } from 'lucide-react';
 import {
   LineChart,
@@ -44,15 +44,21 @@ export default function BounceBacktestComponent({ onClose }: BounceBacktestCompo
   const [isRunning, setIsRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [equityCurve, setEquityCurve] = useState<any[]>([]);
+  const controllerRef = useRef<AbortController | null>(null);
 
   const runBacktest = async () => {
     setIsRunning(true);
     setError(null);
     try {
+      controllerRef.current?.abort();
+      const controller = new AbortController();
+      controllerRef.current = controller;
+
       const response = await fetch('/api/strategies/bounce/backtest', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(config),
+        signal: controller.signal,
       });
 
       const data = await response.json();
@@ -64,11 +70,18 @@ export default function BounceBacktestComponent({ onClose }: BounceBacktestCompo
         setError(data.error || 'Backtest failed');
       }
     } catch (err) {
+      if ((err as any)?.name === 'AbortError') return;
       setError(err instanceof Error ? err.message : 'Unknown error');
     } finally {
       setIsRunning(false);
     }
   };
+
+  useEffect(() => {
+    return () => {
+      controllerRef.current?.abort();
+    };
+  }, []);
 
   const generateMockEquityCurve = () => {
     const data = [];
