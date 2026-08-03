@@ -225,6 +225,7 @@ export class MarketDataLayer extends EventEmitter implements WorldState {
     // Store in database (redundant if called from IntegrityGate)
     try {
       await storage.createMarketFrame({
+        timeframe: timeframe,
         symbol,
         price: candle.close,
         volume: candle.volume,

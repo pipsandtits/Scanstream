@@ -4,8 +4,7 @@
  */
 
 import { Request, Response, NextFunction } from 'express';
-import pkg from '@prisma/client';
-const { PrismaClient } = pkg as any;
+import { db } from '../db-storage';
 
 // Extended request interface
 export interface AuthRequest extends Request {
@@ -16,7 +15,7 @@ export interface AuthRequest extends Request {
   };
 }
 
-const prisma = new PrismaClient();
+// Use shared `db` instance for database access
 
 // TODO: These tables need to be added to Prisma schema
 // For now, storing in-memory until database tables are created
@@ -283,7 +282,8 @@ export async function generateAuditReport(
  */
 export async function exportUserMetadata(userId: string): Promise<any> {
   try {
-    const user = await prisma.user.findUnique({ where: { id: userId } });
+    const ures = await db.query('SELECT * FROM "User" WHERE id = $1 LIMIT 1', [userId]);
+    const user = ures.rows && ures.rows[0];
     const activity = activityLogsCache.get(userId) || [];
     const security = securitySettingsCache.get(userId) || {};
 
@@ -306,15 +306,7 @@ export async function exportUserMetadata(userId: string): Promise<any> {
 export async function anonymizeUserData(userId: string): Promise<boolean> {
   try {
     const anonymousEmail = `deleted_${userId}@scanstream.local`;
-    
-    await prisma.user.update({
-      where: { id: userId },
-      data: {
-        email: anonymousEmail,
-        firstName: 'Deleted',
-        lastName: 'User'
-      }
-    });
+    await db.query('UPDATE "User" SET email = $1, "firstName" = $2, "lastName" = $3, "updatedAt" = NOW() WHERE id = $4', [anonymousEmail, 'Deleted', 'User', userId]);
 
     return true;
   } catch (error) {

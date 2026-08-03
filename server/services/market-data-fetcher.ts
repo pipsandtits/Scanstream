@@ -8,6 +8,7 @@ import { calculateClusterMetrics } from './clustering';
 import { getTickerCache } from './ticker-snapshot-cache';
 import { getTimeAnchorManager } from './market-data/time-anchor';
 import { priceCache } from '../../src/core/PriceCache';
+import { symbolRegistry } from '../../src/core/SymbolRegistry';
 
 /**
  * Market Data Fetcher Service
@@ -22,6 +23,8 @@ export class MarketDataFetcher {
   private isRunning = false;
   private fetchInterval: NodeJS.Timer | null = null;
   private latestSignals: Map<string, any> = new Map();
+  // Track last fetch timestamp per (symbol:timeframe) to enforce cooldowns
+  private lastFetchTime: Map<string, number> = new Map();
   
   // Track last processed CLOSED candle timestamp per symbol to avoid signal spam
   private lastProcessedCandleTime: Map<string, number> = new Map();
@@ -56,6 +59,16 @@ export class MarketDataFetcher {
 
   // Timeframes to fetch data for - matches multi-timeframe analysis
   private readonly timeframes = ['1m', '5m', '15m', '1h', '4h', '1d'];
+
+  // Per-timeframe cooldowns (milliseconds) to avoid re-fetching slow frames too often
+  private readonly TIMEFRAME_COOLDOWNS: Record<string, number> = {
+    '1m':  60_000,
+    '5m':  5 * 60_000,
+    '15m': 15 * 60_000,
+    '1h':  60 * 60_000,
+    '4h':  4 * 60 * 60_000,
+    '1d':  24 * 60 * 60_000,
+  };
 
   // Candle limits per timeframe (more candles for longer timeframes)
   private readonly candleLimits: { [key: string]: number } = {
@@ -132,6 +145,19 @@ export class MarketDataFetcher {
       this.lastProcessedCandleTime.clear();
       console.log('[MarketDataFetcher] Cleared candle timestamp cache for fresh start');
 
+      // If a symbol registry exists, use it to build a dynamic universe instead of hardcoded seed list
+      try {
+        const regs = symbolRegistry.getAll();
+        if (regs && regs.length > 0) {
+          this.symbols = regs.map(r => r.symbol);
+          console.log(`[MarketDataFetcher] Symbol universe initialized from SymbolRegistry: ${this.symbols.length} symbols`);
+        } else {
+          console.log('[MarketDataFetcher] SymbolRegistry empty — using default seed list');
+        }
+      } catch (e) {
+        console.warn('[MarketDataFetcher] Could not read SymbolRegistry, using default seed list');
+      }
+
       // Seed anchors for all configured symbols/timeframes to avoid runtime discovery during LIVE
       try {
         const anchorMgr = getTimeAnchorManager();
@@ -194,19 +220,22 @@ export class MarketDataFetcher {
     let errorCount = 0;
 
     try {
-      // Fetch data for each symbol in parallel
-      const fetchPromises = this.symbols.map(symbol =>
-        this.fetchSymbolData(symbol)
-          .then(() => {
-            successCount++;
-          })
-          .catch(error => {
-            errorCount++;
-            console.error(`[MarketDataFetcher] Failed to fetch ${symbol}:`, error.message);
-          })
-      );
-
-      await Promise.all(fetchPromises);
+      // Fetch data for each symbol in limited concurrency batches to avoid huge parallel blasts
+      const symbolConcurrency = Math.min(5, Math.max(1, Math.floor(this.symbols.length / 3)));
+      for (let i = 0; i < this.symbols.length; i += symbolConcurrency) {
+        const batch = this.symbols.slice(i, i + symbolConcurrency);
+        const batchPromises = batch.map(symbol =>
+          this.fetchSymbolData(symbol)
+            .then(() => {
+              successCount++;
+            })
+            .catch(error => {
+              errorCount++;
+              console.error(`[MarketDataFetcher] Failed to fetch ${symbol}:`, error.message);
+            })
+        );
+        await Promise.all(batchPromises);
+      }
 
       // Check if all timeframes for all symbols are backfilled
       // If so, transition anchors to ARMED and disable REST polling
@@ -317,17 +346,50 @@ export class MarketDataFetcher {
    */
   private async fetchSymbolData(symbol: string): Promise<void> {
     try {
+      console.debug(`[MarketDataFetcher] [Strategy] Processing ${symbol} frames`);
+      if (!this.signalPipeline) {
+        console.warn('[MarketDataFetcher] No SignalPipeline attached — signal generation will be skipped');
+      }
       const anchorMgr = getTimeAnchorManager();
-
       // Fetch data for each timeframe in parallel with appropriate candle limits
       const results = await Promise.all(
         this.timeframes.map(async (timeframe) => {
           const tf_seconds = this.timeframeToSeconds(timeframe);
           const anchor = anchorMgr.getAnchor(symbol, tf_seconds);
-          // If anchor is already ARMED/LIVE, skip REST fetch for this timeframe
+
+          const cacheKey = `ohlcv:${symbol}:${timeframe}`;
+          const cooldown = this.TIMEFRAME_COOLDOWNS[timeframe] || 60_000;
+          const last = this.lastFetchTime.get(cacheKey) || 0;
+
+          // If anchor is ARMED/LIVE we should prefer cache and avoid REST fetches
           if (anchor && (anchor.mode === 'ARMED' || anchor.mode === 'LIVE')) {
-            return [] as any[];
+            // Attempt to return cached candles (closed+forming) if available
+            const cached = this.cacheManager.get(cacheKey) || priceCache.getCandles(symbol, timeframe);
+            if (cached && Array.isArray(cached) && cached.length > 0) {
+              return cached.slice(-this.getCandleLimit(timeframe));
+            }
+            // No cached data available; fall through to conditional fetch below
           }
+
+          // Enforce per-timeframe cooldown to avoid hammering slow frames
+          if (Date.now() - last < cooldown) {
+            const cached = this.cacheManager.get(cacheKey) || priceCache.getCandles(symbol, timeframe);
+            if (cached && Array.isArray(cached) && cached.length > 0) {
+              // Use cache when still in cooldown window
+              console.debug(`[MarketDataFetcher] Skipping fetch for ${symbol} ${timeframe} (cooldown). Using cache (${cached.length} candles)`);
+              return cached.slice(-this.getCandleLimit(timeframe));
+            }
+            // If cache empty, only allow fetch when anchor is still in BACKFILL mode
+            if (!(anchor && anchor.mode === 'BACKFILL')) {
+              console.debug(`[MarketDataFetcher] Skipping fetch for ${symbol} ${timeframe} due to cooldown and empty cache (not BACKFILL)`);
+              return [];
+            }
+            // Otherwise allow fetch because we're still backfilling historical data
+          }
+
+          // Record attempt time to avoid concurrent callers triggering duplicate fetches
+          this.lastFetchTime.set(cacheKey, Date.now());
+
           return this.fetchOHLCV(symbol, timeframe, this.candleLimits[timeframe] || 100);
         })
       );
@@ -481,6 +543,9 @@ export class MarketDataFetcher {
       console.error(`[MarketDataFetcher] Error fetching ${symbol}:`, error);
       throw error;
     }
+    finally {
+      console.debug(`[MarketDataFetcher] [Strategy] Completed processing ${symbol}`);
+    }
   }
 
   /**
@@ -494,9 +559,19 @@ export class MarketDataFetcher {
     limit: number = 100
   ): Promise<number[][]> {
     try {
-      // Use rate limiter with actual exchange name (not a composite key)
-      // The aggregator will handle which exchange to use internally
-      await this.rateLimiter.acquire('binance', 'normal');
+      // Prefer routing per-symbol to the best venue
+      let preferredVenue: string | undefined = undefined;
+      try {
+        if (typeof (this.aggregator as any).chooseVenueForSymbol === 'function') {
+          preferredVenue = (this.aggregator as any).chooseVenueForSymbol(symbol);
+        }
+      } catch (e) {
+        // ignore
+      }
+      console.debug(`[MarketDataFetcher] preferredVenue for ${symbol} -> ${preferredVenue}`);
+
+      const rateLimiterExchange = preferredVenue || 'binance';
+      await this.rateLimiter.acquire(rateLimiterExchange, 'normal');
 
       // Step 1: Prefer PriceCache (authoritative source)
       try {
@@ -537,7 +612,42 @@ export class MarketDataFetcher {
         console.debug(`[MarketDataFetcher] TickerCache not available: ${tickerInitError.message}`);
       }
 
-      // The aggregator tries exchanges in priority order internally
+      // Prefer Aggregator.getMarketFrames which routes frames through the IntegrityGate
+      // so validated candles are stored and world.tick events are emitted.
+      try {
+        // If we've chosen a preferred venue, try fetching from that venue first (more efficient, preserves liquidity)
+        let frames: any[] | null = null;
+        if (preferredVenue && typeof (this.aggregator as any).getMarketFramesOnVenue === 'function') {
+          try {
+            frames = await (this.aggregator as any).getMarketFramesOnVenue(symbol, timeframe, limit, preferredVenue);
+            console.log(`[MarketDataFetcher] Routed ${symbol} to preferred venue ${preferredVenue}`);
+          } catch (e) {
+            console.debug(`[MarketDataFetcher] Preferred venue ${preferredVenue} failed for ${symbol}:`, (e as any)?.message || e);
+            frames = null;
+          }
+        }
+
+        if (!frames) {
+          frames = await (this.aggregator as any).getMarketFrames(symbol, timeframe, limit);
+        }
+        if (frames && Array.isArray(frames) && frames.length > 0) {
+          console.log(`[MarketDataFetcher] Successfully fetched ${symbol} (${frames.length} frames) via aggregator.getMarketFrames`);
+          // Convert frames to CCXT number[][] format
+          const candles = frames.map((f: any) => [
+            typeof f.timestamp === 'number' ? f.timestamp : (f.timestamp instanceof Date ? f.timestamp.getTime() : Number(f.timestamp)),
+            (f.price && f.price.open) || f.open || 0,
+            (f.price && f.price.high) || f.high || 0,
+            (f.price && f.price.low) || f.low || 0,
+            (f.price && f.price.close) || f.close || 0,
+            f.volume || 0,
+          ]);
+          return candles.slice(-limit);
+        }
+      } catch (aggErr) {
+        console.debug('[MarketDataFetcher] aggregator.getMarketFrames failed, falling back to getOHLCV:', (aggErr as any)?.message || aggErr);
+      }
+
+      // Fallback: The aggregator tries exchanges in priority order internally
       // It returns OHLCVData[] but we need to convert to number[][] format
       const ohlcvData = await (this.aggregator as any).getOHLCV(symbol, timeframe, limit);
 

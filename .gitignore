@@ -23,3 +23,5 @@ checkpoints/
 /.replit
 /data/cache/
 .env
+vfmd_system/venv
+vfmd_system/

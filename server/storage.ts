@@ -33,6 +33,13 @@ export interface IStorage {
   // Market metrics
   getMarketSentiment(): Promise<MarketSentiment>;
   getPortfolioSummary(): Promise<PortfolioSummary>;
+
+  // Scan run persistence (scanner analysis)
+  createScanRun?(scan: { scanId: string; timestamp: string; timeframe?: string; symbolCount?: number; payload: any; }): Promise<any>;
+  getRecentScanRuns?(limit?: number): Promise<any[]>;
+
+  // Convenience: fetch recent market frames
+  getRecentFrames?(limit?: number): Promise<MarketFrame[]>;
   
   // Signal performance tracking
   createSignalPerformance(performance: any): Promise<void>;
@@ -69,6 +76,7 @@ export class MemStorage implements IStorage {
   private decisionEvents: Map<string, any> = new Map();
   private decisionSnapshots: Map<string, any> = new Map();
   private orderAudits: Map<string, any> = new Map();
+  private scanRuns: Map<string, any> = new Map();
   
 
   // Runtime limits and cleanup config
@@ -97,6 +105,8 @@ export class MemStorage implements IStorage {
     const frame: MarketFrame = {
       ...frameData,
       id,
+      // Ensure timeframe is present for snapshot filtering compatibility
+      timeframe: (frameData as any).timeframe ?? 3600,
       timestamp: new Date(),
     };
     this.marketFrames.set(id, frame);
@@ -261,6 +271,24 @@ export class MemStorage implements IStorage {
       dayChange: 5892.31,
       dayChangePercent: 4.84,
     };
+  }
+
+  // ScanRun persistence for MemStorage
+  async createScanRun(scan: { scanId: string; timestamp: string; timeframe?: string; symbolCount?: number; payload: any; }): Promise<any> {
+    const id = scan.scanId ?? randomUUID();
+    const record = { ...scan, scanId: id, timestamp: new Date(scan.timestamp), createdAt: new Date() } as any;
+    this.scanRuns.set(id, record);
+    return record;
+  }
+
+  async getRecentScanRuns(limit = 10): Promise<any[]> {
+    const items = Array.from(this.scanRuns.values()) as any[];
+    items.sort((a, b) => new Date((b as any).timestamp).getTime() - new Date((a as any).timestamp).getTime());
+    return items.slice(0, limit);
+  }
+
+  async getRecentFrames(limit: number = 1000): Promise<MarketFrame[]> {
+    return this.query(this.marketFrames, undefined, limit, (a, b) => new Date((b as any).timestamp).getTime() - new Date((a as any).timestamp).getTime());
   }
 
   // Signal Performance Tracking

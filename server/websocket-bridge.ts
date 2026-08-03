@@ -53,6 +53,12 @@ async function getGate(): Promise<any | null> {
 }
 
 export function initializeWebsocketBridge(server: http.Server, path = wsConfig.path) {
+  // Guard: if called without a valid http.Server, skip initialization
+  if (!server || typeof (server as any).on !== 'function') {
+    logger.warn('initializeWebsocketBridge called without valid http.Server — skipping initialization until server available');
+    return null;
+  }
+
   // Prevent double initialization if called more than once
   try {
     if ((global as any).__ws_bridge_initialized) {
@@ -169,7 +175,7 @@ export function initializeWebsocketBridge(server: http.Server, path = wsConfig.p
         eventNames.forEach((evt) => {
           const cb = (payload: any) => {
             try {
-              broadcast({ type: evt, payload });
+              broadcast({ type: evt, payload, timestamp: Date.now() });
             } catch (e) { /* ignore */ }
           };
           (gate as any).on(evt, cb);

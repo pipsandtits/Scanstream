@@ -24,6 +24,8 @@ export const marketFrames = pgTable("market_frames", {
   id: uuid("id").primaryKey().defaultRandom(),
   timestamp: timestamp("timestamp").notNull().default(sql`now()`),
   symbol: text("symbol").notNull(),
+  // Candle timeframe in seconds (e.g., 60, 300, 3600)
+  timeframe: integer("timeframe").notNull().default(3600),
   price: jsonb("price").notNull(), // { open, high, low, close }
   volume: real("volume").notNull(),
   indicators: jsonb("indicators").notNull(), // RSI, MACD, etc.

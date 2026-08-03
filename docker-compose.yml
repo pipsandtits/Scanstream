@@ -2,76 +2,151 @@
 services:
   db:
     image: postgres:16-alpine
-    restart: always
+    restart: unless-stopped
     environment:
-      POSTGRES_USER: scanuser
-      POSTGRES_PASSWORD: scanpass
-      POSTGRES_DB: scandb
+      POSTGRES_USER: ${POSTGRES_USER:-scanuser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-scanpass}
+      POSTGRES_DB: ${POSTGRES_DB:-scandb}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-scanuser} -d ${POSTGRES_DB:-scandb}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     ports:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+    networks:
+      - scanstream
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "60", "1", "--loglevel", "warning"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - scanstream
 
   scanner:
     build:
       context: .
       dockerfile: Dockerfile.scanner
-    restart: always
+    restart: unless-stopped
     environment:
       FLASK_ENV: production
       PYTHONUNBUFFERED: 1
-    ports:
-      - "5001:5001"
-    volumes:
-      - .:/app
-      - scanner-data:/app/data
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5001/health"]
       interval: 30s
       timeout: 10s
-      retries: 3
-      start_period: 40s
+      retries: 5
+      start_period: 30s
+    ports:
+      - "5001:5001"
+    volumes:
+      - scanner-data:/app/data
+    networks:
+      - scanstream
 
   backend:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
     depends_on:
-      - db
-      - scanner
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      scanner:
+        condition: service_healthy
     environment:
-      DATABASE_URL: postgres://scanuser:scanpass@db:5432/scandb
-      SCANNER_API_URL: http://scanner:5001
-      PORT: 5000
       NODE_ENV: production
+      PORT: 5000
+      HOST: 0.0.0.0
+      DATABASE_URL: postgres://${POSTGRES_USER:-scanuser}:${POSTGRES_PASSWORD:-scanpass}@db:5432/${POSTGRES_DB:-scandb}
+      SCANNER_API_URL: http://scanner:5001
+      REDIS_URL: redis://redis:6379
+      SERVE_FRONTEND: "false"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:5000/api/health >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
     ports:
       - "5000:5000"
-    volumes:
-      - .:/app
-      - /app/node_modules
+    networks:
+      - scanstream
 
-  redis:
-    image: redis:7-alpine
-    restart: always
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
     ports:
-      - "6379:6379"
-    volumes:
-      - redis-data:/data
+      - "3000:80"
+    networks:
+      - scanstream
 
   prometheus:
-    image: prom/prometheus:latest
-    restart: always
+    image: prom/prometheus:v2.53.0
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.enable-lifecycle
     ports:
       - "9090:9090"
     volumes:
       - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus-data:/prometheus
-    command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
     depends_on:
-      - backend
-      - scanner
+      backend:
+        condition: service_healthy
+      scanner:
+        condition: service_healthy
+    networks:
+      - scanstream
+
+  grafana:
+    image: grafana/grafana:11.3.1
+    restart: unless-stopped
+    environment:
+      GF_PATHS_PROVISIONING: /etc/grafana/provisioning
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    ports:
+      - "3001:3000"
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/rl-starter-dashboard.json:/etc/grafana/provisioning/dashboards/scanstream-overview.json:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      prometheus:
+        condition: service_started
+    networks:
+      - scanstream
 
 volumes:
   pgdata:
   scanner-data:
   redis-data:
   prometheus-data:
+  grafana-data:
+
+networks:
+  scanstream:
+    driver: bridge

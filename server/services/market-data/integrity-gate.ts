@@ -234,7 +234,7 @@ export class IntegrityGate extends EventEmitter {
         if ((validCandle as any).marketMicrostructure) {
           marketFrame.marketMicrostructure = (validCandle as any).marketMicrostructure;
           
-          // 🔄 Signal microstructure readiness to mode detector
+          // Signal microstructure readiness to mode detector
           // Once we have populated microstructure data, LIVE mode becomes possible
           const modeDetector = getModeDetector();
           const micro = (validCandle as any).marketMicrostructure;
@@ -252,7 +252,7 @@ export class IntegrityGate extends EventEmitter {
         }
 
         // ATOMIC OPERATION: Store THEN emit tick
-        // INVARIANT: A world tick is emitted IFF storage succeeded
+        // INVARIANT: A world tick is emitted IF storage succeeded
           try {
           // 1. Store to database/memory (MUST succeed first) and capture saved id
           const savedFrame = await storage.createMarketFrame(marketFrame);
@@ -268,7 +268,7 @@ export class IntegrityGate extends EventEmitter {
           const emitTime = Date.now();
           const lag = emitTime - worldTime;
 
-          // 🔴 TEMPORAL HYGIENE CHECKS
+          // TEMPORAL HYGIENE CHECKS
           const liveEpoch = getLiveEpoch();
           // Consider this candle historical if explicitly marked OR it predates LIVE start
           const candleIsHistorical = ((validCandle as any).source === 'historical') || liveEpoch.isHistorical(validCandle.ts);
@@ -339,10 +339,27 @@ export class IntegrityGate extends EventEmitter {
 
           ticks.push(tick);
           this.emit('world.tick', tick);
+          // Bridge: also emit on the Market Data Layer singleton so agents
+          // subscribed to MDL receive world.tick events.
+          (async () => {
+            try {
+              const { getMarketDataLayer } = await import('./market-data-layer');
+              const mdl = getMarketDataLayer();
+              try {
+                mdl.emit('world.tick', tick);
+                console.debug('[IntegrityGate] bridged world.tick to MDL');
+              } catch (e) {
+                // Non-fatal: MDL listeners may error; don't disrupt integrity flow
+                console.debug('[IntegrityGate] failed to emit world.tick on MDL:', (e as any)?.message || e);
+              }
+            } catch (e) {
+              // MDL may not be initialized yet in some startup sequences
+            }
+          })();
 
           // Log with explicit mode label
-          const modeLabel = mode === Mode.LIVE ? `mode=${mode}` : `mode=${mode}`;
-          const historicalLabel = isHistorical ? ' [HISTORICAL]' : '';
+          const modeLabel = `mode=${mode}`;
+          const historicalLabel = candleIsHistorical ? ' [HISTORICAL]' : '';
           const exchangeLabel = exchange ? ` [${exchange}]` : '';
           console.log(
             `[IntegrityGate] ✅ World Tick: ${symbol} ${timeframe}s ` +

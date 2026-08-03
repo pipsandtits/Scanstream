@@ -1,6 +1,4 @@
 
-import pkg from '@prisma/client';
-const { PrismaClient } = pkg as any;
 import type { PrismaClient as PrismaClientType } from '@prisma/client';
 
 interface ArchivedSignal {

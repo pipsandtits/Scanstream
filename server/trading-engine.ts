@@ -81,6 +81,20 @@ try {
 } catch (e) {
   // yfinance not installed, fallback will throw if used
 }
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+let exchangeConfig: any = {};
+try {
+  const cfgPath = path.resolve(__dirname, '../config/exchange-config.json');
+  exchangeConfig = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+} catch (e) {
+  console.warn('[Config] Could not load exchange-config.json:', (e as any)?.message || String(e));
+}
 
 // Adapter to mimic ccxt Exchange for yfinance
 class YFinanceForexAdapter {
@@ -1043,7 +1057,9 @@ class ExchangeDataFeed {
       // Try to load from cache first
       if (fs.existsSync(cacheFile)) {
         const cacheAge = Date.now() - fs.statSync(cacheFile).mtime.getTime();
-        const maxCacheAge = 24 * 60 * 60 * 1000; // 24 hours
+        // Allow shorter cache lifetimes (default 5 hours) to pick up new markets
+        const maxCacheAgeHours = process.env.EXCHANGE_MARKETS_CACHE_HOURS ? parseInt(process.env.EXCHANGE_MARKETS_CACHE_HOURS, 10) : 5;
+        const maxCacheAge = maxCacheAgeHours * 60 * 60 * 1000; // in ms
         
         if (cacheAge < maxCacheAge) {
           console.log(`[CACHE] Loading markets for ${exchangeName} from cache (${Math.round(cacheAge / 1000 / 60)} minutes old)`);
@@ -1230,7 +1246,7 @@ class ExchangeDataFeed {
    */
   private async initializeExchanges() {
     try {
-      const config = (await import('../config/exchange-config.json', { with: { type: 'json' } })).default;
+      const config = exchangeConfig;
       // --- Crypto Exchanges ---
       // Initialize all exchanges with proper rate limiting and throttler verification
       const cryptoExchanges = [
@@ -1373,10 +1389,22 @@ class ExchangeDataFeed {
     }
     try {
       // Use kucoinfutures as main if present in config
-      const config = (await import('../config/exchange-config.json', { with: { type: 'json' } })).default;
+      const config = exchangeConfig;
       let mainExchange = 'kucoinfutures';
       if (exchangeName && this.exchanges.has(exchangeName)) {
-        mainExchange = exchangeName;
+        // Only use the provided exchangeName if the exchange actually lists the symbol
+        const candidate = this.exchanges.get(exchangeName) as any;
+        try {
+          const markets = candidate?.markets || {};
+          if (markets[symbol] || markets[symbol.replace('/', '')]) {
+            mainExchange = exchangeName;
+          } else {
+            console.debug(`[ExchangeDataFeed] Requested exchange '${exchangeName}' does not list ${symbol}, ignoring preferred exchange`);
+          }
+        } catch (e) {
+          // If checking markets fails, don't force the override
+          console.debug('[ExchangeDataFeed] Error checking exchange markets for preferred exchange:', (e as any)?.message || e);
+        }
       } else if (config.kucoinfutures?.main) {
         mainExchange = 'kucoinfutures';
       } else if (config.oanda?.enabled) {
@@ -1516,7 +1544,8 @@ class ExchangeDataFeed {
       });
 
       // 🔄 CALCULATE TOXICITY AND UPDATE FRAMES
-      const signalEngine = new SignalEngine(defaultTradingConfig);
+      // Use a singleton SignalEngine so microstructure history persists across fetches
+      const signalEngine = getSignalEngine();
       const enrichedFrames = frames.map((frame, index) => {
         const avg = signalEngine.getAverageMicrostructure(frame.symbol);
         const prev = index > 0 ? frames[index - 1]?.marketMicrostructure : signalEngine.getPreviousMicrostructure(frame.symbol);
@@ -1586,7 +1615,7 @@ class ExchangeDataFeed {
         const result = await gate.storeValidatedCandles(
           symbol,
           timeframeSeconds,
-          candles,
+          candles as any,
           mainExchange  // Pass exchange for time authority validation
         );
 
@@ -1598,6 +1627,9 @@ class ExchangeDataFeed {
         // ✅ Integrity gate already stored validated candles
         // ✅ Integrity gate already emitted 'world.tick' events
         // ✅ No need to call storage.createMarketFrame() again!
+
+        // Helpful operational log for downstream strategy processing visibility
+        console.log(`[Strategy] Processing ${symbol}: ${enrichedFrames.length} frames ready for analysis`);
         
         // Log rejected candles as warnings
         if (result.rejected.length > 0) {
@@ -1649,18 +1681,18 @@ class ExchangeDataFeed {
     }
     return status;
   }
+
+  /**
+   * Return the underlying exchange instances map for consumers
+   */
+  getExchangeInstances(): Map<string, ccxt.Exchange> {
+    return this.exchanges;
+  }
 }
 
 /**
  * Default trading configuration.
  */
-
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 
 function loadTradingConfig(): TradingConfig {
   const configPath = path.resolve(__dirname, '../config/trading-config.json');
@@ -1669,5 +1701,14 @@ function loadTradingConfig(): TradingConfig {
 }
 
 const defaultTradingConfig: TradingConfig = loadTradingConfig();
+
+// Singleton SignalEngine accessor to preserve microstructure history across calls
+let globalSignalEngine: SignalEngine | null = null;
+export function getSignalEngine(): SignalEngine {
+  if (!globalSignalEngine) {
+    globalSignalEngine = new SignalEngine(defaultTradingConfig);
+  }
+  return globalSignalEngine;
+}
 
 export { TechnicalIndicators, SignalEngine, ExchangeDataFeed, defaultTradingConfig };

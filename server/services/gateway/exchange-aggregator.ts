@@ -13,7 +13,7 @@ import type { PriceData, OHLCVData, ExchangeHealth } from '../../types/gateway';
  * - Health monitoring
  */
 export class ExchangeAggregator {
-  private exchangeDataFeed: ExchangeDataFeed | null = null;
+  private exchangeDataFeed: any = null;
   private cache: CacheManager;
   private rateLimiter: RateLimiter;
   private healthStatus: Map<string, ExchangeHealth>;
@@ -62,7 +62,7 @@ export class ExchangeAggregator {
     if (!this.exchangeDataFeed) {
       return new Map();
     }
-    return this.exchangeDataFeed.getExchangeInstances();
+    return (this.exchangeDataFeed as any).getExchangeInstances ? (this.exchangeDataFeed as any).getExchangeInstances() : new Map();
   }
 
   /**
@@ -108,42 +108,34 @@ export class ExchangeAggregator {
     const prices: Array<{ exchange: string; price: number; timestamp: Date }> = [];
     const errors: string[] = [];
 
-    // Fetch from all healthy exchanges in parallel
-    const fetchPromises = this.exchangePriority
-      .filter(exchange => this.isExchangeHealthy(exchange))
-      .map(async (exchange) => {
-        try {
-          await this.rateLimiter.acquire(exchange, 'high');
-          
-          const startTime = Date.now();
-          const frames = await this.exchangeDataFeed!.fetchMarketData(
-            symbol, 
-            '1m', 
-            1, 
-            exchange
-          );
-          
-          const latency = Date.now() - startTime;
-          this.updateExchangeHealth(exchange, true, latency);
-          
-          if (frames && frames.length > 0) {
-            const price = (frames[0].price as any).close;
-            prices.push({
-              exchange,
-              price,
-              timestamp: new Date()
-            });
-          }
-        } catch (error: any) {
-          this.updateExchangeHealth(exchange, false, 0, error);
-          errors.push(`${exchange}: ${error.message}`);
+    // Prefer the chosen venue first and then try other healthy exchanges sequentially
+    const preferred = this.chooseVenueForSymbol(symbol);
+    const healthy = this.exchangePriority.filter(exchange => this.isExchangeHealthy(exchange));
+    const candidates = preferred ? [preferred, ...healthy.filter(e => e !== preferred)] : healthy;
+
+    const maxSources = Math.min(3, candidates.length); // stop after collecting up to 3 sources
+
+    for (const exchange of candidates) {
+      if (prices.length >= maxSources) break;
+      try {
+        await this.rateLimiter.acquire(exchange, 'high');
+        const startTime = Date.now();
+        const frames = await this.exchangeDataFeed!.fetchMarketData(symbol, '1m', 1, exchange);
+        const latency = Date.now() - startTime;
+        this.updateExchangeHealth(exchange, true, latency);
+
+        if (frames && frames.length > 0) {
+          const price = (frames[0].price as any).close;
+          prices.push({ exchange, price, timestamp: new Date() });
         }
-      });
+      } catch (error: any) {
+        this.updateExchangeHealth(exchange, false, 0, error);
+        errors.push(`${exchange}: ${error.message}`);
+        // continue to next candidate
+      }
+    }
 
-    await Promise.allSettled(fetchPromises);
-
-    // Need at least 2 sources for confidence
-    if (prices.length < 2) {
+    if (prices.length === 0) {
       throw new Error(`Insufficient price sources: ${prices.length}. Errors: ${errors.join(', ')}`);
     }
 
@@ -152,13 +144,15 @@ export class ExchangeAggregator {
     const medianPrice = priceValues[Math.floor(priceValues.length / 2)];
 
     // Calculate deviation
-    const maxDeviation = Math.max(...priceValues.map(p => Math.abs(p - medianPrice) / medianPrice));
+    const maxDeviation = Math.max(...priceValues.map(p => Math.abs(p - medianPrice) / (medianPrice || 1)));
 
     // Confidence score based on agreement and number of sources
-    const confidence = Math.min(100, 
+    let confidence = Math.min(100,
       (1 - maxDeviation) * 70 + // Agreement weight
       (prices.length / this.exchangePriority.length) * 30 // Source diversity weight
     );
+    // If only single source, degrade confidence to reflect low redundancy
+    if (prices.length === 1) confidence = Math.min(confidence, 40);
 
     const result: PriceData = {
       symbol,
@@ -222,7 +216,7 @@ export class ExchangeAggregator {
         this.updateExchangeHealth(exchange, true, latency);
 
         // Convert to OHLCV format
-        const ohlcv: OHLCVData[] = frames.map(frame => ({
+        const ohlcv: OHLCVData[] = frames.map((frame: any) => ({
           timestamp: new Date(frame.timestamp).getTime(),
           open: (frame.price as any).open,
           high: (frame.price as any).high,
@@ -298,7 +292,7 @@ export class ExchangeAggregator {
           const gate = getIntegrityGate();
 
           // Convert to candle format
-          const candles = frames.map(f => ({
+          const candles = frames.map((f: any) => ({
             ts: Math.floor((f.timestamp || Date.now()) as number),
             open: (f.price as any)?.open || (f as any).open || 0,
             high: (f.price as any)?.high || (f as any).high || 0,
@@ -318,7 +312,7 @@ export class ExchangeAggregator {
           const result = await gate.storeValidatedCandles(
             symbol,
             timeframeSeconds,
-            candles
+            candles as any
           );
 
           if (result.rejected.length > 0 || result.gaps.length > 0) {
@@ -329,10 +323,10 @@ export class ExchangeAggregator {
           }
 
           // Return validated frames (map back to original format)
-          const validatedFrames = frames.filter(f => {
+          const validatedFrames = frames.filter((f: any) => {
             const fTimestamp = typeof f.timestamp === 'string' ? new Date(f.timestamp).getTime() : 
                              f.timestamp instanceof Date ? f.timestamp.getTime() : f.timestamp;
-            return result.stored.some(c => c.ts === fTimestamp);
+            return result.stored.some((c: any) => c.ts === fTimestamp);
           });
 
           return validatedFrames.length > 0 ? validatedFrames : frames;
@@ -352,6 +346,105 @@ export class ExchangeAggregator {
     }
 
     throw new Error(`Failed to fetch market frames for ${symbol}`);
+  }
+
+  /**
+   * Choose the best venue for a given symbol based on available market metadata (volume/depth).
+   * Returns an exchange name or undefined if no clear candidate.
+   */
+  chooseVenueForSymbol(symbol: string): string | undefined {
+    if (!this.exchangeDataFeed) return undefined;
+        const instancesRaw = (this.exchangeDataFeed as any).getExchangeInstances ? (this.exchangeDataFeed as any).getExchangeInstances() : new Map();
+        const instances: Map<string, any> = instancesRaw as Map<string, any>;
+    let best: { exchange?: string; score: number } = { score: -1 };
+
+    for (const [name, exchange] of Array.from(instances.entries())) {
+      try {
+        const markets: any = (exchange as any).markets || {};
+        // Direct match
+        if (markets[symbol]) {
+          const info = markets[symbol].info || {};
+          const vol = Number(info.quoteVolume || info.quoteVolume24h || info.quoteVolume_24h || info.volume || 0) || 0;
+          const score = vol;
+          if (score > best.score) best = { exchange: name, score };
+          continue;
+        }
+
+        // Try common variant without slash
+        const compact = symbol.replace('/', '');
+        if (markets[compact]) {
+          const info = markets[compact].info || {};
+          const vol = Number(info.quoteVolume || info.quoteVolume24h || info.volume || 0) || 0;
+          const score = vol * 0.9; // slightly de-prioritize heuristics
+          if (score > best.score) best = { exchange: name, score };
+        }
+      } catch (e) {
+        // ignore
+      }
+    }
+
+    if (best.score > 0 && best.exchange) return best.exchange;
+
+    // Fallback: prefer configured priority order when volumes are not available
+    for (const p of this.exchangePriority) {
+      const instancesMap = (this.exchangeDataFeed as any).getExchangeInstances ? (this.exchangeDataFeed as any).getExchangeInstances() : new Map();
+      if (instancesMap.has(p)) {
+        const ex = instancesMap.get(p) as any;
+        if (ex && ex.markets && (ex.markets[symbol] || ex.markets[symbol.replace('/', '')])) {
+          return p;
+        }
+      }
+    }
+
+    // If still not found, distribute load by rotating preferred exchanges
+    // Use a deterministic hash of the symbol so requests spread evenly across exchanges
+    const preferredOrder = ['binance', 'okx', 'bybit', 'kucoinfutures'];
+    const available = preferredOrder.filter(p => instances.has(p));
+    if (available.length === 0) {
+      // fallback to any available exchange instance
+      const any = instances.keys().next();
+      return any.done ? undefined : any.value;
+    }
+
+    // simple djb2-ish hash
+    let h = 5381;
+    for (let i = 0; i < symbol.length; i++) {
+      h = ((h << 5) + h) + symbol.charCodeAt(i);
+      h = h & 0xffffffff;
+    }
+    const start = Math.abs(h) % available.length;
+    console.debug(`[Aggregator] hash=${h} available=${available.join(',')} startIdx=${start}`);
+
+    // Rotate through available preferred exchanges and return the first that actually lists the symbol
+    for (let i = 0; i < available.length; i++) {
+      const idx = (start + i) % available.length;
+      const exName = available[idx];
+      try {
+        const ex = instances.get(exName) as any;
+        const markets = ex?.markets || {};
+        console.debug(`[Aggregator] checking ${exName} markets for ${symbol}: has=${Boolean(markets[symbol] || markets[symbol.replace('/', '')])}`);
+        if (markets[symbol] || markets[symbol.replace('/', '')]) return exName;
+      } catch (e) { /* ignore malformed instances */ }
+    }
+
+    // Last resort: return deterministic preferred exchange even if it may not list the symbol
+    return available[start];
+  }
+
+  /**
+   * Fetch market frames from a specific venue (exchange name). Useful to route symbol to best venue.
+   */
+  async getMarketFramesOnVenue(symbol: string, timeframe: string = '1m', limit: number = 100, venue?: string) {
+    if (!this.exchangeDataFeed) throw new Error('ExchangeAggregator not initialized');
+    if (!venue) return this.getMarketFrames(symbol, timeframe, limit);
+
+    try {
+      const frames = await this.exchangeDataFeed.fetchMarketData(symbol, timeframe, limit, venue);
+      // Map to same return format as getMarketFrames (no integrity processing here)
+      return frames;
+    } catch (e) {
+      throw e;
+    }
   }
 
   /**

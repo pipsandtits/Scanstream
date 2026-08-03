@@ -69,6 +69,23 @@ export class BinanceDataFetcher {
   private baseURL = 'https://api.binance.com/api/v3';
   private maxCandlesPerRequest = 1000; // Binance limit
   private ccxtExchange: any = null; // Lazy-loaded CCXT exchange
+  // Per-symbol+timeframe last fetch tracking to avoid refetching slow timeframes too often
+  private lastFetchTime: Map<string, number> = new Map();
+
+  private static readonly TIMEFRAME_COOLDOWNS: Record<string, number> = {
+    '1m': 60_000,
+    '3m': 3 * 60_000,
+    '5m': 5 * 60_000,
+    '15m': 15 * 60_000,
+    '30m': 30 * 60_000,
+    '1h': 60 * 60_000,
+    '2h': 2 * 60 * 60_000,
+    '4h': 4 * 60 * 60_000,
+    '6h': 6 * 60 * 60_000,
+    '8h': 8 * 60 * 60_000,
+    '12h': 12 * 60 * 60_000,
+    '1d': 24 * 60 * 60_000
+  };
 
   // All supported timeframes from 1m to 1d
   private readonly allTimeframes = [
@@ -125,6 +142,20 @@ export class BinanceDataFetcher {
       const timeframeData = new Map<string, MarketDataWithOrderFlow[]>();
 
       for (const timeframe of this.allTimeframes) {
+        // Per-timeframe cooldown: skip refetching slow timeframes too often
+        try {
+          const key = `${symbol}:${timeframe}`;
+          const last = this.lastFetchTime.get(key) || 0;
+          const cooldown = BinanceDataFetcher.TIMEFRAME_COOLDOWNS[timeframe] ?? 60_000;
+          if (Date.now() - last < cooldown) {
+            console.debug(`  ⏭ Skipping ${symbol} @ ${timeframe} (cooldown)`);
+            continue;
+          }
+          // mark attempted fetch time to avoid thundering herd
+          this.lastFetchTime.set(key, Date.now());
+        } catch (e) {
+          // non-fatal
+        }
         try {
           console.log(`  📍 ${symbol} @ ${timeframe}...`);
           

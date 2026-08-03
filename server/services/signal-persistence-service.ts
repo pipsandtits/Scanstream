@@ -10,10 +10,8 @@
  * Enables feedback loop: actual signal effectiveness → dynamic accuracy adjustment
  */
 
-import pkg from '@prisma/client';
-const { PrismaClient } = pkg as any;
-
-const prisma = new PrismaClient();
+import { db } from '../db-storage';
+const prisma: any = (db as any).prisma || null;
 
 export interface SignalRecord {
   symbol: string;

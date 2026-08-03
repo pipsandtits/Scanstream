@@ -4,11 +4,9 @@
  */
 
 import { Request, Response } from 'express';
-import pkg from '@prisma/client';
-const { PrismaClient } = pkg as any;
+import { db } from '../db-storage';
 import crypto from 'crypto';
-
-const prisma = new PrismaClient();
+import { randomUUID } from 'crypto';
 
 // In-memory caches for settings. Preferences and API keys are persisted to the DB;
 // remaining caches are kept in-memory as fallbacks and can be migrated later.
@@ -42,24 +40,10 @@ export async function updateProfile(req: AuthRequest, res: Response) {
     }
 
     // Update user in database
-    const updatedUser = await prisma.user.update({
-      where: { id: userId },
-      data: {
-        email: email || undefined,
-        firstName: firstName || undefined,
-        lastName: lastName || undefined
-      }
-    });
+    const updRes = await db.query('UPDATE "User" SET email = COALESCE($1, email), "firstName" = COALESCE($2, "firstName"), "lastName" = COALESCE($3, "lastName"), "updatedAt" = NOW() WHERE id = $4 RETURNING *', [email || null, firstName || null, lastName || null, userId]);
+    const updatedUser = updRes.rows && updRes.rows[0];
 
-    res.json({ 
-      success: true, 
-      user: {
-        id: updatedUser.id,
-        email: updatedUser.email,
-        firstName: updatedUser.firstName,
-        lastName: updatedUser.lastName
-      }
-    });
+    res.json({ success: true, user: { id: updatedUser.id, email: updatedUser.email, firstName: updatedUser.firstName, lastName: updatedUser.lastName } });
   } catch (error: any) {
     console.error('Update profile error:', error);
     res.status(500).json({ error: 'Failed to update profile' });
@@ -84,9 +68,8 @@ export async function changePassword(req: AuthRequest, res: Response) {
     }
 
     // Get user to verify they exist
-    const user = await prisma.user.findUnique({
-      where: { id: userId }
-    });
+    const ures = await db.query('SELECT * FROM "User" WHERE id = $1 LIMIT 1', [userId]);
+    const user = ures.rows && ures.rows[0];
 
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
@@ -108,9 +91,7 @@ export async function deleteAccount(req: AuthRequest, res: Response) {
     if (!userId) return res.status(401).json({ error: 'Unauthorized' });
 
     // Delete user
-    await prisma.user.delete({
-      where: { id: userId }
-    });
+    await db.query('DELETE FROM "User" WHERE id = $1', [userId]);
 
     // DB cascade will remove related ApiKeys / Preferences; clear in-memory fallbacks
     userSettingsCache.delete(userId);
@@ -136,9 +117,9 @@ export async function getPreferences(req: AuthRequest, res: Response) {
     if (!userId) return res.status(401).json({ error: 'Unauthorized' });
 
     // Prefer persisted preferences when available
-    const dbPref = await prisma.userPreference.findUnique({ where: { userId } });
+    const dbPrefRes = await db.query('SELECT * FROM "UserPreference" WHERE "userId" = $1 LIMIT 1', [userId]);
+    const dbPref = dbPrefRes.rows && dbPrefRes.rows[0];
     if (dbPref) {
-      // return only preference fields
       const { theme, defaultTimeframe, defaultExchange, notificationsEnabled, emailAlerts, priceAlerts, signalAlerts, soundEnabled } = dbPref;
       return res.json({ theme, defaultTimeframe, defaultExchange, notificationsEnabled, emailAlerts, priceAlerts, signalAlerts, soundEnabled });
     }
@@ -178,11 +159,21 @@ export async function updatePreferences(req: AuthRequest, res: Response) {
       soundEnabled: typeof req.body.soundEnabled === 'boolean' ? req.body.soundEnabled : true,
     };
 
-    await prisma.userPreference.upsert({
-      where: { userId },
-      update: payload,
-      create: { userId, ...payload }
-    });
+    // Upsert preferences via SQL
+    await db.query(
+      `INSERT INTO "UserPreference" ("userId", theme, "defaultTimeframe", "defaultExchange", "notificationsEnabled", "emailAlerts", "priceAlerts", "signalAlerts", "soundEnabled")
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+       ON CONFLICT ("userId") DO UPDATE SET
+         theme = EXCLUDED.theme,
+         "defaultTimeframe" = EXCLUDED."defaultTimeframe",
+         "defaultExchange" = EXCLUDED."defaultExchange",
+         "notificationsEnabled" = EXCLUDED."notificationsEnabled",
+         "emailAlerts" = EXCLUDED."emailAlerts",
+         "priceAlerts" = EXCLUDED."priceAlerts",
+            "signalAlerts" = EXCLUDED."signalAlerts",
+            "soundEnabled" = EXCLUDED."soundEnabled"
+          `, [userId, payload.theme, payload.defaultTimeframe, payload.defaultExchange, payload.notificationsEnabled, payload.emailAlerts, payload.priceAlerts, payload.signalAlerts, payload.soundEnabled]
+    );
 
     // keep in-memory fallback in sync
     userPreferencesCache.set(userId, payload);
@@ -350,7 +341,8 @@ export async function getLoginSessions(req: AuthRequest, res: Response) {
 
     // Try persisted sessions from Prisma `Session` table. The session JSON structure
     // is app-dependent; we'll parse stored `sess` JSON and filter by userId when available.
-    const dbSessions = await prisma.session.findMany({ take: 1000 });
+    const dbSessionsRes = await db.query('SELECT sid, sess, expire FROM "Session" ORDER BY "expire" DESC LIMIT 1000');
+    const dbSessions = dbSessionsRes.rows || [];
     const sessions: any[] = [];
     for (const s of dbSessions) {
       try {
@@ -417,12 +409,11 @@ export async function exportUserData(req: AuthRequest, res: Response) {
     const userId = req.user?.id;
     if (!userId) return res.status(401).json({ error: 'Unauthorized' });
 
-    const user = await prisma.user.findUnique({
-      where: { id: userId }
-    });
+    const userRes = await db.query('SELECT * FROM "User" WHERE id = $1 LIMIT 1', [userId]);
+    const user = userRes.rows && userRes.rows[0];
 
-    const dbPref = await prisma.userPreference.findUnique({ where: { userId } });
-
+    const dbPrefRes = await db.query('SELECT * FROM "UserPreference" WHERE "userId" = $1 LIMIT 1', [userId]);
+    const dbPref = dbPrefRes.rows && dbPrefRes.rows[0];
     const exportData = {
       exportDate: new Date().toISOString(),
       user: {
@@ -462,8 +453,8 @@ export async function getApiKeys(req: AuthRequest, res: Response) {
     const userId = req.user?.id;
     if (!userId) return res.status(401).json({ error: 'Unauthorized' });
 
-    const keys = await prisma.apiKey.findMany({ where: { userId }, orderBy: { createdAt: 'desc' } });
-    // Mask apiKey before returning
+    const keysRes = await db.query('SELECT id, exchange, name, "isTestnet", "isActive", "createdAt", "lastValidated", "apiKey" FROM "ApiKey" WHERE "userId" = $1 ORDER BY "createdAt" DESC', [userId]);
+    const keys = keysRes.rows || [];
     const masked = keys.map((k: any) => ({ id: k.id, exchange: k.exchange, name: k.name, isTestnet: k.isTestnet, isActive: k.isActive, createdAt: k.createdAt, lastValidated: k.lastValidated, apiKey: maskApiKey(k.apiKey) }));
     res.json(masked);
   } catch (error: any) {
@@ -483,17 +474,9 @@ export async function addApiKey(req: AuthRequest, res: Response) {
       return res.status(400).json({ error: 'Missing required fields' });
     }
 
-    const created = await prisma.apiKey.create({
-      data: {
-        userId,
-        exchange,
-        name,
-        apiKey,
-        apiSecret,
-        isTestnet: Boolean(isTestnet),
-        isActive: true
-      }
-    });
+    const id = randomUUID();
+    const inserted = await db.query('INSERT INTO "ApiKey" (id, "userId", exchange, name, "apiKey", "apiSecret", "isTestnet", "isActive", permissions, "createdAt") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW()) RETURNING *', [id, userId, exchange, name, apiKey, apiSecret, Boolean(isTestnet), true, []]);
+    const created = inserted.rows && inserted.rows[0];
 
     // update in-memory fallback
     const mem = apiKeysCache.get(userId) || [];
@@ -513,15 +496,12 @@ export async function deleteApiKey(req: AuthRequest, res: Response) {
     if (!userId) return res.status(401).json({ error: 'Unauthorized' });
 
     const { keyId } = req.params;
-    const result = await prisma.apiKey.deleteMany({ where: { id: keyId, userId } });
-    // update in-memory fallback
-    if (result.count > 0) {
+    const delRes = await db.query('DELETE FROM "ApiKey" WHERE id = $1 AND "userId" = $2 RETURNING id', [keyId, userId]);
+    if (delRes.rows && delRes.rows.length > 0) {
       const keys = apiKeysCache.get(userId) || [];
       apiKeysCache.set(userId, keys.filter((k: any) => k.id !== keyId));
       return res.json({ success: true });
     }
-
-    // If none deleted, still respond success for idempotency
     res.json({ success: true });
   } catch (error: any) {
     console.error('Delete API key error:', error);

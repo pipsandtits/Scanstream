@@ -43,6 +43,8 @@ class SimpleFallbackStorage implements IStorage {
     const frame: MarketFrame = {
       ...frameData,
       id,
+      // Ensure timeframe is always present in fallback storage (defaults to 1h)
+      timeframe: (frameData as any).timeframe ?? 3600,
       timestamp: new Date(),
     };
     this.marketFrames.set(id, frame);
@@ -315,25 +317,72 @@ export class DbStorage implements IStorage {
   private prisma: PrismaClientType | any;
   private fallback: IStorage = new SimpleFallbackStorage();
   private isConnected: boolean = false;
+  private ready: Promise<void> | null = null;
   // Use Phase5 event bridge to broadcast fallback events for observability
   private eventBridge: any;
 
+  private isReady(): boolean {
+    return this.isConnected && !!this.prisma;
+  }
+
+  private async tryPrismaCreate(modelNames: string[], data: any) {
+    for (const name of modelNames) {
+      try {
+        const model = (this.prisma as any)[name];
+        if (model && typeof model.create === 'function') {
+          return await model.create({ data });
+        }
+      } catch (_) {
+        // try next
+      }
+    }
+    throw new Error('prisma_create_failed');
+  }
+
+  private async tryPrismaFindMany(modelNames: string[], args: any) {
+    for (const name of modelNames) {
+      try {
+        const model = (this.prisma as any)[name];
+        if (model && typeof model.findMany === 'function') {
+          return await model.findMany(args || {});
+        }
+      } catch (_) {
+        // try next
+      }
+    }
+    throw new Error('prisma_findmany_failed');
+  }
+
   constructor() {
-    this.prisma = new PrismaClient({
-      errorFormat: 'minimal',
-    });
+    try {
+      this.prisma = new PrismaClient({
+        errorFormat: 'minimal',
+      });
+    } catch (e) {
+      // Prisma client construction failed (e.g., missing adapter/accelerateUrl)
+      this.prisma = null as any;
+      this.isConnected = false;
+      console.warn('[DbStorage] Prisma client construction failed, using in-memory fallback:', (e as any).message || e);
+      this.reportFallback('prisma_client_construction_failed', { message: (e as any).message || String(e) });
+    }
     try { this.eventBridge = require('./services/phase5-event-bridge').phase5EventBridge; } catch (e) { this.eventBridge = null; }
-    this.testConnection();
+    // start connection check and expose readiness promise
+    this.ready = this.testConnection();
     // Ensure fallback queue directory exists
     try {
       const dir = path.join(process.cwd(), 'data');
       if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
     } catch (e) {}
-    // Periodic flush if reconnected
-    setInterval(() => {
-      if (this.isConnected) {
-        this.flushFallbackQueue().catch(() => {});
-      }
+    // Periodic connectivity check + flush when connected
+    setInterval(async () => {
+      try {
+        if (!this.isConnected && this.prisma) {
+          await this.testConnection();
+        }
+        if (this.isConnected) {
+          await this.flushFallbackQueue().catch(() => {});
+        }
+      } catch (_) {}
     }, 15_000);
   }
 
@@ -371,6 +420,11 @@ export class DbStorage implements IStorage {
             try { await (this.prisma as any).orderAudit.create({ data: rec }); } catch (_) { try { await this.getFallback().createOrderAudit(rec); } catch (_) {} }
             continue;
           }
+          // tradeProvenance may be queued with type or tradeId
+          if (rec && (rec.type === 'tradeProvenance' || rec.tradeId)) {
+            try { await (this.prisma as any).tradeProvenance.create({ data: rec }); } catch (_) { try { await this.getFallback().createTradeProvenance(rec); } catch (_) {} }
+            continue;
+          }
           if (rec && rec.type === 'orderAudit.update') {
             try {
               // attempt update by id first, then by orderId
@@ -391,13 +445,13 @@ export class DbStorage implements IStorage {
             continue;
           }
 
-          if (rec && rec.tradeId) {
-            try { await (this.prisma as any).tradeProvenance.create({ data: rec }); } catch (_) { try { await this.getFallback().createTradeProvenance(rec); } catch (_) {} }
-            continue;
+          // default fallback to audit log - try singular then plural Prisma model names
+          try {
+            try { await (this.prisma as any).auditLog.create({ data: rec }); }
+            catch (_) { await (this.prisma as any).auditLogs.create({ data: rec }); }
+          } catch (_) {
+            try { await this.getFallback().createAuditLog(rec); } catch (_) {}
           }
-
-          // default fallback to audit log
-          try { await (this.prisma as any).auditLogs.create({ data: rec }); } catch (_) { try { await this.getFallback().createAuditLog(rec); } catch (_) {} }
         } catch (e) {
           // skip malformed
           continue;
@@ -431,6 +485,11 @@ export class DbStorage implements IStorage {
 
   private async testConnection(): Promise<void> {
     try {
+      if (!this.prisma) {
+        this.isConnected = false;
+        this.reportFallback('prisma_client_unavailable', {});
+        return;
+      }
       await this.prisma.$queryRaw`SELECT 1`;
       this.isConnected = true;
       console.log('[DbStorage] Connected to PostgreSQL');
@@ -745,9 +804,13 @@ export class DbStorage implements IStorage {
       createdAt: record.createdAt ? new Date(record.createdAt) : undefined,
     } as any;
 
-    if (!this.isConnected) {
-      try { await this.enqueueFallback({ type: 'orderAudit', ...safe }); } catch (_) { return this.getFallback().createTradeProvenance(record); }
-      return this.getFallback().createTradeProvenance(record);
+    if (!this.isReady()) {
+      try {
+        await this.enqueueFallback({ type: 'orderAudit', ...safe });
+        return safe; // persisted to queue
+      } catch (_) {
+        return this.getFallback().createOrderAudit ? this.getFallback().createOrderAudit(record) : null;
+      }
     }
 
     try {
@@ -755,8 +818,12 @@ export class DbStorage implements IStorage {
       return res;
     } catch (error) {
       console.warn('[DbStorage] Write failed for order audit, enqueuing fallback:', (error as any).message);
-      try { await this.enqueueFallback({ type: 'orderAudit', ...safe }); } catch (_) { return this.getFallback().createTradeProvenance(record); }
-      return this.getFallback().createTradeProvenance(record);
+      try {
+        await this.enqueueFallback({ type: 'orderAudit', ...safe });
+        return safe;
+      } catch (_) {
+        return this.getFallback().createOrderAudit ? this.getFallback().createOrderAudit(record) : null;
+      }
     }
   }
 
@@ -908,46 +975,54 @@ export class DbStorage implements IStorage {
   }
 
   async getBacktestResults(strategyId?: string): Promise<BacktestResult[]> {
-    // Ensure all required fields are present in returned results
-    const results = await this.prisma.backtestResult.findMany({
-      where: strategyId ? { strategyId } : undefined,
-      orderBy: { createdAt: 'desc' },
-      select: {
-        id: true,
-        strategyId: true,
-        startDate: true,
-        endDate: true,
-        initialCapital: true,
-        finalCapital: true,
-        performance: true,
-        equityCurve: true,
-        monthlyReturns: true,
-        metrics: true,
-        trades: true,
-        createdAt: true,
-      },
-    });
-    // Map results to ensure all required fields
-    return results.map((r: any) => ({
-      id: r.id,
-      strategyId: r.strategyId,
-      startDate: r.startDate,
-      endDate: r.endDate,
-      initialCapital: r.initialCapital,
-      finalCapital: r.finalCapital,
-      performance: r.performance ?? {},
-      equityCurve: r.equityCurve ?? [],
-      monthlyReturns: r.monthlyReturns ?? [],
-      metrics: r.metrics ?? {},
-      trades: r.trades ?? [],
-      createdAt: r.createdAt,
-    }));
+    if (!this.isReady()) return this.getFallback().getBacktestResults(strategyId);
+    try {
+      const results = await this.prisma.backtestResult.findMany({
+        where: strategyId ? { strategyId } : undefined,
+        orderBy: { createdAt: 'desc' },
+        select: {
+          id: true,
+          strategyId: true,
+          startDate: true,
+          endDate: true,
+          initialCapital: true,
+          finalCapital: true,
+          performance: true,
+          equityCurve: true,
+          monthlyReturns: true,
+          metrics: true,
+          trades: true,
+          createdAt: true,
+        },
+      });
+      return results.map((r: any) => ({
+        id: r.id,
+        strategyId: r.strategyId,
+        startDate: r.startDate,
+        endDate: r.endDate,
+        initialCapital: r.initialCapital,
+        finalCapital: r.finalCapital,
+        performance: r.performance ?? {},
+        equityCurve: r.equityCurve ?? [],
+        monthlyReturns: r.monthlyReturns ?? [],
+        metrics: r.metrics ?? {},
+        trades: r.trades ?? [],
+        createdAt: r.createdAt,
+      }));
+    } catch (error) {
+      console.warn('[DbStorage] getBacktestResults failed, using fallback:', (error as any).message);
+      return this.getFallback().getBacktestResults(strategyId);
+    }
   }
 
   async deleteBacktestResult(id: string): Promise<void> {
-    await this.prisma.backtestResult.delete({
-      where: { id },
-    });
+    if (!this.isReady()) return this.getFallback().deleteBacktestResult(id);
+    try {
+      await this.prisma.backtestResult.delete({ where: { id } });
+    } catch (error) {
+      console.warn('[DbStorage] deleteBacktestResult failed, using fallback:', (error as any).message);
+      return this.getFallback().deleteBacktestResult(id);
+    }
   }
 
   async createBacktestResult(result: InsertBacktestResult): Promise<BacktestResult> {
@@ -964,7 +1039,13 @@ export class DbStorage implements IStorage {
       metrics: result.metrics ?? {},
       trades: result.trades ?? [],
     };
-    return this.prisma.backtestResult.create({ data: safeResult });
+    if (!this.isReady()) return this.getFallback().createBacktestResult(result);
+    try {
+      return await this.prisma.backtestResult.create({ data: safeResult });
+    } catch (error) {
+      console.warn('[DbStorage] createBacktestResult failed, using fallback:', (error as any).message);
+      return this.getFallback().createBacktestResult(result);
+    }
   }
 
   // Model metrics persistence
@@ -973,7 +1054,7 @@ export class DbStorage implements IStorage {
       return this.getFallback().createModelMetric(metric);
     }
     try {
-      await (this.prisma as any).modelMetrics.create({ data: {
+      await this.tryPrismaCreate(['modelMetrics','modelMetric'], {
         modelName: metric.modelName,
         accuracy: metric.accuracy ?? null,
         precision: metric.precision ?? null,
@@ -981,7 +1062,7 @@ export class DbStorage implements IStorage {
         driftScore: metric.driftScore ?? null,
         dataPoints: metric.dataPoints ?? 0,
         isStale: metric.isStale ?? false,
-      }} as any);
+      });
     } catch (error) {
       console.warn('[DbStorage] Write failed for model metric, using fallback:', (error as any).message);
       return this.getFallback().createModelMetric(metric);
@@ -993,11 +1074,7 @@ export class DbStorage implements IStorage {
       return this.getFallback().getLatestModelMetrics(modelName, limit);
     }
     try {
-      const results = await (this.prisma as any).modelMetrics.findMany({
-        where: { modelName },
-        orderBy: { timestamp: 'desc' },
-        take: limit,
-      });
+      const results = await this.tryPrismaFindMany(['modelMetrics','modelMetric'], { where: { modelName }, orderBy: { timestamp: 'desc' }, take: limit });
       return results as any;
     } catch (error) {
       console.warn('[DbStorage] Query failed for model metrics, using fallback:', (error as any).message);
@@ -1010,10 +1087,7 @@ export class DbStorage implements IStorage {
       return this.getFallback().getStaleModelMetrics();
     }
     try {
-      const results = await (this.prisma as any).modelMetrics.findMany({
-        where: { isStale: true },
-        orderBy: { timestamp: 'desc' },
-      });
+      const results = await this.tryPrismaFindMany(['modelMetrics','modelMetric'], { where: { isStale: true }, orderBy: { timestamp: 'desc' } });
       return results as any;
     } catch (error) {
       console.warn('[DbStorage] Query failed for stale model metrics, using fallback:', (error as any).message);
@@ -1030,77 +1104,130 @@ export class DbStorage implements IStorage {
       symbolCount: scan.symbolCount ?? (Array.isArray(scan.payload?.results) ? scan.payload.results.length : 0),
       payload: scan.payload ?? {}
     };
-    return this.prisma.scanRun.create({ data });
+    if (!this.isReady()) return this.getFallback().createScanRun ? (this.getFallback() as any).createScanRun(scan) : null;
+    try {
+      return await this.prisma.scanRun.create({ data });
+    } catch (error) {
+      console.warn('[DbStorage] createScanRun failed, using fallback:', (error as any).message);
+      try { return await (this.getFallback() as any).createScanRun(scan); } catch (_) { return null; }
+    }
   }
 
   async getRecentScanRuns(limit = 10): Promise<any[]> {
-    const results = await this.prisma.scanRun.findMany({
-      orderBy: { timestamp: 'desc' },
-      take: limit,
-    });
-    return results;
+    if (!this.isReady()) return this.getFallback().getRecentScanRuns ? (this.getFallback() as any).getRecentScanRuns(limit) : [];
+    try {
+      const results = await this.prisma.scanRun.findMany({ orderBy: { timestamp: 'desc' }, take: limit });
+      return results;
+    } catch (error) {
+      console.warn('[DbStorage] getRecentScanRuns failed, using fallback:', (error as any).message);
+      try { return await (this.getFallback() as any).getRecentScanRuns(limit); } catch (_) { return []; }
+    }
   }
 
   async getMarketSentiment(): Promise<MarketSentiment> {
-    // Return the latest MarketSentiment record
-    const sentiment = await this.prisma.marketSentiment.findFirst({
-      orderBy: { createdAt: 'desc' },
-    });
-    if (!sentiment) throw new Error('No market sentiment data found');
-    // Ensure all required fields are present, extracting from .data if needed
-    const data = (sentiment as any).data || sentiment;
-    return {
-      fearGreedIndex: data.fearGreedIndex ?? 0,
-      btcDominance: data.btcDominance ?? 0,
-      totalMarketCap: data.totalMarketCap ?? 0,
-      volume24h: data.volume24h ?? 0,
-    };
+    if (!this.isReady()) return this.getFallback().getMarketSentiment();
+    try {
+      const sentiment = await this.prisma.marketSentiment.findFirst({ orderBy: { createdAt: 'desc' } });
+      if (!sentiment) return this.getFallback().getMarketSentiment();
+      const data = (sentiment as any).data || sentiment;
+      return {
+        fearGreedIndex: data.fearGreedIndex ?? 0,
+        btcDominance: data.btcDominance ?? 0,
+        totalMarketCap: data.totalMarketCap ?? 0,
+        volume24h: data.volume24h ?? 0,
+      };
+    } catch (error) {
+      console.warn('[DbStorage] getMarketSentiment failed, using fallback:', (error as any).message);
+      return this.getFallback().getMarketSentiment();
+    }
   }
 
   async getPortfolioSummary(): Promise<PortfolioSummary> {
-    // Return the latest PortfolioSummary record
-    const summary = await this.prisma.portfolioSummary.findFirst({
-      orderBy: { createdAt: 'desc' },
-    });
-
-    // Return default empty portfolio if no data exists
-    if (!summary) {
+    if (!this.isReady()) return this.getFallback().getPortfolioSummary();
+    try {
+      const summary = await this.prisma.portfolioSummary.findFirst({ orderBy: { createdAt: 'desc' } });
+      if (!summary) return this.getFallback().getPortfolioSummary();
+      const data = (summary as any).data || summary;
       return {
-        totalValue: 0,
-        availableCash: 0,
-        invested: 0,
-        dayChange: 0,
-        dayChangePercent: 0,
+        totalValue: data.totalValue ?? 0,
+        availableCash: data.availableCash ?? 0,
+        invested: data.invested ?? 0,
+        dayChange: data.dayChange ?? 0,
+        dayChangePercent: data.dayChangePercent ?? 0,
       };
+    } catch (error) {
+      console.warn('[DbStorage] getPortfolioSummary failed, using fallback:', (error as any).message);
+      return this.getFallback().getPortfolioSummary();
     }
-
-    // If summary fields are nested in summary.data, extract them
-    const data = (summary as any).data || summary;
-    return {
-      totalValue: data.totalValue ?? 0,
-      availableCash: data.availableCash ?? 0,
-      invested: data.invested ?? 0,
-      dayChange: data.dayChange ?? 0,
-      dayChangePercent: data.dayChangePercent ?? 0,
-    };
   }
 
   async getRecentFrames(limit: number = 1000): Promise<MarketFrame[]> {
-    return this.prisma.marketFrame.findMany({
-      orderBy: { timestamp: 'desc' },
-      take: limit,
-    });
+    if (!this.isReady()) return this.getFallback().getRecentFrames ? (this.getFallback() as any).getRecentFrames(limit) : [];
+    try {
+      return await this.prisma.marketFrame.findMany({ orderBy: { timestamp: 'desc' }, take: limit });
+    } catch (error) {
+      console.warn('[DbStorage] getRecentFrames failed, using fallback:', (error as any).message);
+      try { return await (this.getFallback() as any).getRecentFrames(limit); } catch (_) { return []; }
+    }
   }
 
   async createSignalPerformance(performance: any): Promise<void> {
-    // Store signal performance metrics - could be in a separate table or cache
-    // For now, we'll just log it since signal tracking is handled elsewhere
-    console.log('[DbStorage] Signal performance tracked:', performance);
+    const safe = {
+      signalId: performance.signalId ?? null,
+      timestamp: performance.timestamp ? new Date(performance.timestamp) : new Date(),
+      pnl: performance.pnl ?? null,
+      realizedPnl: performance.realizedPnl ?? null,
+      metrics: performance.metrics ?? {},
+      features: performance.features ?? {},
+      extra: performance.extra ?? {},
+    } as any;
+
+    if (!this.isConnected) {
+      try { await this.enqueueFallback({ type: 'signalPerformance', ...safe }); } catch (_) { try { await this.getFallback().createSignalPerformance(performance); } catch (_) {} }
+      return;
+    }
+
+    try {
+      try {
+        await (this.prisma as any).signalPerformance.create({ data: safe });
+        return;
+      } catch (_) {
+        // try helper for alternative model names
+        try { await this.tryPrismaCreate(['signalPerformances','signal_performance','signal_metrics'], safe); return; } catch (_) {}
+      }
+      // if direct write not possible enqueue for durability
+      await this.enqueueFallback({ type: 'signalPerformance', ...safe });
+    } catch (error) {
+      console.warn('[DbStorage] Write failed for signal performance, enqueuing fallback:', (error as any).message);
+      try { await this.enqueueFallback({ type: 'signalPerformance', ...safe }); } catch (_) { try { await this.getFallback().createSignalPerformance(performance); } catch (_) {} }
+    }
   }
 
   async updateSignalPerformance(signalId: string, updates: any): Promise<void> {
-    // Update signal performance metrics
-    console.log('[DbStorage] Signal performance updated:', { signalId, updates });
+    if (!this.isConnected) {
+      try { await this.enqueueFallback({ type: 'signalPerformance.update', id: signalId, updates }); } catch (_) { try { await this.getFallback().updateSignalPerformance(signalId, updates); } catch (_) {} }
+      return;
+    }
+    try {
+      try {
+        // try update by primary id
+        await (this.prisma as any).signalPerformance.update({ where: { id: signalId }, data: updates });
+        return;
+      } catch (_) {
+        // try update by signalId
+        try {
+          await (this.prisma as any).signalPerformance.updateMany({ where: { signalId }, data: updates });
+          return;
+        } catch (_) {
+          // enqueue update for later
+          await this.enqueueFallback({ type: 'signalPerformance.update', id: signalId, updates });
+          return;
+        }
+      }
+    } catch (error) {
+      console.warn('[DbStorage] Update failed for signal performance, enqueuing fallback:', (error as any).message);
+      try { await this.enqueueFallback({ type: 'signalPerformance.update', id: signalId, updates }); } catch (_) { try { await this.getFallback().updateSignalPerformance(signalId, updates); } catch (_) {} }
+    }
   }
 
   // Audit log persistence (DB-backed when available)
@@ -1112,7 +1239,9 @@ export class DbStorage implements IStorage {
       return;
     }
     try {
-      await (this.prisma as any).auditLogs.create({ data: safe } as any);
+      // Try singular then plural Prisma model names
+      try { await (this.prisma as any).auditLog.create({ data: safe } as any); }
+      catch (_) { await (this.prisma as any).auditLogs.create({ data: safe } as any); }
     } catch (error) {
       console.warn('[DbStorage] Write failed for audit log, enqueuing fallback:', (error as any).message);
       try { await this.enqueueFallback({ type: 'auditLog', ...safe }); } catch (_) { return this.getFallback().createAuditLog(log); }
@@ -1127,8 +1256,14 @@ export class DbStorage implements IStorage {
       const where: any = {};
       if (entityType) where.entityType = entityType;
       if (entityId) where.entityId = entityId;
-      const results = await (this.prisma as any).auditLogs.findMany({ where, orderBy: { timestamp: 'desc' }, take: limit });
-      return results as any as import("@shared/schema").InsertAuditLog[];
+      // Try singular then plural Prisma model names
+      try {
+        const results = await (this.prisma as any).auditLog.findMany({ where, orderBy: { timestamp: 'desc' }, take: limit });
+        return results as any as import("@shared/schema").InsertAuditLog[];
+      } catch (_) {
+        const results = await (this.prisma as any).auditLogs.findMany({ where, orderBy: { timestamp: 'desc' }, take: limit });
+        return results as any as import("@shared/schema").InsertAuditLog[];
+      }
     } catch (error) {
       console.warn('[DbStorage] Query failed for audit logs, using fallback:', (error as any).message);
       return this.getFallback().getAuditLogs(entityType, entityId, limit);

@@ -7,8 +7,7 @@ import { WebSocketServer, WebSocket } from "ws";
 import { storage } from "./storage";
 import { rlGuard } from './rl-guard';
 import { z } from 'zod';
-import pkg from '@prisma/client';
-const { PrismaClient } = pkg as any;
+import { db } from './db-storage';
 import axios from 'axios'; // Import axios for CoinGecko API calls
 import { coinGeckoService } from './services/coingecko';
 import { Router } from 'express'; // Import Router for dynamic route registration
@@ -85,9 +84,10 @@ import agentSignalInsightsRouter from './routes/agent-signal-insights';
 import { apiRegistry } from './services/api-registry';
 // Import scanner signal router
 import scannerSignalRouter from './routes/scanner-signal';
+import { symbolRegistry } from '../src/core/SymbolRegistry';
 
-// Create prisma instance
-const prisma = new PrismaClient();
+// Use shared db.prisma when available
+const prisma: any = (db as any).prisma || null;
 
 // Optional imports - only use if modules exist
 let MirrorOptimizer: any, ScannerAgent: any, MLAgent: any;
@@ -723,7 +723,7 @@ try {
 
   // List all assets and their latest performance/metrics
 app.get('/api/assets/performance', async (req: Request, res: Response) => {
-  const db = new PrismaClient();
+  const prismaLocal: any = prisma;
   try {
     // Query params
     const {
@@ -738,7 +738,7 @@ app.get('/api/assets/performance', async (req: Request, res: Response) => {
     } = req.query;
 
     // Get all distinct symbols
-    let symbols: { symbol: string }[] = await db.marketFrame.findMany({
+    let symbols: { symbol: string }[] = await prismaLocal.marketFrame.findMany({
       distinct: ['symbol'],
       select: { symbol: true },
     });
@@ -748,13 +748,13 @@ app.get('/api/assets/performance', async (req: Request, res: Response) => {
     }
     // For each symbol, get the latest and previous market frame for metrics
     let results = (await Promise.all(symbols.map(async (row: { symbol: string }) => {
-      const latest = await db.marketFrame.findFirst({
+      const latest = await prismaLocal.marketFrame.findFirst({
         where: { symbol: row.symbol },
         orderBy: { timestamp: 'desc' },
       });
       if (!latest) return null;
       // Previous close for percent change
-      const prev = await db.marketFrame.findFirst({
+      const prev = await prismaLocal.marketFrame.findFirst({
         where: { symbol: row.symbol, NOT: { timestamp: latest.timestamp } },
         orderBy: { timestamp: 'desc' },
       });
@@ -762,7 +762,7 @@ app.get('/api/assets/performance', async (req: Request, res: Response) => {
       const prevClose = prev?.price?.close ?? close;
       const percentChange = prevClose !== 0 ? ((close - prevClose) / prevClose) * 100 : 0;
       // Volatility: stddev of close over last 10 frames
-      const last10 = await db.marketFrame.findMany({
+      const last10 = await prismaLocal.marketFrame.findMany({
         where: { symbol: row.symbol },
         orderBy: { timestamp: 'desc' },
         take: 10
@@ -774,12 +774,12 @@ app.get('/api/assets/performance', async (req: Request, res: Response) => {
       // Momentum: close - close n frames ago
       const momentum = closes.length >= 2 ? closes[0] - closes[closes.length - 1] : 0;
       // 7d and 30d momentum (if available)
-      const last7 = await db.marketFrame.findMany({
+      const last7 = await prismaLocal.marketFrame.findMany({
         where: { symbol: row.symbol },
         orderBy: { timestamp: 'desc' },
         take: 7
       });
-      const last30 = await db.marketFrame.findMany({
+      const last30 = await prismaLocal.marketFrame.findMany({
         where: { symbol: row.symbol },
         orderBy: { timestamp: 'desc' },
         take: 30
@@ -822,7 +822,7 @@ app.get('/api/assets/performance', async (req: Request, res: Response) => {
   } catch (err: any) {
     res.status(500).json({ error: err?.message || String(err) });
   } finally {
-    await db.$disconnect();
+    try { if ((db as any).prisma && typeof (db as any).prisma.$disconnect === 'function') await (db as any).prisma.$disconnect(); } catch (_) {}
   }
 });
 
@@ -881,6 +881,11 @@ app.get('/api/assets/performance', async (req: Request, res: Response) => {
           const exchangeIds = Array.from(exchangeDataFeed.exchanges.keys());
           console.log('[INIT] Available exchanges in ExchangeDataFeed:', exchangeIds);
           console.log('[INIT] KuCoin Futures available:', exchangeDataFeed.exchanges.has('kucoinfutures') ? '✅ YES' : '❌ NO');
+          try {
+            // Seed SymbolRegistry from loaded exchange markets to avoid waiting for discovery
+            symbolRegistry.populateFromExchanges(exchangeDataFeed.exchanges);
+            console.log('[INIT] SymbolRegistry seeded from ExchangeDataFeed:', symbolRegistry.getAll().length, 'symbols');
+          } catch (e) { console.warn('[INIT] Could not seed SymbolRegistry from ExchangeDataFeed', (e as any)?.message || e); }
         }
       } else {
         console.warn('[INIT] ExchangeDataFeed class not available');
@@ -1302,6 +1307,12 @@ app.get('/api/assets/performance', async (req: Request, res: Response) => {
   // Strategy Integration Engine
   const strategyEngine = StrategyIntegrationEngine ? new StrategyIntegrationEngine() : null;
 
+  // If a MirrorOptimizer instance exists, provide it with the shared StrategyIntegrationEngine
+  try {
+    if (optimizer && typeof (optimizer as any).setStrategyEngine === 'function') {
+      (optimizer as any).setStrategyEngine(strategyEngine);
+    }
+  } catch (e) { /* ignore */ }
   // Synthesize signals endpoint
   app.post('/api/strategies/synthesize', async (req: Request, res: Response) => {
     try {

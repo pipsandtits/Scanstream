@@ -1,11 +1,7 @@
 import { Router, Request, Response } from 'express';
-import pkg from '@prisma/client';
-const { PrismaClient } = pkg as any;
 import axios from 'axios';
 import { coinGeckoService } from '../services/coingecko';
 import { SignalPersistenceService } from '../services/signal-persistence-service';
-
-const prisma = new PrismaClient();
 const router = Router();
 const signalService = new SignalPersistenceService();
 
@@ -70,11 +66,7 @@ export function setupSignalRoutes(app: any) {
   app.get('/api/signals/:symbol', async (req: any, res: Response) => {
     try {
       const raw = normalizeParamSymbol(req.params.symbol);
-      const signals = await prisma.signal.findMany({
-        where: { symbol: raw.toUpperCase() },
-        orderBy: { timestamp: 'desc' },
-        take: 10
-      });
+      const signals = await signalService.getRecentSignals(raw.toUpperCase(), 10);
       res.json(signals);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
@@ -123,27 +115,24 @@ export function setupSignalRoutes(app: any) {
         strength = maCrossover.strength;
       }
 
-      const signal = await prisma.signal.create({
-        data: {
-          symbol: upperSymbol,
-          type: 'ma_crossover_rsi',
-          strength: strength,
-          confidence: Math.min(strength / 100 * 0.95, 1),
-          price: currentPrice,
-          stopLoss: currentPrice * 0.95,
-          takeProfit: currentPrice * 1.1,
-          entryPrice: currentPrice,
-          riskReward: (currentPrice * 1.1 - currentPrice) / (currentPrice - currentPrice * 0.95),
-          reasoning: {
-            maCrossover: maCrossover.signal,
-            rsi: rsi.signal,
-            rsiStrength: rsi.strength,
-            combined: combinedSignal,
-          },
+      const recorded = await signalService.recordSignal({
+        symbol: upperSymbol,
+        type: 'BUY',
+        strength: strength,
+        confidence: Math.min(strength / 100 * 0.95, 1),
+        entryPrice: currentPrice,
+        stopLoss: currentPrice * 0.95,
+        takeProfit: currentPrice * 1.1,
+        riskReward: (currentPrice * 1.1 - currentPrice) / (currentPrice - currentPrice * 0.95),
+        reasoning: {
+          maCrossover: maCrossover.signal,
+          rsi: rsi.signal,
+          rsiStrength: rsi.strength,
+          combined: combinedSignal,
         },
       });
 
-      res.json(signal);
+      res.json(recorded);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
     }

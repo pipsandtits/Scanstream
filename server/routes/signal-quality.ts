@@ -1,9 +1,6 @@
 import { Router, Request, Response } from 'express';
 import { signalQualityEngine, type SignalMetrics } from '../lib/signal-quality';
-import pkg from '@prisma/client';
-const { PrismaClient } = pkg as any;
-
-const prisma = new PrismaClient();
+import { db } from '../db-storage';
 const router = Router();
 
 /**
@@ -127,7 +124,12 @@ router.get('/high-quality', async (req: Request, res: Response) => {
       query.where = { symbol: (symbol as string).toUpperCase() };
     }
 
-    const dbSignals = await prisma.signal.findMany(query);
+    const q = `SELECT * FROM "Signal" ${query.where ? 'WHERE "symbol" = $1' : ''} ORDER BY "timestamp" DESC LIMIT $2`;
+    const params: any[] = [];
+    if (query.where) params.push((query.where as any).symbol);
+    params.push(parseInt(limit as string) || 20);
+    const dbSignalsRes = await db.query(q, params);
+    const dbSignals = dbSignalsRes.rows || [];
 
     const signals: SignalMetrics[] = dbSignals.map(s => ({
       id: s.id,
@@ -141,6 +143,7 @@ router.get('/high-quality', async (req: Request, res: Response) => {
       reasoning: s.reasoning as Record<string, any>
     }));
 
+    const accuracyMap = await signalQualityEngine.preloadHistoricalAccuracy(signals);
     const qualified = await signalQualityEngine.filterByQuality(signals, parseInt(minScore as string));
 
     // Reuse same accuracy map to annotate qualified signals
@@ -179,11 +182,8 @@ router.post('/compare', async (req: Request, res: Response) => {
     }
 
     // Get multiple types of signals for the same symbol
-    const signals = await prisma.signal.findMany({
-      where: { symbol: symbol.toUpperCase() },
-      orderBy: { timestamp: 'desc' },
-      take: 50
-    });
+    const rowsRes = await db.query('SELECT * FROM "Signal" WHERE "symbol" = $1 ORDER BY "timestamp" DESC LIMIT 50', [symbol.toUpperCase()]);
+    const signals = rowsRes.rows || [];
 
     if (signals.length === 0) {
       return res.status(404).json({ error: 'No signals found for this symbol' });

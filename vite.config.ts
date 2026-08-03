@@ -47,7 +47,7 @@ export default defineConfig({
     // Write a rollup-compatible stats JSON so we can analyze module sizes reliably
     {
       name: 'write-rollup-stats',
-      writeBundle(options, bundle) {
+      writeBundle(options: any, bundle: Record<string, any>) {
         try {
           const modules = [];
           for (const fileName of Object.keys(bundle)) {
@@ -67,7 +67,7 @@ export default defineConfig({
           console.log('[stats] wrote rollup stats to', out);
         } catch (err) {
           // eslint-disable-next-line no-console
-          console.warn('[stats] error writing rollup stats', err && err.stack ? err.stack : err);
+          console.warn('[stats] error writing rollup stats', (err as any)?.stack ?? err);
         }
       }
     }
@@ -76,7 +76,7 @@ export default defineConfig({
     alias: {
       "@": path.resolve(__dirname, "client", "src"),
       "@shared": path.resolve(__dirname, "shared"),
-      "@assets": path.resolve(__dirname, "attached_assets"),
+      "@assets": path.resolve(__dirname, "assets"),
     },
   },
   root: path.resolve(__dirname, "client"),
@@ -86,7 +86,7 @@ export default defineConfig({
     sourcemap: true,
     rollupOptions: {
       output: {
-        manualChunks(id) {
+        manualChunks(id: string | undefined): string | undefined {
           if (!id || !id.includes('node_modules')) return undefined;
           // Group react/react-dom into vendor chunk
           if (id.includes('node_modules/react') || id.includes('node_modules/react-dom')) return 'vendor-react';
@@ -156,12 +156,12 @@ export default defineConfig({
       '/api/scanner': {
         target: 'http://localhost:5001',
         changeOrigin: true,
-        rewrite: (path) => path,
+        rewrite: (p: string) => p,
       },
       '/api/position': {
         target: 'http://localhost:5001',
         changeOrigin: true,
-        rewrite: (path) => path,
+        rewrite: (p: string) => p,
       }
     } : undefined,
     watch: {

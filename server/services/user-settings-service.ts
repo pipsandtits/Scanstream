@@ -3,9 +3,9 @@
  * Business logic and validation for user settings operations
  */
 
-import pkg from '@prisma/client';
-const { PrismaClient } = pkg as any;
+import { db } from '../db-storage';
 import crypto from 'crypto';
+const prisma: any = (db as any).prisma || null;
 
 export interface PreferencesData {
   theme?: 'light' | 'dark';
@@ -320,12 +320,8 @@ export class EmailService {
 export class DataExportService {
   static async generateExportReport(userId: string): Promise<object> {
     try {
-      const prisma = new PrismaClient();
-      
-      // Fetch user data
-      const user = await prisma.user.findUnique({
-        where: { id: userId }
-      });
+      const p: any = prisma;
+      const user = p ? await p.user.findUnique({ where: { id: userId } }) : null;
 
       return {
         exportDate: new Date().toISOString(),

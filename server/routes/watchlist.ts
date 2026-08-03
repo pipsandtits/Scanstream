@@ -1,8 +1,6 @@
 import { Router, Request, Response } from 'express';
-import pkg from '@prisma/client';
-const { PrismaClient } = pkg as any;
-
-const prisma = new PrismaClient();
+import { db } from '../db-storage';
+import { randomUUID } from 'crypto';
 const router = Router();
 
 export function setupWatchlistRoutes(app: any) {
@@ -16,11 +14,8 @@ export function setupWatchlistRoutes(app: any) {
   // Get watchlist
   app.get('/api/user/watchlist', isAuthenticated, async (req: any, res: Response) => {
     try {
-      const watchlist = await prisma.watchlist.findMany({
-        where: { userId: req.user.id },
-        orderBy: { addedAt: 'desc' }
-      });
-      res.json(watchlist);
+      const resQ = await db.query('SELECT * FROM "Watchlist" WHERE "userId" = $1 ORDER BY "addedAt" DESC', [req.user.id]);
+      res.json(resQ.rows || []);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
     }
@@ -34,22 +29,11 @@ export function setupWatchlistRoutes(app: any) {
         return res.status(400).json({ error: 'Symbol is required' });
       }
 
-      const existing = await prisma.watchlist.findUnique({
-        where: { userId_symbol: { userId: req.user.id, symbol } }
-      });
-
-      if (existing) {
-        return res.status(400).json({ error: 'Symbol already in watchlist' });
-      }
-
-      const item = await prisma.watchlist.create({
-        data: {
-          userId: req.user.id,
-          symbol,
-          notes: notes || null
-        }
-      });
-      res.json(item);
+      const existingRes = await db.query('SELECT id FROM "Watchlist" WHERE "userId" = $1 AND symbol = $2 LIMIT 1', [req.user.id, symbol]);
+      if (existingRes.rows && existingRes.rows.length > 0) return res.status(400).json({ error: 'Symbol already in watchlist' });
+      const id = randomUUID();
+      const itemRes = await db.query('INSERT INTO "Watchlist" (id, "userId", symbol, notes, "addedAt") VALUES ($1, $2, $3, $4, NOW()) RETURNING *', [id, req.user.id, symbol, notes || null]);
+      res.json(itemRes.rows && itemRes.rows[0]);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
     }
@@ -58,15 +42,9 @@ export function setupWatchlistRoutes(app: any) {
   // Remove from watchlist
   app.delete('/api/user/watchlist/:id', isAuthenticated, async (req: any, res: Response) => {
     try {
-      const item = await prisma.watchlist.findFirst({
-        where: { id: req.params.id, userId: req.user.id }
-      });
-
-      if (!item) {
-        return res.status(404).json({ error: 'Watchlist item not found' });
-      }
-
-      await prisma.watchlist.delete({ where: { id: req.params.id } });
+      const itemRes = await db.query('SELECT id FROM "Watchlist" WHERE id = $1 AND "userId" = $2 LIMIT 1', [req.params.id, req.user.id]);
+      if (!itemRes.rows || itemRes.rows.length === 0) return res.status(404).json({ error: 'Watchlist item not found' });
+      await db.query('DELETE FROM "Watchlist" WHERE id = $1', [req.params.id]);
       res.json({ success: true });
     } catch (error: any) {
       res.status(500).json({ error: error.message });

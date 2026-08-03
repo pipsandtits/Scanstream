@@ -8,9 +8,8 @@
  * - Audit trails
  */
 
-import type { ScanResult, ExchangeScanResults, CrossExchangeSignal, MultiExchangeScanResults } from './multi-exchange-scanner';
-import pkg from '@prisma/client';
-const { PrismaClient } = pkg as any;
+import type { ScanResult, CrossExchangeSignal } from './multi-exchange-scanner';
+import { db } from '../../db-storage';
 import type { PrismaClient as PrismaClientType } from '@prisma/client';
 
 export interface StoredScanResult {
@@ -79,10 +78,11 @@ export interface StoredScanSession {
  * - Computing statistics
  */
 export class ScannerPersistenceService {
-  private db: PrismaClientType;
+  private db: PrismaClientType | any;
 
-  constructor(prismaClient: PrismaClientType) {
-    this.db = prismaClient;
+  constructor(prismaClient?: PrismaClientType) {
+    this.db = prismaClient ?? (db as any).prisma ?? null;
+    if (!this.db) console.warn('[ScannerPersistence] No Prisma client available; ensure DB injected or db.prisma is configured.');
   }
 
   /**
@@ -203,7 +203,7 @@ export class ScannerPersistenceService {
    * Store cross-exchange signals
    */
   async storeCrossExchangeSignals(
-    signals: any[],
+    signals: CrossExchangeSignal[],
     sessionId: string
   ): Promise<void> {
     try {
@@ -278,7 +278,7 @@ export class ScannerPersistenceService {
   async getCrossExchangeSignalHistory(
     symbol: string,
     days: number = 7
-  ): Promise<any[]> {
+  ): Promise<CrossExchangeSignal[]> {
     try {
       const since = new Date(Date.now() - days * 24 * 3600 * 1000);
 
@@ -292,15 +292,14 @@ export class ScannerPersistenceService {
       });
 
       return signals.map((s: any) => ({
-        id: s.id,
         symbol: s.symbol,
         type: s.signalType,
         confidence: s.confidence,
         exchanges: s.exchanges,
         description: s.description,
+        signals: s.signals || new Map<string,string>(),
         avgScore: s.avgCompositeScore,
-        timestamp: s.timestamp.getTime()
-      }));
+      } as CrossExchangeSignal));
     } catch (error) {
       console.error('[ScannerPersistence] Error getting signal history:', error);
       return [];

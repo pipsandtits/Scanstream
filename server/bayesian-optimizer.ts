@@ -314,8 +314,23 @@ export class MirrorOptimizer {
   private agents      = new Map<string, OptimizableAgent>();
   private optimizationHistory = new Map<string, OptimizationResult>();
 
-  private rlAgent       = getRLAgent();
-  private strategyEngine = new StrategyIntegrationEngine();
+  private rlAgent: any;
+  private strategyEngine: StrategyIntegrationEngine | null = null;
+
+  constructor() {
+    this.rlAgent = getRLAgent();
+    // Defer heavy strategy engine construction to external owner to avoid
+    // accidental duplicate initializations. Use `setStrategyEngine()` to
+    // provide a shared engine instance when available.
+  }
+
+  setStrategyEngine(engine: StrategyIntegrationEngine | null) {
+    this.strategyEngine = engine;
+  }
+
+  getStrategyEngine(): StrategyIntegrationEngine | null {
+    return this.strategyEngine;
+  }
 
   registerAgent(name: string, agent: OptimizableAgent): void {
     this.agents.set(name, agent);
@@ -596,7 +611,7 @@ export class MirrorOptimizer {
     return {
       agents:          agentResults,
       rlAgent:         this.rlAgent.getStats(),
-      strategyWeights: this.strategyEngine.getStrategyWeights(),
+      strategyWeights: this.strategyEngine ? this.strategyEngine.getStrategyWeights() : null,
       summary: {
         totalIterations:     Object.values(agentResults).reduce((sum, r) => sum + r.iterations, 0),
         bestOverallScore:    allScores.length > 0 ? Math.max(...allScores) : 0,

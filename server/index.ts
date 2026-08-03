@@ -206,8 +206,6 @@ function wrapRouter(router: any, name = 'router') {
   paperTradingRouter, scannerRouter, scannerAnalysisRouter, coinGeckoRouter
 ].forEach((r: any) => wrapRouter(r));
 
-app.use('/api/docs', apiDocsRouter);
-console.log('[express] API Documentation registered at /api/docs');
 console.log('[express]   - GET /api/docs/endpoints - List all endpoints');
 console.log('[express]   - GET /api/docs/stats - Statistics and metrics');
 console.log('[express]   - GET /api/docs/health - Health status');
@@ -217,6 +215,10 @@ console.log('[express]   - GET /api/docs/markdown - Markdown documentation');
 console.log('[express] Dashboard available at /admin/api-docs');
 
 // Register Feature Flags API (early - needed by all other routes)
+app.use('/api/docs', apiDocsRouter);
+console.log('[express] API Documentation registered at /api/docs');
+
+// Feature flags are lightweight and can remain mounted here
 app.use('/api/feature-flags', featureFlagsRouter);
 console.log('[express] Feature Flags API registered at /api/feature-flags');
 
@@ -231,28 +233,9 @@ console.log('[express] Feature Flags API registered at /api/feature-flags');
 // console.log('[express]   - GET /api/logs/tail/:filename - Tail log file');
 // console.log('[express]   - GET /api/logs/search - Search logs');
 
-// Register Agent Abilities API
-app.use('/api/agents/abilities', agentAbilitiesRouter);
-console.log('[express] Agent Abilities API registered at /api/agents/abilities');
-
-// Register Flow Field analytics routes
-app.use('/api/analytics', flowFieldRouter);
-app.use('/api/analytics', flowFieldBacktestRouter);
-
-// Register Enhanced Analytics (with CoinGecko sentiment)
-app.use('/api/analytics', enhancedAnalyticsRouter);
-
-// Removed Fast Scanner routes registration
-// app.use('/api/scanner', fastScannerRouter);
-
-// Register Scanner routes
-app.use('/api/scanner', scannerRouter);
-app.use('/api/scanner/analysis', scannerAnalysisRouter);
-console.log('[express] Scanner API registered at /api/scanner');
-console.log('[express] Scanner Analysis API registered at /api/scanner/analysis');
-
-// Register CoinGecko sentiment & market data routes
-app.use('/api/coingecko', coinGeckoRouter);
+// Core API routers (analytics, scanner, ml, coinGecko, paper-trading, live-trading, etc.)
+// are registered centrally inside registerRoutes(app) to avoid duplicate mounts.
+console.log('[express] Core API router mounting deferred to registerRoutes() to avoid duplicates');
 // Register Symbol Universe API  - TEMPORARILY DISABLED FOR DEBUG
 // import symbolUniverseRouter from './routes/api/symbol-universe';
 // app.use('/api/symbol-universe', symbolUniverseRouter);
@@ -897,6 +880,10 @@ app.use((req, res, next) => {
   // Initialize and start market data fetcher (auto-fetches BTC, ETH, SOL, etc)
   const { aggregator, cacheManager, rateLimiter } = getGatewayServices();
 
+  if (!aggregator) {
+    throw new Error('[MarketDataFetcher] Gateway aggregator is not ready');
+  }
+
   // Initialize signal engine for analysis
   const signalEngine = new SignalEngine(defaultTradingConfig);
 
@@ -912,6 +899,18 @@ app.use((req, res, next) => {
   (global as any).signalPipeline = signalPipeline;
 
   console.log('[MarketDataFetcher] Auto-fetch service started with signal generation');
+
+  // Start scanner scheduler (periodic autonomous scans)
+  try {
+    const ScannerScheduler = (await import('./services/scanner/scanner-scheduler')).default;
+    const scannerIntervalMinutes = Number(process.env.SCANNER_INTERVAL_MINUTES || '10');
+    const scannerScheduler = new ScannerScheduler(aggregator, cacheManager);
+    scannerScheduler.start(scannerIntervalMinutes);
+    (global as any).scannerScheduler = scannerScheduler;
+    console.log(`[ScannerScheduler] Scheduled every ${scannerIntervalMinutes} minutes`);
+  } catch (e) {
+    console.warn('[ScannerScheduler] Failed to initialize scanner scheduler:', (e as any).message || e);
+  }
 
   // Register API documentation dashboard (admin panel)
   app.get('/admin/api-docs', (req, res) => {
@@ -952,8 +951,12 @@ app.use((req, res, next) => {
   // setting up all the other routes so the catch-all route
   // doesn't interfere with the other routes
   const isProduction = process.env.NODE_ENV === "production";
-  if (isProduction) {
+  const serveFrontend = process.env.SERVE_FRONTEND !== 'false';
+  if (isProduction && serveFrontend) {
     serveStatic(app);
+    console.log('[express] Frontend static assets enabled');
+  } else if (isProduction && !serveFrontend) {
+    console.log('[express] Frontend static assets disabled via SERVE_FRONTEND=false');
   } else {
     console.log('[express] Setting up Vite dev server...');
     await setupVite(app, server);

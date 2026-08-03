@@ -9,6 +9,7 @@ start/stop commands to the runtime store.
 """
 import asyncio
 import logging
+import os
 from datetime import datetime
 import time
 
@@ -112,13 +113,42 @@ def main():
 
 
 if __name__ == '__main__':
-                            try:
-                                metrics.inc('status_update_failures')
-                            except Exception:
-                                pass
+    # Optionally auto-start the continuous scanner via runtime command
+    try:
+        AUTO_START = os.getenv('SCANNER_AUTO_START', 'true').lower() in ('1', 'true', 'yes')
+        if AUTO_START:
+            try:
+                existing = task_store.load_runtime('continuous_scanner:command')
+            except Exception:
+                existing = None
+
+            if not existing:
+                symbols_env = os.getenv('SCANNER_SYMBOLS')
+                if symbols_env:
+                    symbols = [s.strip() for s in symbols_env.split(',') if s.strip()]
+                else:
+                    symbols = [
+                        'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT',
+                        'ADA/USDT', 'DOGE/USDT', 'MATIC/USDT', 'DOT/USDT', 'LINK/USDT'
+                    ]
+
+                exchanges_env = os.getenv('SCANNER_EXCHANGES')
+                exchanges = [e.strip() for e in exchanges_env.split(',')] if exchanges_env else ['binance', 'kucoinfutures']
+
+                scan_interval_min = int(os.getenv('SCANNER_SCAN_INTERVAL_MINUTES', '15'))
+                cfg = {'scan_interval': scan_interval_min * 60}
+
+                try:
+                    task_store.save_runtime('continuous_scanner:command', {
+                        'action': 'start',
+                        'symbols': symbols,
+                        'exchanges': exchanges,
+                        'config': cfg
+                    })
+                    logger.info(f"Auto-start queued continuous scanner (interval {scan_interval_min}m) for {len(symbols)} symbols on {exchanges}")
+                except Exception:
+                    logger.exception('Failed to queue auto-start command for continuous scanner')
+    except Exception:
+        logger.exception('Failed while evaluating scanner auto-start')
+
     main()
-                    # sample metrics periodically
-                    try:
-                        metrics.sample()
-                    except Exception:
-                        logger.exception('Metrics sampling failed')

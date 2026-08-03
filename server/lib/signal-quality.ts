@@ -4,11 +4,8 @@
  * Ensures only high-quality signals are presented to users
  */
 
-import pkg from '@prisma/client';
-const { PrismaClient } = pkg as any;
 import { SignalAccuracyEngine } from './signal-accuracy';
-
-const prisma = new PrismaClient();
+import { db } from '../db-storage';
 
 export interface SignalMetrics {
   id: string;
@@ -225,11 +222,8 @@ export class SignalQualityEngine {
     }
 
     try {
-      const signals = await prisma.signal.findMany({
-        where: { type: signalType, symbol },
-        take: 100,
-        orderBy: { timestamp: 'desc' }
-      });
+      const res = await db.query('SELECT * FROM "Signal" WHERE type = $1 AND symbol = $2 ORDER BY "timestamp" DESC LIMIT 100', [signalType, symbol]);
+      const signals = res.rows || [];
 
       if (signals.length === 0) return 0.5; // Default to 50% if no history
 
@@ -259,7 +253,7 @@ export class SignalQualityEngine {
    * Returns a Map keyed by `${type}:${symbol}` -> accuracy (0-1).
    */
   async preloadHistoricalAccuracy(signals: SignalMetrics[]): Promise<Map<string, number>> {
-    const prismaAny = prisma as any;
+    const prismaAny = (db as any).prisma as any;
     const pairs = new Map<string, { type: string; symbol: string }>();
     for (const s of signals) {
       const key = `${s.type}:${s.symbol}`;
@@ -297,9 +291,8 @@ export class SignalQualityEngine {
     `;
 
     try {
-      // prisma.$queryRawUnsafe used because dynamic parameter count
-      // eslint-disable-next-line @typescript-eslint/no-unsafe-call
-      const rows: any[] = await prismaAny.$queryRawUnsafe(sql, ...params);
+      const rowsRes = await db.query(sql, params);
+      const rows: any[] = rowsRes.rows || [];
       for (const r of rows) {
         const tot = (Number(r.wins) || 0) + (Number(r.losses) || 0);
         const acc = tot > 0 ? (Number(r.wins) || 0) / tot : 0.5;
