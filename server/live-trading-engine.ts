@@ -730,6 +730,15 @@ export class LiveTradingEngine extends EventEmitter {
     return entry;
   }
 
+  resolveFundingBaseline(symbol: string, reason: string): void {
+    this.fundingAccounting.attestInitialCoverage(symbol, reason);
+    safetyEventLog.record({
+      type: 'funding_baseline_resolved',
+      detail: `funding baseline for ${symbol} attested by operator`,
+      data: { symbol, reason: reason.trim() },
+    });
+  }
+
   /**
    * Start live trading engine
    */

@@ -167,8 +167,11 @@ that no longer exist and are not wired into the runner.
 4. Set `TRADING_OPERATOR_TOKEN` (32+ random bytes). Without it all trading
    control endpoints answer `503`.
    Configure explicit funding lookback and recheck intervals in the engine
-   integration; the initial lookback is bounded and never proves older
-   funding was accounted for.
+   integration. A complete venue response can prove coverage when its first
+   page is short at the requested boundary; otherwise funding older than the
+   bounded initial lookback requires the authenticated
+   (`TRADING_OPERATOR_TOKEN`), audited baseline attestation endpoint below:
+   `POST /api/live-trading/funding/attest`.
 5. Set risk limits explicitly — defaults are deliberately small:
    `RISK_MAX_POSITION_USD`, `RISK_MAX_TOTAL_EXPOSURE_USD`,
    `RISK_MAX_SYMBOL_EXPOSURE_USD`, `RISK_MAX_OPEN_POSITIONS`,
@@ -200,8 +203,10 @@ that no longer exist and are not wired into the runner.
   below only after exchange records are reviewed.
 - `funding_unaccounted`, `funding_state_unreadable` or `funding_unknown` →
   perpetual/swap funding is not provable; reconcile the venue history before
-  clearing the block. Treat `ALLOW_UNACCOUNTED_FUNDING=1` as an incident-level
-  exception, not normal operation.
+  clearing the block. If older coverage cannot be proven from the venue
+  response, use the symbol-specific baseline attestation procedure below after
+  reviewing exchange evidence. Treat `ALLOW_UNACCOUNTED_FUNDING=1` as an
+  incident-level exception, not normal operation.
 
 ## 7. Rollback and incident recovery
 
@@ -221,6 +226,15 @@ that no longer exist and are not wired into the runner.
   Wildcards, bulk clearing, automatic expiry and editing the original ledger
   record are forbidden. The request is audited as `shared-operator-token`, and
   both durable records must show the resolution before execution resumes.
+- **Unknown funding baseline:** keep contract execution stopped and review the
+  venue's funding export for the exact symbol. If the bounded initial query
+  cannot prove older coverage, call
+  `POST /api/live-trading/funding/attest` with the shared operator token and
+  `{ "symbol": "<exact symbol>", "reason": "<evidence>" }`. The symbol must be
+  specific; wildcard or bulk clearing is forbidden. The attestation is
+  durably recorded in funding state and audited as `shared-operator-token`; it
+  clears only that symbol's initial baseline gap. Failed or truncated later
+  queries create a new unknown and must be investigated again.
 - **After an incident:** compare exchange positions/orders against
   `/api/live-trading/status` before clearing the kill switch — there is no
   automatic startup reconciliation yet (see §4). Clear the breaker, then resume
@@ -403,10 +417,16 @@ block live execution for contract markets. Spot markets do not require funding
 accounting. `ALLOW_UNACCOUNTED_FUNDING=1` is the sole deliberate escape hatch;
 it is recorded as an operator-visible safety event and must not be treated as a
 normal operating mode. The first reconciliation uses an explicit bounded
-initial lookback and records that funding older than that window remains
-unaccounted/unknown; subsequent funding checks do not silently clear that
-condition. The default initial window is 24 hours and is bounded to seven
-days; the default minimum recheck interval is one hour.
+initial lookback. Coverage becomes known without attestation only when the
+venue response proves the requested window (for example, a short first page
+at the boundary); a symbol whose older history remains unprovable stays
+unknown until an operator-attested baseline is recorded through
+`POST /api/live-trading/funding/attest`. The attestation requires one exact
+symbol and a reason, is durable and audited, and cannot clear another
+symbol's gap. The default initial window is 24 hours and is bounded to seven
+days; the default minimum recheck interval is one hour. Known answers are
+cached only within the recheck interval. Unknown answers are never reused,
+and failed or truncated later queries return to unknown.
 Subsequent queries page until a short response, advance the cursor only after
 complete pagination, and reuse only a durable known answer within the minimum
 recheck interval; unknown answers are never cached.

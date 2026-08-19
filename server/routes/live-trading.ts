@@ -154,6 +154,28 @@ router.post(
   }
 );
 
+router.post(
+  '/funding/attest',
+  requireTradingOperator,
+  audit('resolve_funding_baseline', (req) => String(req.body?.symbol ?? '')),
+  (req: Request, res: Response) => {
+    const body = req.body ?? {};
+    const symbol = typeof body.symbol === 'string' ? body.symbol.trim() : '';
+    const reason = typeof body.reason === 'string' ? body.reason.trim() : '';
+    if (!symbol || symbol === '*' || symbol.includes('*')) {
+      return res.status(400).json({ success: false, error: 'A specific funding symbol is required' });
+    }
+    if (!reason) return res.status(400).json({ success: false, error: 'Baseline reason is required' });
+    try {
+      liveTradingEngine.resolveFundingBaseline(symbol, reason);
+      return res.json({ success: true, symbol });
+    } catch (error: any) {
+      const message = error?.message ? String(error.message) : 'Unable to attest funding baseline';
+      return res.status(409).json({ success: false, error: message });
+    }
+  }
+);
+
 /**
  * GET /api/live-trading/positions
  * Get open positions

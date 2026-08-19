@@ -23,15 +23,9 @@ describe('funding accounting', () => {
         timestamp: 1_700_000_000_000,
       }],
     };
-    expect(await accounting.reconcile(exchange, 'BTC/USDT:USDT')).toMatchObject({
-      status: 'unknown',
-      reason: 'funding_history_older_than_initial_lookback',
-    });
+    expect(await accounting.reconcile(exchange, 'BTC/USDT:USDT')).toMatchObject({ status: 'known' });
     now += 60_001;
-    expect(await accounting.reconcile(exchange, 'BTC/USDT:USDT')).toMatchObject({
-      status: 'unknown',
-      reason: 'funding_history_older_than_initial_lookback',
-    });
+    expect(await accounting.reconcile(exchange, 'BTC/USDT:USDT')).toMatchObject({ status: 'known' });
     expect(accounting.payments()).toHaveLength(1);
   });
 
@@ -63,7 +57,7 @@ describe('funding accounting', () => {
     expect(calls[1]).toBeGreaterThan(calls[0]);
   });
 
-  it('does not reuse unknown funding answers and rechecks known answers only after the interval', async () => {
+  it('does not reuse unknown funding answers', async () => {
     let now = 1_800_000_000_000;
     let queries = 0;
     const accounting = new FundingAccounting({
@@ -77,19 +71,13 @@ describe('funding accounting', () => {
       markets: { BTC: { type: 'swap' } },
       fetchFundingHistory: async () => {
         queries += 1;
-        return [];
+        throw new Error('history unavailable');
       },
     };
     expect((await accounting.reconcile(exchange, 'BTC')).status).toBe('unknown');
     now += 1;
     expect((await accounting.reconcile(exchange, 'BTC')).status).toBe('unknown');
     expect(queries).toBe(2);
-    now += 1;
-    await accounting.reconcile(exchange, 'BTC');
-    expect(queries).toBe(3);
-    now += 60_000;
-    await accounting.reconcile(exchange, 'BTC');
-    expect(queries).toBe(4);
   });
 
   it('reuses a durable known answer only within the configured interval', async () => {
@@ -102,6 +90,8 @@ describe('funding accounting', () => {
       lastCheckedAt: { BTC: now - 1 },
       lastKnownAt: { BTC: now - 1 },
       initialLookbackUnknown: {},
+      initialLookbackSince: {},
+      baselineAttestations: {},
     }));
     const accounting = new FundingAccounting({ filePath, clock: () => now, recheckIntervalMs: 60_000 });
     expect(accounting.load().status).toBe('ok');
@@ -118,6 +108,69 @@ describe('funding accounting', () => {
     now += 60_000;
     expect((await accounting.reconcile(exchange, 'BTC')).status).toBe('known');
     expect(queries).toBe(1);
+  });
+
+  it('proves initial coverage when the venue returns a short page at the boundary', async () => {
+    const accounting = new FundingAccounting({
+      filePath: statePath(),
+      clock: () => 1_800_000_000_000,
+      initialLookbackMs: 1_000,
+    });
+    accounting.load();
+    expect(await accounting.reconcile({
+      markets: { BTC: { type: 'swap' } },
+      fetchFundingHistory: async () => [{
+        id: 'p1',
+        amount: 1,
+        currency: 'USDT',
+        timestamp: 1_800_000_000_000,
+      }],
+    }, 'BTC')).toMatchObject({ status: 'known' });
+  });
+
+  it('attests one unknown baseline and requires a new gap to block again', async () => {
+    let now = 1_800_000_000_000;
+    const accounting = new FundingAccounting({
+      filePath: statePath(),
+      clock: () => now,
+      initialLookbackMs: 1_000,
+      recheckIntervalMs: 0,
+    });
+    accounting.load();
+    const full = Array.from({ length: 200 }, (_, index) => ({
+      id: `p-${index}`,
+      amount: 1,
+      currency: 'USDT',
+      timestamp: now + index,
+    }));
+    const calls: Record<string, number> = {};
+    const exchange = {
+      markets: { BTC: { type: 'swap' }, ETH: { type: 'swap' } },
+      fetchFundingHistory: async (symbol: string) => {
+        calls[symbol] = (calls[symbol] ?? 0) + 1;
+        if (calls[symbol] <= 2) return calls[symbol] === 1 ? full : [];
+        if (symbol === 'BTC' && calls[symbol] === 3) return [];
+        if (symbol === 'BTC') {
+          if (calls[symbol] === 4) return full;
+          throw new Error('truncated history');
+        }
+        return [];
+      },
+    };
+
+    expect((await accounting.reconcile(exchange, 'BTC')).status).toBe('unknown');
+    expect((await accounting.reconcile(exchange, 'ETH')).status).toBe('unknown');
+    accounting.attestInitialCoverage('BTC', 'venue export reviewed to establish baseline');
+    const persisted = JSON.parse(fs.readFileSync(accounting.getPath(), 'utf8'));
+    expect(persisted.initialLookbackUnknown).toMatchObject({ BTC: false, ETH: true });
+    expect(persisted.baselineAttestations.BTC).toMatchObject({
+      symbol: 'BTC',
+      reason: 'venue export reviewed to establish baseline',
+    });
+    expect((await accounting.reconcile(exchange, 'BTC')).status).toBe('known');
+    expect((await accounting.reconcile(exchange, 'ETH')).status).toBe('unknown');
+    now += 1;
+    expect((await accounting.reconcile(exchange, 'BTC')).status).toBe('unknown');
   });
 
   it('refuses unsupported and failed funding queries as unknown', async () => {

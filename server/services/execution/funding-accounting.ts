@@ -15,6 +15,12 @@ export interface FundingPayment {
   timestamp: number;
 }
 
+interface FundingBaselineAttestation {
+  symbol: string;
+  reason: string;
+  attestedAt: string;
+}
+
 interface FundingState {
   schemaVersion: number;
   writtenAt: string;
@@ -22,6 +28,8 @@ interface FundingState {
   lastCheckedAt: Record<string, number>;
   lastKnownAt: Record<string, number>;
   initialLookbackUnknown: Record<string, boolean>;
+  initialLookbackSince: Record<string, number>;
+  baselineAttestations: Record<string, FundingBaselineAttestation>;
 }
 
 export type FundingLoadResult =
@@ -83,6 +91,8 @@ export class FundingAccounting {
     lastCheckedAt: {},
     lastKnownAt: {},
     initialLookbackUnknown: {},
+    initialLookbackSince: {},
+    baselineAttestations: {},
   };
 
   constructor(options: FundingAccountingOptions = {}) {
@@ -108,16 +118,19 @@ export class FundingAccounting {
         lastCheckedAt: {},
         lastKnownAt: {},
         initialLookbackUnknown: {},
+        initialLookbackSince: {},
+        baselineAttestations: {},
       };
       return { status: 'absent' };
     }
     try {
       const parsed: unknown = JSON.parse(fs.readFileSync(this.filePath, 'utf8'));
-      if (!this.isValidState(parsed)) {
+      const normalized = this.normalizeState(parsed);
+      if (!this.isValidState(normalized)) {
         return { status: 'unreadable', reason: 'unknown or invalid funding state schema' };
       }
-      this.state = parsed;
-      return { status: 'ok', state: parsed };
+      this.state = normalized;
+      return { status: 'ok', state: normalized };
     } catch (error: any) {
       return {
         status: 'unreadable',
@@ -139,12 +152,16 @@ export class FundingAccounting {
       return { status: 'known', payments: [] };
     }
 
+    const since = this.state.lastCheckedAt[symbol] ?? now - this.initialLookbackMs;
     const initial = this.state.lastCheckedAt[symbol] === undefined;
     const initialCoverageUnknown = this.state.initialLookbackUnknown[symbol] === true;
-    const since = this.state.lastCheckedAt[symbol] ?? now - this.initialLookbackMs;
+    const initialBoundary = this.state.initialLookbackSince[symbol] ?? since;
     const rows: any[] = [];
     let pageSince = since;
     let complete = false;
+    let firstPage = true;
+    let firstPageShort = false;
+    let oldestTimestamp = Number.POSITIVE_INFINITY;
     for (let page = 0; page < 1000; page += 1) {
       let response: unknown;
       try {
@@ -158,6 +175,14 @@ export class FundingAccounting {
       }
       if (!Array.isArray(response)) return { status: 'unknown', reason: 'funding_history_unusable', payments: [] };
       rows.push(...response);
+      if (firstPage) {
+        firstPageShort = response.length < FUNDING_PAGE_LIMIT;
+        firstPage = false;
+      }
+      for (const row of response) {
+        const timestamp = Number(row?.timestamp ?? (row?.datetime ? Date.parse(row.datetime) : NaN));
+        if (finite(timestamp)) oldestTimestamp = Math.min(oldestTimestamp, timestamp);
+      }
       if (response.length < FUNDING_PAGE_LIMIT) {
         complete = true;
         break;
@@ -176,6 +201,9 @@ export class FundingAccounting {
       pageSince = nextSince;
     }
     if (!complete) return { status: 'unknown', reason: 'funding_history_pagination_limit', payments: [] };
+    const coverageProven = initial
+      ? firstPageShort || oldestTimestamp <= initialBoundary
+      : oldestTimestamp <= initialBoundary;
 
     const additions: FundingPayment[] = [];
     for (const row of rows) {
@@ -202,9 +230,12 @@ export class FundingAccounting {
     const nextLastCheckedAt = { ...this.state.lastCheckedAt };
     const nextLastKnownAt = { ...this.state.lastKnownAt };
     nextLastCheckedAt[symbol] = now;
-    if (!initial && !initialCoverageUnknown) nextLastKnownAt[symbol] = now;
+    const coverageUnknown = (initial || initialCoverageUnknown) && !coverageProven;
+    if ((!initial && !coverageUnknown) || (initial && coverageProven)) nextLastKnownAt[symbol] = now;
     const nextInitialLookbackUnknown = { ...this.state.initialLookbackUnknown };
-    if (initial) nextInitialLookbackUnknown[symbol] = true;
+    if (initial) nextInitialLookbackUnknown[symbol] = !coverageProven;
+    const nextInitialLookbackSince = { ...this.state.initialLookbackSince };
+    if (initial) nextInitialLookbackSince[symbol] = since;
     const next: FundingState = {
       schemaVersion: FUNDING_STATE_SCHEMA_VERSION,
       writtenAt: new Date(now).toISOString(),
@@ -212,6 +243,8 @@ export class FundingAccounting {
       lastCheckedAt: nextLastCheckedAt,
       lastKnownAt: nextLastKnownAt,
       initialLookbackUnknown: nextInitialLookbackUnknown,
+      initialLookbackSince: nextInitialLookbackSince,
+      baselineAttestations: { ...this.state.baselineAttestations },
     };
     try {
       this.write(next);
@@ -219,7 +252,7 @@ export class FundingAccounting {
     } catch {
       return { status: 'unknown', reason: 'funding_state_persistence_failed', payments: additions };
     }
-    if (initial || initialCoverageUnknown) {
+    if (coverageUnknown) {
       return {
         status: 'unknown',
         reason: 'funding_history_older_than_initial_lookback',
@@ -227,6 +260,32 @@ export class FundingAccounting {
       };
     }
     return { status: 'known', payments: additions };
+  }
+
+  attestInitialCoverage(symbol: string, reason: string): void {
+    if (!symbol || symbol.includes('*')) throw new Error('a specific funding symbol is required');
+    if (!reason.trim()) throw new Error('funding baseline reason is required');
+    if (this.state.initialLookbackUnknown[symbol] !== true) {
+      throw new Error('funding baseline is not awaiting attestation');
+    }
+    const now = this.clock();
+    const next: FundingState = {
+      ...this.state,
+      writtenAt: new Date(now).toISOString(),
+      initialLookbackUnknown: { ...this.state.initialLookbackUnknown, [symbol]: false },
+      baselineAttestations: {
+        ...this.state.baselineAttestations,
+        [symbol]: {
+          symbol,
+          reason: reason.trim(),
+          attestedAt: new Date(now).toISOString(),
+        },
+      },
+      lastKnownAt: { ...this.state.lastKnownAt },
+    };
+    delete next.lastKnownAt[symbol];
+    this.write(next);
+    this.state = next;
   }
 
   payments(): FundingPayment[] {
@@ -278,6 +337,17 @@ export class FundingAccounting {
       !!state.initialLookbackUnknown &&
       typeof state.initialLookbackUnknown === 'object' &&
       Object.values(state.initialLookbackUnknown).every((unknown) => typeof unknown === 'boolean') &&
+      !!state.initialLookbackSince &&
+      typeof state.initialLookbackSince === 'object' &&
+      Object.values(state.initialLookbackSince).every((timestamp) => finite(timestamp)) &&
+      !!state.baselineAttestations &&
+      typeof state.baselineAttestations === 'object' &&
+      Object.values(state.baselineAttestations).every((attestation) =>
+        !!attestation &&
+        typeof attestation.symbol === 'string' &&
+        typeof attestation.reason === 'string' &&
+        typeof attestation.attestedAt === 'string'
+      ) &&
       state.payments.every((payment) =>
         payment &&
         typeof payment.id === 'string' &&
@@ -287,6 +357,19 @@ export class FundingAccounting {
         finite(payment.timestamp)
       )
     );
+  }
+
+  private normalizeState(value: unknown): unknown {
+    if (!value || typeof value !== 'object') return value;
+    const state = value as Record<string, unknown>;
+    return {
+      ...state,
+      initialLookbackSince:
+        state.initialLookbackSince === undefined
+          ? { ...((state.lastCheckedAt as Record<string, number> | undefined) ?? {}) }
+          : state.initialLookbackSince,
+      baselineAttestations: state.baselineAttestations === undefined ? {} : state.baselineAttestations,
+    };
   }
 }
 
