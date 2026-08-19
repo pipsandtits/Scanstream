@@ -33,6 +33,7 @@ import {
 } from './services/execution/fill-accounting';
 import { reconcileAtStartup, type ReconciliationReport } from './services/execution/startup-reconciler';
 import { safetyEventLog } from './services/observability/safety-event-log';
+import { getSharedService } from './services/shared-service-registry';
 import {
   DurableLocalStateStore,
   type LocalStateLoadResult,
@@ -1184,7 +1185,7 @@ export class LiveTradingEngine extends EventEmitter {
 
     // Ensure market data is healthy for this symbol via TruthEngine
     try {
-      const truth = (global as any).truthEngine as any;
+      const truth = getSharedService('truthEngine');
       if (truth && typeof truth.isTradeable === 'function') {
         const tradeable = truth.isTradeable(signal.symbol, {
           minSources: Number(process.env.MIN_TRUTH_SOURCES) || 2,
@@ -1309,7 +1310,7 @@ export class LiveTradingEngine extends EventEmitter {
       let amount = positionSizeUSD / signal.price;
       // If TruthEngine consensus price exists, prefer it for amount calculation
       try {
-        const truth = (global as any).truthEngine as any;
+        const truth = getSharedService('truthEngine');
         if (truth && typeof truth.getConsensus === 'function') {
           const cons = truth.getConsensus(signal.symbol);
           if (cons && typeof cons.price === 'number' && cons.price > 0) {

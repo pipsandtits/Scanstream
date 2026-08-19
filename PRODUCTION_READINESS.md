@@ -15,8 +15,8 @@ Verification environment: Node 22.12.0, pnpm 10.15.0, PostgreSQL not attached
 | `typescript@6.0.3`, `@types/node@25.9.1`, `zod@4.4.3` do not exist on npm | **Refuted** | `npm view` resolves all three; they are current releases |
 | `prisma@7.8.0` unusable | **Confirmed (real P0)** | `prisma generate` failed: Prisma 7 removed `datasource.url` in schema and requires a driver adapter, while `prisma/schema.prisma` and `new PrismaClient()` in `server/db-storage.ts` are Prisma 6 style. The client could therefore never be generated, so **every** deployment silently ran on the in-memory fallback. Pinned `prisma`/`@prisma/client` to `6.19.3`, which matches the committed schema and client usage |
 | Dual ORM confusion | **Partly confirmed, no migration needed** | `drizzle-orm` is imported **only** by `shared/schema.ts` (table + `drizzle-zod` insert-schema definitions used as types); server code imports it 0 times and there is no drizzle migration directory. Prisma is the sole runtime ORM (`server/db-storage.ts`). Authoritative path: **Prisma for persistence, Drizzle purely as schema/zod type source.** Documented rather than changed — removing Drizzle would touch 39 server type imports for no safety gain |
-| Global state abuse | **Confirmed, not addressed in this pass** | 36 `(global as any)` service handoffs in `server/`. Refactoring to DI is a wide, behaviour-changing change with no capital-safety payoff; tracked below |
-| O(n²) indicator recalculation | **Not reproduced in this pass** | Not measured; left as an open P2 item rather than asserted either way |
+| Global state abuse | **Partially addressed in Pass 4E** | Capital-adjacent `truthEngine` handoffs now use the typed shared-service registry; non-capital bridges, analytics globals and legacy service publication remain inventoried below. A full DI refactor is intentionally out of scope |
+| O(n²) indicator recalculation | **Measured in Pass 4E** | The committed fixed-fixture benchmark reports per-indicator median cost below; it is measurement evidence, not a CI performance gate |
 | Disabled routes in main | **Confirmed** | `server/index.ts` has a ~200-line `BINARY SEARCH: TEMPORARILY DISABLE ALL ROUTERS` comment block covering ~25 route groups. Left disabled deliberately: re-enabling them blind would reintroduce whatever crash the binary search was chasing. Each group needs individual triage |
 | No tests / no CI | **Confirmed, fixed** | No runner was configured. Vitest is now wired up (`pnpm test`) with 82 passing tests, and `.github/workflows/ci.yml` runs install → prisma generate → tests → build |
 | No LICENSE despite MIT claim | **Confirmed, fixed** | `LICENSE` (MIT) added to match README |
@@ -145,9 +145,9 @@ that no longer exist and are not wired into the runner.
 | P1 | `TRADING_OPERATOR_TOKEN` is a single shared secret with no rotation, per-user identity or audit trail — an interim guard, not an authz design. Read-only status routes remain unauthenticated |
 | P1 | ~25 route groups remain commented out in `server/index.ts`; unknown functional gaps |
 | P1 | Safety metrics are process-local and reset on restart; no Prometheus/OTel exporter, no correlation IDs end-to-end |
-| P1 | `typecheck` reports 362 pre-existing errors (mostly legacy `tests/` and Express 5 `req.params` typing). CI does not gate on it; the number was unchanged by this pass and none of the new files error |
-| P2 | 36 `(global as any)` service handoffs; no DI |
-| P2 | Indicator recomputation cost unmeasured; full market-data replay/MIXED parity remains unverified |
+| P1 | `typecheck` reports a 362-error legacy baseline; one safe `server/routes` narrowing is now fixed, leaving 361 errors. CI does not gate on it; the remaining errors are classified below |
+| P2 | Capital-adjacent `truthEngine` handoffs are typed through a registry; remaining non-capital global handoffs are inventoried below and full DI remains open |
+| P2 | Indicator cost is measured over a committed fixture; full market-data replay/MIXED parity remains unverified |
 | P2 | Rich `/api/health` still contains hard-coded exchange counts and placeholder freshness values |
 
 ---
@@ -373,7 +373,7 @@ distinctions are unchanged.
 | P1 | **Partially closed in Pass 4C:** fixture-driven paper/live gate observations and order-intent parity; full market-data replay and MIXED-mode parity remain unexercised |
 | P1 | **Partially closed in Pass 4C:** concurrent flatten, operator stop during an in-flight order, and stale TruthEngine refusal are covered; the ticker cache has no capital-adjacent consumer, so cache-specific gate wiring remains unproven |
 | P1 | **Partially closed in Pass 4D:** `/api/agents/services-api`, `/api/model-performance`, and guarded `/api/execution` are covered and restored; every other classified group remains disabled pending complete route-level coverage and safety review |
-| P2 | Legacy `tests/` suites and the 362-error typecheck baseline are still unclassified; `(global as any)` handoffs and indicator cost remain unmeasured |
+| P2 | **Partially closed in Pass 4E:** the 362-error baseline is classified below; safe registry and measurement work is complete, while legacy type errors and non-capital global handoffs remain open |
 
 Scanstream is **not** production-ready for live capital on this branch. The
 direction of failure is now defensive — it refuses to trade when it cannot prove
@@ -506,7 +506,119 @@ work is tracked below rather than hidden by this pass.
 | P1 | **Closed in Pass 4B:** venue-scoped keys, explicit age bounds, invalidation, concurrency limits, single-flight, failure backoff and memory-only restart semantics. No persisted live cache was found, so persisted-cache corruption is not applicable |
 | P1 | **Partially closed in Pass 4C:** fixture-driven paper/live gate observations and order-intent parity, plus a REPLAY confidence-scorer oracle; the full historical pipeline and MIXED mode are not reproducible in-process |
 | P1 | **Partially closed in Pass 4D:** route-level contracts and operator audit coverage restored `/api/agents/services-api` and `/api/execution`; all other disabled groups remain disabled pending per-route coverage |
-| P2 | Legacy 362-error typecheck baseline classification, `(global as any)` handoffs and indicator cost measurement |
+| P2 | **Partially closed in Pass 4E:** 362-error classification is committed; capital-adjacent `truthEngine` handoffs use a typed registry; indicator costs are measured. Legacy errors, non-capital globals and full DI remain open |
+
+#### Pass 4E typecheck classification
+
+The fresh Pass 4E baseline is 362 errors. Counts are semantic rather than
+duplicates of TypeScript error codes; an error is assigned to the first
+applicable cause in this table.
+
+| Cause | Total | `server/routes` | other `server/` | `tests/` | `client/` | Assessment |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Express 5 `req.params`/path values remain `string \| string[]` | 97 | 95 | 2 | 0 | 0 | Typing gap, but each route needs a correctly typed parameter contract; blanket coercion could hide malformed requests |
+| Implicit-any callback or handler parameters | 65 | 37 | 2 | 0 | 26 | Typing gaps where the surrounding API shape is known; scattered legacy callbacks need local domain types |
+| Missing module or path | 8 | 0 | 2 | 5 | 1 | Five legacy `tests/` imports target removed/moved modules; no unambiguous replacement was found, so files remain as findings |
+| Missing name/import or dead symbol | 53 | 0 | 11 | 0 | 42 | Requires distinguishing a removed feature from a missing import before changing behavior |
+| Null/undefined flow not narrowed | 14 | 12 | 2 | 0 | 0 | Several gateway singleton checks are safety-sensitive and require an explicit unavailable-service response |
+| Domain/API/type-shape mismatch, including possible latent defects | 125 | 28 | 23 | 0 | 74 | Not treated as cosmetic: wrong model fields, method names, interface implementations and argument shapes require owner review |
+| **Total** | **362** | **172** | **40** | **5** | **145** | Baseline |
+
+The raw TypeScript-code counts are TS2345 85, TS2339 83, TS7006 65,
+TS2304 53, TS18047 13, TS2349 11, TS2554 11, TS2307 8, TS2538 7,
+TS2367 6, TS2322 5, TS2552 4, TS2769 3, TS2353 2, and one each of
+TS2459, TS2664, TS18048, TS2420, TS2739 and TS2341.
+
+One safe legacy error was reduced without changing behavior: the disabled
+`server/routes/user-settings.ts` auth middleware now uses the existing
+`AuthRequest` domain type, removing its `req.user` property error. No error was
+reduced by suppression, `any`, an unsafe double cast, signature widening, or
+test deletion. The safe reduction count is 1: `server/routes` is 171 and the
+post-change total is 361; `other server/` remains 40, `tests/` remains 5, and
+`client/` remains 145. The registry and benchmark changes do not alter the
+other legacy errors. In particular, the five missing test
+modules are reported rather than papered over:
+
+| File | Missing import |
+| --- | --- |
+| `tests/test-backtest.ts` | `./server/services/historical-backtester.js` |
+| `tests/test-physics-validation-standalone.ts` | `./server/services/vfmd/types` |
+| `tests/test-rtm-force-decay.ts` | `./server/services/physics-based-rtm-engine` |
+| `tests/test-validation-improvements.ts` | `./server/services/rpg-agents/VFMDPhysicsAgent` |
+| `tests/test-validation-improvements.ts` | `./server/services/vfmd/types` |
+
+#### Pass 4E typed shared-service registry
+
+`server/services/shared-service-registry.ts` declares the typed
+`SharedServiceMap` and `getSharedService`/`setSharedService` operations.
+Missing services return `undefined`; callers must retain their existing
+fail-closed or optional behavior. The capital-adjacent `truthEngine` handoff
+was converted at:
+
+- `server/services/clustering/cluster-validator.ts`
+- `server/services/gateway/exchange-aggregator.ts`
+- `server/live-trading-engine.ts`
+- `server/paper-trading-engine.ts`
+- `server/rl-position-agent.ts`
+- `server/index.ts`
+- `server/__tests__/pass4c-parity-failure-injection.test.ts`
+
+The registry intentionally does not perform a dependency-injection refactor.
+Remaining global handoffs are unchanged and inventoried here:
+
+- `server/live-trading-engine.ts`: `rlPositionAgent` (three reads)
+- `server/routes/scout-report-routes.ts`: `scoutReportService`
+- `server/services/websocket-signals.ts`: `__wss_bridge`, `__bridgeBroadcast`
+- `server/services/coingecko.ts`: market-cap/volume aggregate globals
+- `server/websocket-bridge.ts`: bridge initialization, websocket instances,
+  broadcast and client-count globals
+- `server/index.ts`: `scoutReportService`, `executionEngine`,
+  `crossExchangeAggregator`, `discoveryAgent`, `arbitrageAgent`,
+  `portfolioAgent`, `marketDataFetcher`, `signalPipeline`, and
+  `scannerScheduler` publication/cleanup
+
+These remaining handoffs are non-capital shared infrastructure, analytics,
+or legacy lifecycle publication. They remain a separate migration decision;
+they were not widened or silently replaced with an untyped registry entry.
+
+#### Pass 4E indicator computation measurement
+
+`scripts/measure-indicator-cost.ts` runs the production
+`OptimizedMomentumScanner.computeScore` path and measures each dependency-free
+indicator over a committed deterministic 256-frame `FIXTURE/USDT` 1-minute
+fixture. It uses five warmups and 40 samples, reporting the median per
+indicator. On this machine (Linux x86_64, two Intel Xeon Platinum 8559C
+vCPUs, Node v22.12.0), the scanner path computed 22 indicators in
+`0.8931 ms`; `ichimoku` and `volumeProfile` were explicitly deferred by the
+aggressive profile.
+
+| Indicator | Median ms | Relative |
+| --- | ---: | ---: |
+| `sma` | 0.0102 | 0.11% |
+| `ema` | 0.0075 | 0.08% |
+| `macd` | 0.0641 | 0.70% |
+| `rsi` | 0.0375 | 0.41% |
+| `slope` | 0.0067 | 0.07% |
+| `vwap` | 8.6752 | 94.22% |
+| `atr` | 0.0291 | 0.32% |
+| `bollingerBands` | 0.0066 | 0.07% |
+| `adx` | 0.1060 | 1.15% |
+| `stochastic` | 0.0078 | 0.08% |
+| `cci` | 0.0049 | 0.05% |
+| `williamsR` | 0.0062 | 0.07% |
+| `obv` | 0.0116 | 0.13% |
+| `mfi` | 0.0070 | 0.08% |
+| `cmf` | 0.0109 | 0.12% |
+| `aroon` | 0.0166 | 0.18% |
+| `tsi` | 0.1208 | 1.31% |
+| `elderRay` | 0.0169 | 0.19% |
+| `keltnerChannels` | 0.0248 | 0.27% |
+| `parabolicSAR` | 0.0300 | 0.33% |
+| `fibLevels` | 0.0023 | 0.03% |
+| `vwma` | 0.0050 | 0.05% |
+| **Summed per-indicator medians** | **9.2077** | **100%** |
+
+The benchmark is evidence for relative cost, not a CI performance gate.
 
 The parity fixture intentionally records the legitimate paper/live differences:
 live-only durability, funding and conversion gates; generated client-order IDs;

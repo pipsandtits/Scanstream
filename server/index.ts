@@ -26,6 +26,7 @@ import metricsRouter from './routes/metrics';
 import agentsRouter from './routes/agents';
 import tradeExecutionRouter from './routes/trade-execution';
 import modelPerformanceRouter from './routes/model-performance';
+import { getSharedService, setSharedService } from './services/shared-service-registry';
 // Removed fastScanner service import
 
 // API Registry System imports
@@ -668,7 +669,8 @@ app.use((req, res, next) => {
       const { TruthEngine } = await import('./services/aggregator/truth-engine');
       const truthEngine = new TruthEngine(integrityGate, crossAggregator);
       // Expose TruthEngine globally so agents and engines can access canonical consensus
-      try { (global as any).truthEngine = truthEngine; console.log('[TruthEngine] registered globally'); } catch (e) { /* ignore */ }
+      setSharedService('truthEngine', truthEngine);
+      console.log('[TruthEngine] registered in shared service registry');
 
       // Healing service for forward-fill / interpolation
       const { HealingService } = await import('./services/aggregator/healing-service');
@@ -996,7 +998,7 @@ app.use((req, res, next) => {
         await maybeStop(globalMarketDataLayer);
         await maybeStop((global as any).crossExchangeAggregator);
         await maybeStop((global as any).executionEngine);
-        await maybeStop((global as any).truthEngine);
+        await maybeStop(getSharedService('truthEngine'));
       } catch (e) {
         console.error('[process] Error during graceful shutdown:', e);
       } finally {
@@ -1021,7 +1023,7 @@ app.use((req, res, next) => {
         await maybeStop(globalMarketDataLayer);
         await maybeStop((global as any).crossExchangeAggregator);
         await maybeStop((global as any).executionEngine);
-        await maybeStop((global as any).truthEngine);
+        await maybeStop(getSharedService('truthEngine'));
         server.close(() => {
           console.log('[process] HTTP server closed');
           process.exit(0);

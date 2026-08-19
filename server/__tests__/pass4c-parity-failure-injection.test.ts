@@ -9,6 +9,7 @@ import { FundingAccounting } from '../services/execution/funding-accounting';
 import { getConfidenceScorer } from '../services/market-data/confidence-scorer';
 import { getModeDetector } from '../services/market-data/mode-detector';
 import { TruthEngine } from '../services/aggregator/truth-engine';
+import { getSharedService, setSharedService } from '../services/shared-service-registry';
 
 const FIXTURE = {
   symbol: 'BTC/USDT',
@@ -118,8 +119,8 @@ describe('Pass 4C paper/live parity fixtures', () => {
       'postgresql://scanstream:scanstream_dev_password@localhost:5432/scanstream?schema=public';
     durabilityGate.setProbe(async () => true);
     setLiveMode();
-    const previousTruth = (globalThis as any).truthEngine;
-    (globalThis as any).truthEngine = freshTruthEngine(FIXTURE.symbol);
+    const previousTruth = getSharedService('truthEngine');
+    setSharedService('truthEngine', freshTruthEngine(FIXTURE.symbol));
     const durabilityObservations: Array<{ testMode: boolean; durable: boolean; detail?: string }> = [];
     const gateSequences: Record<'paper' | 'live', string[]> = { paper: [], live: [] };
     const originalRequireForLive = durabilityGate.requireForLive.bind(durabilityGate);
@@ -217,7 +218,7 @@ describe('Pass 4C paper/live parity fixtures', () => {
     } finally {
       paper.dispose();
       live.dispose();
-      (globalThis as any).truthEngine = previousTruth;
+      setSharedService('truthEngine', previousTruth);
     }
   });
 
@@ -227,8 +228,8 @@ describe('Pass 4C paper/live parity fixtures', () => {
     modeDetector.recordTick('rest');
     modeDetector.recordEmitLag(120_000);
     expect(modeDetector.detectMode()).toBe('REPLAY');
-    const previousTruth = (globalThis as any).truthEngine;
-    (globalThis as any).truthEngine = freshTruthEngine(FIXTURE.symbol);
+    const previousTruth = getSharedService('truthEngine');
+    setSharedService('truthEngine', freshTruthEngine(FIXTURE.symbol));
     const createOrder = vi.fn(async () => ({ id: 'replay-order' }));
     const paper = prepareEngine(true, createOrder);
     const blocked: any[] = [];
@@ -247,7 +248,7 @@ describe('Pass 4C paper/live parity fixtures', () => {
       })]);
     } finally {
       paper.dispose();
-      (globalThis as any).truthEngine = previousTruth;
+      setSharedService('truthEngine', previousTruth);
     }
   });
 });
@@ -327,13 +328,16 @@ describe('Pass 4C failure injection', () => {
   });
 
   it('refuses stale TruthEngine consensus at a capital-adjacent gate', async () => {
-    const truth = (globalThis as any).truthEngine;
+    const truth = getSharedService('truthEngine');
     const actualTruth = freshTruthEngine(FIXTURE.symbol);
     // Use the real TruthEngine store and gate; only the consensus timestamp is
     // aged here to inject the stale condition without replacing isTradeable.
-    const consensus = (actualTruth as any).store.get(FIXTURE.symbol);
+    const consensus = actualTruth.getConsensus(FIXTURE.symbol);
+    if (!consensus) {
+      throw new Error('fixture TruthEngine did not produce consensus');
+    }
     consensus.timestamp = Date.now() - 120_000;
-    (globalThis as any).truthEngine = actualTruth;
+    setSharedService('truthEngine', actualTruth);
     const createOrder = vi.fn(async () => ({ id: 'stale-order' }));
     const engine = prepareEngine(true, createOrder);
     setLiveMode();
@@ -351,7 +355,7 @@ describe('Pass 4C failure injection', () => {
         reason: expect.stringMatching(/^stale:/),
       }));
     } finally {
-      (globalThis as any).truthEngine = truth;
+      setSharedService('truthEngine', truth);
       engine.dispose();
     }
   });
