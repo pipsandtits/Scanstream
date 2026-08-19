@@ -1079,6 +1079,15 @@ export class LiveTradingEngine extends EventEmitter {
       const scored = scorer.scoreWithCurrentMode(signal.confidence, 'execution');
       if (!scored.canTrade) {
         logger.info(`Signal blocked by mode-aware scorer: ${scored.reason}`);
+        recordExecutionBlocked('confidence_scorer_refused');
+        this.emit('executionBlocked', {
+          type: 'confidence',
+          reason: 'confidence_scorer_refused',
+          detail: scored.reason,
+          timestamp: Date.now(),
+          signalId: signal.id,
+          symbol: signal.symbol,
+        });
         return null;
       }
       // Use adjusted confidence for execution threshold checks

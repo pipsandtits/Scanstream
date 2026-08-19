@@ -49,7 +49,10 @@ export type OperatorAction =
   | 'circuit_breaker_activate'
   | 'circuit_breaker_clear'
   | 'resolve_realized_pnl'
-  | 'resolve_funding_baseline';
+  | 'resolve_funding_baseline'
+  | 'execution_decision'
+  | 'record_outcome'
+  | 'reset_execution';
 
 export interface SafetyEvent {
   type: SafetyEventType;

@@ -240,9 +240,11 @@ describe('Pass 4C paper/live parity fixtures', () => {
       expect(score.reason).toContain('REPLAY mode');
       await expect(paper.executeSignal(fixtureSignal() as any)).resolves.toBeNull();
       expect(createOrder).not.toHaveBeenCalled();
-      // The scorer's refusal is observable, but executeSignal currently
-      // returns without emitting executionBlocked for this branch.
-      expect(blocked).toEqual([]);
+      expect(blocked).toEqual([expect.objectContaining({
+        type: 'confidence',
+        reason: 'confidence_scorer_refused',
+        detail: expect.stringContaining('REPLAY mode'),
+      })]);
     } finally {
       paper.dispose();
       (globalThis as any).truthEngine = previousTruth;

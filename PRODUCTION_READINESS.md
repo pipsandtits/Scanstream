@@ -335,17 +335,22 @@ import, which is what the "BINARY SEARCH: TEMPORARILY DISABLE ALL ROUTERS"
 comment was bisecting. Config is now resolved lazily on first use.
 
 `npx tsx scripts/probe-disabled-routers.ts` mounts each formerly disabled router
-in isolation and prints the real failure. After the fix, all of them import and
-mount cleanly:
+in isolation and prints the real failure. After the import-cycle fix, all
+remaining candidates import and mount cleanly, but import success is not route
+safety evidence:
 
 | Route group | Classification |
 | --- | --- |
 | `/api/health` | **Safe — restored** (read-only; readiness was unreachable, so no operator could verify durable storage). Covered by `server/routes/__tests__/health-routes.test.ts` |
-| `/api/logs` | **Obsolete** — `server/routes/logs.ts` does not exist; logs are served by `/api/health/logs` |
-| physics, exit agents, scout, agent interactions/signals/services, optimization, strategies, model performance, backtesting, velocity, adaptive holding, clustering, phase 5/6, symbol universe, user settings, multi-timeframe, signal generation | **Requires tests before restore** — imports fine, no route-level coverage exists, and several call heavy analytical services on request |
-| `/api/execution` (trade execution) | **Requires fix before restore** — capital-adjacent surface with no `requireTradingOperator` guard; must not be exposed as-is |
+| `/api/logs` | **Obsolete — deleted** — `server/routes/logs.ts` does not exist; logs are served by `/api/health/logs` |
+| `/api/agents/services-api` | **Covered — restored** — route-level tests cover status/config contracts and handled unknown/disabled ability requests |
+| `/api/execution` (trade execution) | **Covered — restored with operator guard** — `POST /decision`, `POST /record-outcome`, and `POST /reset` require `requireTradingOperator` and audited actions; read-only `GET /status` remains public |
+| `/api/model-performance` | **Covered — restored** — metrics/history/status/validation/prune contracts and bounded ensemble input/error handling are tested |
+| physics, exit agents, scout, agent interactions/signals, optimization, strategies, backtesting, velocity, adaptive holding, clustering, phase 5/6, symbol universe, user settings, multi-timeframe, signal generation | **Covered/restoration still open** — import probes pass, but route-level contract/error coverage is not complete; several routes call heavy analytical services and state-changing routes need separate safety review |
 
-Only `/api/health` was restored. Nothing was deleted.
+The restored set is intentionally small: `/api/health`,
+`/api/agents/services-api`, `/api/model-performance`, and guarded
+`/api/execution`. The obsolete `/api/logs` registration was deleted.
 
 ### 8.7 Health endpoint no longer publishes fabricated data
 
@@ -367,7 +372,7 @@ distinctions are unchanged.
 | P1 | **Closed in Pass 4B:** cache key uniqueness, TTL, invalidation, stampede and memory-only restart semantics; no persisted live cache was found, so persisted-cache corruption is not applicable |
 | P1 | **Partially closed in Pass 4C:** fixture-driven paper/live gate observations and order-intent parity; full market-data replay and MIXED-mode parity remain unexercised |
 | P1 | **Partially closed in Pass 4C:** concurrent flatten, operator stop during an in-flight order, and stale TruthEngine refusal are covered; the ticker cache has no capital-adjacent consumer, so cache-specific gate wiring remains unproven |
-| P1 | Route groups classified above still need per-group tests, and `/api/execution` needs operator auth |
+| P1 | **Partially closed in Pass 4D:** `/api/agents/services-api`, `/api/model-performance`, and guarded `/api/execution` are covered and restored; every other classified group remains disabled pending complete route-level coverage and safety review |
 | P2 | Legacy `tests/` suites and the 362-error typecheck baseline are still unclassified; `(global as any)` handoffs and indicator cost remain unmeasured |
 
 Scanstream is **not** production-ready for live capital on this branch. The
@@ -500,7 +505,7 @@ work is tracked below rather than hidden by this pass.
 | P0 | **Closed in Pass 4A:** funding source fallback through declared `fetchLedger` funding entries; venues declaring neither source refuse explicitly |
 | P1 | **Closed in Pass 4B:** venue-scoped keys, explicit age bounds, invalidation, concurrency limits, single-flight, failure backoff and memory-only restart semantics. No persisted live cache was found, so persisted-cache corruption is not applicable |
 | P1 | **Partially closed in Pass 4C:** fixture-driven paper/live gate observations and order-intent parity, plus a REPLAY confidence-scorer oracle; the full historical pipeline and MIXED mode are not reproducible in-process |
-| P1 | Per-route tests for the classified disabled groups and operator authentication for `/api/execution` |
+| P1 | **Partially closed in Pass 4D:** route-level contracts and operator audit coverage restored `/api/agents/services-api` and `/api/execution`; all other disabled groups remain disabled pending per-route coverage |
 | P2 | Legacy 362-error typecheck baseline classification, `(global as any)` handoffs and indicator cost measurement |
 
 The parity fixture intentionally records the legitimate paper/live differences:
