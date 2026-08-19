@@ -215,7 +215,8 @@ export function createStrategiesCompatRouter(
     }
   });
 
-  router.get('/:id', (req, res) => {
+  router.get('/:id', (req, res, next) => {
+    if (req.params.id === 'list' || req.params.id === 'weights') return next();
     const strategy = STRATEGIES.find((candidate) => candidate.id === req.params.id);
     if (!strategy) return res.status(404).json({ success: false, error: 'Strategy not found' });
     return res.json({ success: true, strategy });
