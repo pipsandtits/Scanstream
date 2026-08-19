@@ -12,8 +12,7 @@ import axios from 'axios'; // Import axios for CoinGecko API calls
 import { coinGeckoService } from './services/coingecko';
 import { Router } from 'express'; // Import Router for dynamic route registration
 
-// Import strategy routes and paper trading routes
-import strategyRoutes from './routes/strategies';
+// Import paper trading routes
 import paperTradingRoutes from './routes/paper-trading';
 // Import signal performance routes
 import signalPerformanceRoutes from './routes/signal-performance';
@@ -46,6 +45,8 @@ import compositeQualityRouter from './routes/composite-quality';
 
 // Import Live Trading routes
 import liveTradingRouter from './routes/live-trading';
+import { requireTradingOperator } from './middleware/require-trading-operator';
+import { auditOperatorAction } from './middleware/audit-operator-action';
 
 // Import Portfolio Risk and Source Analytics routes
 import portfolioRiskRouter from './routes/portfolio-risk';
@@ -1314,14 +1315,26 @@ app.get('/api/assets/performance', async (req: Request, res: Response) => {
     }
   } catch (e) { /* ignore */ }
   // Synthesize signals endpoint
-  app.post('/api/strategies/synthesize', async (req: Request, res: Response) => {
+  app.post(
+    '/api/strategies/synthesize',
+    requireTradingOperator,
+    auditOperatorAction('signal_generate', {
+      target: (req) => typeof req.body?.symbol === 'string' ? req.body.symbol.slice(0, 32) : undefined,
+    }),
+    async (req: Request, res: Response) => {
     try {
       const { symbol, timeframe } = req.body;
 
-      if (!symbol || !timeframe) {
+      if (
+        typeof symbol !== 'string' ||
+        symbol.trim().length === 0 ||
+        symbol.length > 32 ||
+        typeof timeframe !== 'string' ||
+        !new Set(['1m', '5m', '15m', '30m', '1h', '4h', '1d']).has(timeframe)
+      ) {
         return res.status(400).json({
           success: false,
-          error: 'Missing required parameters: symbol, timeframe'
+          error: 'symbol and timeframe must be bounded and valid'
         });
       }
 
@@ -1360,7 +1373,8 @@ app.get('/api/assets/performance', async (req: Request, res: Response) => {
         error: 'Failed to synthesize signals'
       });
     }
-  });
+    },
+  );
 
   // Get strategy weights endpoint
   app.get('/api/strategies/weights', async (req, res) => {
@@ -1516,8 +1530,8 @@ app.get('/api/assets/performance', async (req: Request, res: Response) => {
     }
   ];
 
-  // Mount strategy routes and paper trading routes
-  app.use('/api/strategies', strategyRoutes);
+  // The legacy strategy router remains disabled until its subprocess work,
+  // signal writes, and consumer relationship have complete route-level review.
   app.use('/api/paper-trading', paperTradingRoutes);
 
   // Mount Symbol Universe routes

@@ -36,6 +36,8 @@ import agentInteractionsRouter from './routes/agent-interactions';
 import optimizationRouter from './routes/optimization';
 import signalBacktestingRouter from './routes/signal-backtesting';
 import historicalBacktestRouter from './routes/historical-backtest';
+import signalGenerationRouter from './routes/api/signal-generation';
+import symbolUniverseRouter from './routes/api/symbol-universe';
 import { getSharedService, setSharedService } from './services/shared-service-registry';
 // Removed fastScanner service import
 
@@ -238,10 +240,9 @@ console.log('[express] Feature Flags API registered at /api/feature-flags');
 // Core API routers (analytics, scanner, ml, coinGecko, paper-trading, live-trading, etc.)
 // are registered centrally inside registerRoutes(app) to avoid duplicate mounts.
 console.log('[express] Core API router mounting deferred to registerRoutes() to avoid duplicates');
-// Register Symbol Universe API  - TEMPORARILY DISABLED FOR DEBUG
-// import symbolUniverseRouter from './routes/api/symbol-universe';
-// app.use('/api/symbol-universe', symbolUniverseRouter);
-// console.log('[express] Symbol Universe API registered at /api/symbol-universe');
+// Register Symbol Universe API
+app.use('/api/symbol-universe', symbolUniverseRouter);
+console.log('[express] Symbol Universe API registered at /api/symbol-universe');
 
 // Register ML Predictions routes
 app.use('/api/ml', mlPredictionsRouter);
@@ -423,12 +424,11 @@ console.log('[express]   - agent-clustering/analyze-impact: Clustering impact an
 console.log('[express]   - agent-clustering/metrics: Metrics explanation');
 console.log('[express]   - agent-clustering/agents: Agent profiles and specializations');
 
-// Register Complete Signal Generation routes (regime-aware unified pipeline)
-import signalGenerationRouter from './routes/api/signal-generation';
+*/
+
+// Register bounded, operator-authenticated signal generation routes.
 app.use('/api/signal-generation', signalGenerationRouter);
 console.log('[express] Complete Signal Generation API registered at /api/signal-generation');
-
-*/
 
 // Initialize WebSocket service for real-time signal streaming
 import { signalWebSocketService } from './services/websocket-signals';

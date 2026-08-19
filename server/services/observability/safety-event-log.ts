@@ -57,7 +57,8 @@ export type OperatorAction =
   | 'exit_opposition'
   | 'exit_microstructure'
   | 'exit_consensus'
-  | 'exit_coordinate';
+  | 'exit_coordinate'
+  | 'signal_generate';
 
 export interface SafetyEvent {
   type: SafetyEventType;
