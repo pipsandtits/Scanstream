@@ -827,7 +827,7 @@ disabled groups are:
 | --- | --- | --- |
 | `/api/health`, `/api/agents/services-api`, `/api/scout`, `/api/phase5`, `/api/analysis/multi-timeframe`, `/api/symbols` | Restored | Public read-only routes with bounded inputs, handled failures, and route-level coverage; the simulated ability mutation under `/api/agents/services-api` is separately authenticated below |
 | `POST /api/agents/services-api/ability/:ability/use` | Restored | Simulated state-changing ability use requires `requireAuth` and a bounded `routeParam()` ability name; it is not an execution or capital route |
-| `/api/model-performance` | Restored | Metrics/history/status reads remain public; `POST /validate`, `POST /ensemble-predict`, and destructive `POST /prune` require `requireAuth` with finite numeric, array-size, and retention-day bounds |
+| `/api/model-performance` | Restored | Metrics/history/status reads remain public; `POST /validate` and `POST /ensemble-predict` require `requireAuth`, while destructive process-global `POST /prune` requires `requireTradingOperator`, an operator audit, and finite retention-day bounds |
 | `/api/execution` | Restored | `GET /status` is public; decision, outcome, and reset mutations require the trading-operator guard and audit |
 | `/api/physics`, `/api/learning`, `/api/agents/physics` | Restored | Public status/read routes remain open; heavy or state-changing operations require authentication and bounded inputs |
 | `/api/agents/exit` | Restored | Status is public; decision, coordination, and outcome mutations require the trading-operator guard and audit |
@@ -974,13 +974,13 @@ The follow-up review fixes preserve the same fail-closed boundaries:
   therefore corrected: the fallback had been non-functional when it queried
   by market symbol and required a direct symbol field, and it works only on
   venues with resolvable, unambiguous contract attribution.
-- The model-performance mutations (`validate`, `ensemble-predict`, and
-  `prune`) and simulated agent ability use are authenticated with
-  `requireAuth`. Numeric fields are finite, ensemble input is capped, prune
-  retention is bounded, and the ability name uses bounded `routeParam()`
-  validation. `prune` still operates on process-global history and has no
-  ownership model; it was not escalated to operator auth without a separate
-  deployment decision.
+- The model-performance mutations (`validate` and `ensemble-predict`) and
+  simulated agent ability use are authenticated with `requireAuth`; numeric
+  fields are finite, ensemble input is capped, and the ability name uses
+  bounded `routeParam()` validation. Destructive `prune` operates on
+  process-global history with no ownership model, so it requires
+  `requireTradingOperator` and records the `prune_model_history` operator
+  audit action with its `daysToKeep` target.
 
 `RealtimeContext` no longer contains cache-update branches for
 `world_tick`, `tick`, `ui_tick`, `orderbook_update`, `market_frame`, and

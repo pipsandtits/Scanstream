@@ -8,6 +8,8 @@ import express, { type Request, type Response } from 'express';
 import { getPerformanceTracker } from '../services/model-performance-tracker';
 import EnsemblePredictor from '../services/ensemble-predictor';
 import { requireAuth } from '../middleware/auth';
+import { requireTradingOperator } from '../middleware/require-trading-operator';
+import { auditOperatorAction } from '../middleware/audit-operator-action';
 
 const router = express.Router();
 const tracker = getPerformanceTracker();
@@ -196,30 +198,38 @@ router.post('/ensemble-predict', requireAuth, async (req: Request, res: Response
 
 /**
  * POST /api/model-performance/prune
- * Clean up old predictions
+ * Clean up old predictions. This is operator-gated because it destroys
+ * process-global history without an ownership model.
  */
-router.post('/prune', requireAuth, (req: Request, res: Response) => {
-  try {
-    const { daysToKeep = 30 } = req.body;
-    if (!finiteNumber(daysToKeep) || !Number.isInteger(daysToKeep) || daysToKeep < 1 || daysToKeep > MAX_PRUNE_DAYS) {
-      return res.status(400).json({
-        error: 'Invalid daysToKeep',
-        message: `daysToKeep must be an integer between 1 and ${MAX_PRUNE_DAYS}`,
+router.post(
+  '/prune',
+  requireTradingOperator,
+  auditOperatorAction('prune_model_history', {
+    target: (req) => String(req.body?.daysToKeep ?? 30),
+  }),
+  (req: Request, res: Response) => {
+    try {
+      const { daysToKeep = 30 } = req.body;
+      if (!finiteNumber(daysToKeep) || !Number.isInteger(daysToKeep) || daysToKeep < 1 || daysToKeep > MAX_PRUNE_DAYS) {
+        return res.status(400).json({
+          error: 'Invalid daysToKeep',
+          message: `daysToKeep must be an integer between 1 and ${MAX_PRUNE_DAYS}`,
+        });
+      }
+      tracker.pruneOldPredictions(daysToKeep);
+
+      res.json({
+        success: true,
+        message: `Pruned predictions older than ${daysToKeep} days`,
+        timestamp: new Date().toISOString()
+      });
+    } catch (error: any) {
+      res.status(500).json({
+        error: error.message || 'Prune operation failed',
+        timestamp: new Date().toISOString()
       });
     }
-    tracker.pruneOldPredictions(daysToKeep);
-
-    res.json({
-      success: true,
-      message: `Pruned predictions older than ${daysToKeep} days`,
-      timestamp: new Date().toISOString()
-    });
-  } catch (error: any) {
-    res.status(500).json({
-      error: error.message || 'Prune operation failed',
-      timestamp: new Date().toISOString()
-    });
-  }
-});
+  },
+);
 
 export default router;

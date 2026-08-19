@@ -53,6 +53,7 @@ export type OperatorAction =
   | 'execution_decision'
   | 'record_outcome'
   | 'reset_execution'
+  | 'prune_model_history'
   | 'exit_orchestrator'
   | 'exit_opposition'
   | 'exit_microstructure'

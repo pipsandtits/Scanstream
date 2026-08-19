@@ -2,12 +2,17 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest
 import express from 'express';
 import type { Server } from 'http';
 import { AddressInfo } from 'net';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 import modelPerformanceRouter from '../model-performance';
 import { ModelPerformanceTracker } from '../../services/model-performance-tracker';
 import type { AuthRequest } from '../../middleware/auth';
+import { safetyEventLog } from '../../services/observability/safety-event-log';
 
 let server: Server;
 let base: string;
+const operatorToken = 'model-performance-operator-token';
 
 async function request(
   route: string,
@@ -20,8 +25,19 @@ async function request(
   return { status: response.status, body: await response.json() };
 }
 
+function withOperator(init: RequestInit = {}): RequestInit {
+  return {
+    ...init,
+    headers: {
+      ...(init.headers ?? {}),
+      'x-trading-operator-token': operatorToken,
+    },
+  };
+}
+
 describe('model performance route group', () => {
   beforeAll(async () => {
+    process.env.TRADING_OPERATOR_TOKEN = operatorToken;
     const app = express();
     app.use(express.json());
     app.use((req, _res, next) => {
@@ -38,10 +54,17 @@ describe('model performance route group', () => {
   });
 
   afterEach(() => {
+    safetyEventLog.setFilePath(
+      path.join(
+        fs.mkdtempSync(path.join(os.tmpdir(), 'scanstream-model-performance-audit-')),
+        'events.jsonl',
+      ),
+    );
     vi.restoreAllMocks();
   });
 
   afterAll(async () => {
+    delete process.env.TRADING_OPERATOR_TOKEN;
     await new Promise<void>((resolve) => server.close(() => resolve()));
   });
 
@@ -99,9 +122,10 @@ describe('model performance route group', () => {
       }),
     });
     const prune = await request('/prune', {
-      method: 'POST',
-      headers: { 'x-test-user': 'model-user' },
-      body: JSON.stringify({ daysToKeep: 30 }),
+      ...withOperator({
+        method: 'POST',
+        body: JSON.stringify({ daysToKeep: 30 }),
+      }),
     });
 
     expect(validation.status).toBe(200);
@@ -114,6 +138,14 @@ describe('model performance route group', () => {
     }));
     expect(prune.status).toBe(200);
     expect(prune.body.success).toBe(true);
+    expect(safetyEventLog.tail()).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'operator_action',
+        action: 'prune_model_history',
+        target: '30',
+        success: true,
+      }),
+    ]));
   });
 
   it('requires authentication and bounds restored state-changing operations', async () => {
@@ -127,9 +159,15 @@ describe('model performance route group', () => {
       body: JSON.stringify({ symbol: 'BTC/USDT', predictedDirection: 'UP', actualChange: Infinity }),
     });
     const invalidPrune = await request('/prune', {
+      ...withOperator({
+        method: 'POST',
+        body: JSON.stringify({ daysToKeep: 3651 }),
+      }),
+    });
+    const ordinaryPrune = await request('/prune', {
       method: 'POST',
       headers: { 'x-test-user': 'model-user' },
-      body: JSON.stringify({ daysToKeep: 3651 }),
+      body: JSON.stringify({ daysToKeep: 30 }),
     });
     const oversizedEnsemble = await request('/ensemble-predict', {
       method: 'POST',
@@ -140,6 +178,7 @@ describe('model performance route group', () => {
     expect(unauthenticated.status).toBe(401);
     expect(invalidValidation.status).toBe(400);
     expect(invalidPrune.status).toBe(400);
+    expect(ordinaryPrune.status).toBe(401);
     expect(oversizedEnsemble.status).toBe(400);
   });
 
