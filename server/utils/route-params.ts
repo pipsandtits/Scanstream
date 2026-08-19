@@ -1,8 +1,16 @@
+import type { Response } from 'express';
+
 export class InvalidRouteParamError extends Error {
   constructor(name: string) {
     super(`Invalid route parameter: ${name}`);
     this.name = 'InvalidRouteParamError';
   }
+}
+
+export function respondToInvalidRouteParam(error: unknown, res: Pick<Response, 'status'>): boolean {
+  if (!(error instanceof InvalidRouteParamError)) return false;
+  res.status(400).json({ error: error.message });
+  return true;
 }
 
 export function routeParam(

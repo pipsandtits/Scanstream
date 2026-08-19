@@ -17,6 +17,7 @@ import { SignalEngine, defaultTradingConfig } from '../trading-engine';
 import { signalPerformanceTracker } from '../services/signal-performance-tracker';
 import { generateModuleSignal, type ArmDetectionInput, type ModuleState } from '../services/arm-template';
 import { routeParam } from '../utils/route-params';
+import type { OHLCVData } from '../types/gateway';
 
 interface GatewayFrame {
   price?: { close?: number; high?: number; low?: number };
@@ -42,6 +43,11 @@ let securityValidator: SecurityValidator | null = null;
 const gasProvider = new GasProvider(cacheManager);
 const signalEngine = new SignalEngine(defaultTradingConfig);
 let isGatewayReady = false;
+
+function requireGatewayService<T>(service: T | null, name: string): T {
+  if (!service) throw new Error(`${name} unavailable`);
+  return service;
+}
 
 async function initializeGateway() {
   try {
@@ -447,10 +453,20 @@ router.get('/ohlcv/:symbol', async (req: Request, res: Response) => {
 
     console.log(`[Gateway] Fetching OHLCV for ${symbol}, timeframe: ${timeframe}, limit: ${limit}`);
 
-    let ohlcv = priceCache.getCandles(symbol, timeframe as string);
+    let ohlcv: OHLCVData[] = priceCache.getCandles(symbol, timeframe as string).map(
+      ([timestamp, open, high, low, close, volume]) => ({
+        timestamp,
+        open,
+        high,
+        low,
+        close,
+        volume,
+        exchange: 'cache',
+      }),
+    );
 
     if (!ohlcv || ohlcv.length === 0) {
-      ohlcv = await aggregator!.getOHLCV(
+      ohlcv = await requireGatewayService(aggregator, 'aggregator').getOHLCV(
         symbol,
         timeframe as string,
         parseInt(limit as string)
@@ -568,7 +584,7 @@ router.get('/market-frames/:symbol', async (req: Request, res: Response) => {
     const symbol = routeParam(req.params.symbol, 'symbol', 64);
     const { timeframe = '1m', limit = '100' } = req.query;
 
-    const frames = await aggregator.getMarketFrames(
+    const frames = await requireGatewayService(aggregator, 'aggregator').getMarketFrames(
       symbol,
       timeframe as string,
       parseInt(limit as string)
@@ -611,7 +627,7 @@ router.get('/dataframe/:symbol', async (req: Request, res: Response) => {
     }
 
     // Get latest OHLCV data from aggregator (no persistence)
-    const frames = await aggregator.getMarketFrames(symbol, timeframe as string, limitNum);
+    const frames = await requireGatewayService(aggregator, 'aggregator').getMarketFrames(symbol, timeframe as string, limitNum);
 
     if (!frames || frames.length === 0) {
       console.warn(`[Gateway] No frames returned for ${symbol} on timeframe ${timeframe}`);
@@ -892,7 +908,7 @@ router.get('/liquidity/:symbol', async (req: Request, res: Response) => {
     const { amount } = req.query;
     const amountNum = amount ? parseFloat(amount as string) : undefined;
 
-    const liquidity = await liquidityMonitor.checkLiquidity(symbol, amountNum);
+    const liquidity = await requireGatewayService(liquidityMonitor, 'liquidity monitor').checkLiquidity(symbol, amountNum);
 
     // Broadcast liquidity update via WebSocket
     signalWebSocketService.broadcastLiquidityUpdate(symbol, liquidity);
@@ -922,7 +938,7 @@ router.post('/liquidity/batch', async (req: Request, res: Response) => {
       return res.status(400).json({ error: 'Symbols array required' });
     }
 
-    const results = await liquidityMonitor.batchCheckLiquidity(symbols);
+    const results = await requireGatewayService(liquidityMonitor, 'liquidity monitor').batchCheckLiquidity(symbols);
 
     res.json({
       success: true,
@@ -1021,7 +1037,7 @@ router.delete('/alerts/acknowledged', (req: Request, res: Response) => {
  */
 router.get('/exchanges/status', (req: Request, res: Response) => {
   try {
-    const health = aggregator.getHealthStatus();
+    const health = requireGatewayService(aggregator, 'aggregator').getHealthStatus();
     const rateLimits = rateLimiter.getStats();
     
     const exchanges = Object.keys(health).map(exchange => ({
@@ -1124,7 +1140,7 @@ router.post('/security/validate', async (req: Request, res: Response) => {
       return res.status(400).json({ error: 'Symbol and amount required' });
     }
 
-    const validation = await securityValidator.validateOperation(
+    const validation = await requireGatewayService(securityValidator, 'security validator').validateOperation(
       symbol,
       parseFloat(amount),
       operation
@@ -1157,8 +1173,8 @@ router.post('/recommend-exchange', async (req: Request, res: Response) => {
 
     // Get liquidity and health data
     const [liquidity, health] = await Promise.all([
-      liquidityMonitor.checkLiquidity(symbol),
-      Promise.resolve(aggregator.getHealthStatus())
+      requireGatewayService(liquidityMonitor, 'liquidity monitor').checkLiquidity(symbol),
+      Promise.resolve(requireGatewayService(aggregator, 'aggregator').getHealthStatus())
     ]);
 
     // Score each exchange
@@ -2012,7 +2028,7 @@ function createDataQualityStatus(quality: { score: number; reasons: string[]; su
  */
 router.post('/exchange/:name/reset', (req: Request, res: Response) => {
   const name = routeParam(req.params.name, 'name', 64);
-  aggregator.resetExchangeHealth(name);
+  requireGatewayService(aggregator, 'aggregator').resetExchangeHealth(name);
   res.json({ success: true, message: `Exchange ${name} health reset` });
 });
 
@@ -2167,7 +2183,7 @@ router.get('/dataframe-validated/:symbol', async (req: Request, res: Response) =
     const limitNum = parseInt(limit as string) || 100;
 
     // Get frames from aggregator
-    const frames = await aggregator.getMarketFrames(symbol, timeframe as string, limitNum);
+    const frames = await requireGatewayService(aggregator, 'aggregator').getMarketFrames(symbol, timeframe as string, limitNum);
 
     if (!frames || frames.length === 0) {
       return res.status(404).json({

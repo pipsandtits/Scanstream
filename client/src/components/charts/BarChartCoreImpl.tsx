@@ -2,21 +2,34 @@ import React from 'react';
 import { ResponsiveContainer, BarChart, Bar, CartesianGrid, XAxis, YAxis, Tooltip, Legend, Cell } from 'recharts';
 
 interface BarChartCoreProps {
-  data: any[];
+  data: Record<string, unknown>[];
   dataKey: string;
   layout?: 'vertical' | 'horizontal';
   height?: number;
   children?: React.ReactNode;
   cellColors?: string[];
-  barProps?: any;
-  xAxisProps?: any;
-  yAxisProps?: any;
-  gridProps?: any;
-  tooltipProps?: any;
-  legendProps?: any;
+  barProps?: Record<string, unknown>;
+  xAxisProps?: Record<string, unknown>;
+  yAxisProps?: Record<string, unknown>;
+  gridProps?: Record<string, unknown>;
+  tooltipProps?: Record<string, unknown>;
+  legendProps?: Record<string, unknown>;
 }
 
-export default function BarChartCoreImpl({ data, dataKey, layout = 'horizontal', height = 200, children, cellColors, barProps }: BarChartCoreProps) {
+export default function BarChartCoreImpl({
+  data,
+  dataKey,
+  layout = 'horizontal',
+  height = 200,
+  children,
+  cellColors,
+  barProps,
+  xAxisProps,
+  yAxisProps,
+  gridProps,
+  tooltipProps,
+  legendProps,
+}: BarChartCoreProps) {
   return (
     <ResponsiveContainer width="100%" height="100%">
       <BarChart data={data} layout={layout}>

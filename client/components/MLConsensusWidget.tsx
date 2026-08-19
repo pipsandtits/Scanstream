@@ -121,12 +121,17 @@ export const MLConsensusWidget: React.FC<MLConsensusWidgetProps> = ({
   }
 
   const consensus = data.consensus;
-  const metrics = data.aggregatedMetrics;
+  const metrics = data.aggregatedMetrics ?? {
+    avgRiskScore: 0,
+    maxVolatility: 0,
+    shortestRegimeDuration: 'unknown',
+    velocityConfidenceAvg: 0,
+  };
   const directionColor = getDirectionColor(consensus.direction);
   const riskLevel = getRiskLevel(metrics.avgRiskScore);
 
   // Prepare timeframe data for chart
-  const timeframeChartData = data.timeframes.map((tf: TimeframeConfidence) => ({
+  const timeframeChartData = data.timeframes.map((tf) => ({
     timeframe: tf.timeframe,
     confidence: tf.confidence * 100,
     strength: tf.strength,
@@ -263,7 +268,7 @@ export const MLConsensusWidget: React.FC<MLConsensusWidgetProps> = ({
               </tr>
             </thead>
             <tbody>
-              {data.timeframes.map((tf: TimeframeConfidence) => (
+              {data.timeframes.map((tf) => (
                 <tr key={tf.timeframe} className="border-b border-gray-100 hover:bg-gray-50">
                   <td className="px-3 py-2 font-medium text-gray-800">{tf.timeframe}</td>
                   <td className="px-3 py-2">

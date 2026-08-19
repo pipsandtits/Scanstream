@@ -4,6 +4,7 @@ import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 // Recharts usage is wrapped by BarChartCore; avoid direct Recharts imports here to reduce bundle size
 import BarChartCore from './charts/BarChartCore';
+import { Bar } from 'recharts';
 import { Filter, TrendingUp, TrendingDown } from 'lucide-react';
 import { formatConfidence, formatPct } from '@/utils/formatting';
 

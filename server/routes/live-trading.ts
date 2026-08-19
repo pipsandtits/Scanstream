@@ -7,7 +7,7 @@ import { systemKillSwitch } from '../services/system-kill-switch';
 import { liveCircuitBreaker } from '../services/live-circuit-breaker';
 import { auditOperatorAction } from '../middleware/audit-operator-action';
 import { safetyEventLog } from '../services/observability/safety-event-log';
-import { routeParam } from '../utils/route-params';
+import { respondToInvalidRouteParam, routeParam } from '../utils/route-params';
 
 const router = Router();
 
@@ -205,6 +205,7 @@ router.post('/close/:positionId', requireTradingOperator, audit('close', (req) =
       res.status(400).json({ success: false, error: 'Failed to close position' });
     }
   } catch (error: any) {
+    if (respondToInvalidRouteParam(error, res)) return;
     res.status(500).json({ success: false, error: error.message });
   }
 });
