@@ -809,3 +809,176 @@ Scanstream remains **not production-ready for live capital**. The hardening
 direction is fail-closed, but route coverage, legacy typecheck classification,
 venue-specific operational validation and the unexercised `MIXED` pipeline
 remain required.
+
+### 9.6 Pass 5 — route hardening and type baseline
+
+Pass 5 is complete as a classification and hardening pass. It does not
+change the readiness conclusion above: Scanstream remains **not production-ready
+for live capital**.
+
+#### Route track final inventory
+
+The route track's rule is now explicit: **disabled means actually unmounted**.
+Commenting a router out in one registration path is not sufficient when a
+second `registerRoutes(app)` path still mounts it. The final restored and
+disabled groups are:
+
+| Group | Final status | Authentication and boundary |
+| --- | --- | --- |
+| `/api/health`, `/api/agents/services-api`, `/api/model-performance`, `/api/scout`, `/api/phase5`, `/api/analysis/multi-timeframe`, `/api/symbols` | Restored | Public read-only routes with bounded inputs, handled failures, and route-level coverage |
+| `/api/execution` | Restored | `GET /status` is public; decision, outcome, and reset mutations require the trading-operator guard and audit |
+| `/api/physics`, `/api/learning`, `/api/agents/physics` | Restored | Public status/read routes remain open; heavy or state-changing operations require authentication and bounded inputs |
+| `/api/agents/exit` | Restored | Status is public; decision, coordination, and outcome mutations require the trading-operator guard and audit |
+| `/api/agents/interactions` | Restored | Reads are public; process-global recording mutations require authentication and bounded payloads |
+| `/api/symbol-universe` | Restored | Read-only lookups are public; the UI-configuration mutation requires authentication |
+| `/api/optimize`, `/api/backtest/signal`, `/api/backtest/historical` | Restored | Compute mutations require authentication and enforce explicit symbol, date, candle, signal, iteration, and timeout bounds; reads are bounded and covered |
+| `/api/signal-generation` | Restored | Generation routes require the trading-operator guard and audit because their output is an execution input, even though the route itself does not persist a signal |
+| `/api/user` settings | Restored | Authenticated user-self access; trading settings and venue-credential mutations require operator authentication and audit, with persisted ownership checks |
+| `/api/strategies` compatibility reads and analysis | Restored | Read-only strategy metadata, signals, feature state, duration comparison, and result reads are public; consensus, backtest, duration, and pyramid analysis require authentication and bounded inputs |
+| `POST /api/strategies/synthesize` | Restored | `requireAuth` rather than operator authentication; the route only synthesizes and returns analytical output, does not call `storage.createSignal()`, does not mutate engine state, and no engine consumer of its returned value was found. Audit remains attached |
+| Read-only gateway compatibility (`/api/gateway/signals/performance/*`, `/api/gateway/dataframe/*`, `/api/gateway/price/*`, `/api/exchange/status`) | Restored | Public, bounded read-only compatibility router; it does not import `gateway.ts`, initialize the gateway, persist signals, mutate venues, or fetch through unbounded provider paths |
+| `/api/agents/signals` | Disabled/unmounted | Although isolated contract tests exist and recording is authenticated, the read paths fan out into multiple external/analytical pipelines without one enforceable request deadline |
+| Main `/api/gateway` router | Disabled/unmounted | Its routes remain coupled to import-time `initializeGateway()` and recurring refresh intervals, cache/venue mutations, external fan-out, signal persistence, and incomplete cost/error contracts |
+| `/api/backtest` phase 6 unified | Disabled/unmounted | Stored-result writes and request-controlled asset, agent, strategy, timeframe, and gap-healing fan-out lack a complete enforceable cost and consumer contract |
+| `/api/backtest` capability measurement | Disabled/unmounted | Multi-asset historical work and arbitrary trade-array impact routes lack complete asset, date, trade, and cost caps |
+| `/api/backtest` velocity profile, adaptive holding, and clustering | Disabled/unmounted | Heavy analytical work lacks the required explicit latency/cost boundaries and complete route contracts |
+| `POST /api/strategies/enhanced-bounce/execute`, `POST /api/strategies/:id/execute`, `POST /api/strategies/execute-all` | Disabled/unmounted | These inject signals; `execute-all` also permits unbounded caller fan-out, and downstream ownership is not established |
+| `DELETE /api/strategies/backtest/:id` | Disabled/unmounted | Destructive stored-state mutation has no owner-scoped deletion contract |
+
+Four routers were found to be disabled in appearance only and were fixed as
+registration findings, not treated as documentation footnotes:
+
+1. **Legacy strategies:** a second registration path kept the router live.
+   Its handlers reached `storage.createSignal()` at
+   `server/routes/strategies.ts:592`, `:647`, and `:924` without established
+   downstream ownership. The signal-injecting routes therefore remain
+   unmounted.
+2. **Agent signal insights:** the router was commented in the apparent
+   disabled block but mounted by `registerRoutes(app)`. Its alternate mount
+   was removed because the read paths lack a uniform latency deadline.
+3. **User preferences:** `server/routes/user-preferences.ts` was active at
+   `/api/user` and accepted arbitrary `x-user-id` headers, allowing
+   cross-user reads and writes to in-memory preferences. That mount was
+   removed; the owner-scoped `user-settings` router is now the sole
+   registration.
+4. **Velocity-profile helper:** the distinct `velocity-profiles.ts`
+   registration helper exposed `/api/velocity/*` through `registerRoutes(app)`
+   despite the primary velocity router being disabled. Its registration was
+   removed pending dedicated bounded-work coverage.
+
+Ownership gaps found and closed in the restored user surface:
+
+- Session revocation now verifies persisted session ownership, returning
+  `403` for another user's session and `404` for an unknown session.
+- API-key deletion now verifies `ApiKey.userId` before deletion, with the
+  same cross-owner/unknown-record distinction.
+
+Client compatibility and deliberate breakage are recorded explicitly:
+
+| Client surface | Path/action | Result |
+| --- | --- | --- |
+| `UnifiedSignalDisplay`, signal-performance, gateway-scanner, trading-terminal | Restored read-only strategy/gateway compatibility calls | Restored with bounded, handled read routes |
+| `strategy-synthesis.tsx:67` | `POST /api/strategies/synthesize` | Restored for authenticated users after the no-persistence/no-engine-effect review |
+| `BounceStrategyCard.tsx:43` | `POST /api/strategies/enhanced-bounce/execute` | Deliberately non-functional; the UI should hide or disable this signal-injection action |
+| `strategies.tsx:214` | `POST /api/strategies/execute-all` | Deliberately non-functional; signal injection and unbounded fan-out remain disabled |
+| `backtest.tsx:224` | `DELETE /api/strategies/backtest/:id` | Deliberately non-functional; destructive deletion has no ownership contract |
+| `agent-interactions.tsx:307,322,335` | Exit-agent `consensus-history`, `interaction-flow`, and `activity-log` reads | Remain `404`; these paths are not part of the covered seven-route exit router |
+
+#### Type track
+
+The classified TypeScript baseline moved from **362 errors to 2**:
+
+| Area | Pass 4E baseline | After T1 defects | After T2 mechanical server pass | Pass 5 final |
+| --- | ---: | ---: | ---: | ---: |
+| Total | 362 | 304 | 168 | 2 |
+| `server/routes` | 172 | 143 | 14 | 0 |
+| Other `server/` | 40 | 11 | 9 | 2 |
+| Client | 145 | 145 | 145 | 0 |
+| Tests | 5 | 5 | 0 | 0 |
+| Execution | 0 | 0 | 0 | 0 |
+| Risk | 0 | 0 | 0 | 0 |
+| Observability | 0 | 0 | 0 | 0 |
+
+The two residuals are the genuinely absent `chartjs-node-canvas` and
+`chart.js` packages in `server/chart-api.ts`. `chart.js` is not declared in
+`package.json`; the only related package reference is tsup's externalization
+flag for `chartjs-node-canvas`. The chart API is dynamically imported and
+registration catches an unavailable module, so adding ambient declarations or
+casts would falsely imply an installed runtime dependency. These errors are
+reported rather than suppressed.
+
+##### T1 confirmed runtime defects
+
+The defect-first pass verified reachability before changing behavior:
+
+| Defect | Reachability evidence | Fix and regression coverage |
+| --- | --- | --- |
+| Missing `priceCache` binding in `ccxt-scanner.ts` | `scanSymbols()` defaults to the cache path; active scanner routes call it | Imported the established `PriceCache` singleton; `server/services/gateway/__tests__/ccxt-scanner.test.ts` covers the cache path |
+| `rl-metrics.ts` module-local metrics were out of scope | `rl-feedback-loop.ts` calls `recordDomainReward()` and `recordEpisode()` | Moved typed bindings to module scope; no stable isolated test seam |
+| Nullable `exchange.symbols` in live velocity | `calculateLiveVelocityProfile()` is reached through asset-velocity and strategy integration paths | Loads markets before symbol access and retains a defensive empty-symbol path; no stable isolated test seam |
+| Missing `scanLoop` in continuous scanner | `examples.ts` starts the scanner and the undeclared scheduler call ran during startup | Removed the nonexistent call; `continuous-scanner-optimized.test.ts` covers startup/scan |
+| Nullable aggregator in signal-price monitor | `server/index.ts` starts the monitor while gateway aggregation initializes asynchronously | Defers a tick until the aggregator is available; no stable isolated test seam |
+| OANDA candle source mismatch | Forex engine consumes the adapter's REST candle output | Uses historical-source metadata with OANDA origin; `oanda-adapter.test.ts` covers the shape |
+| Invalid adaptive-controller drift audit payload | `adaptiveController` is initialized and used from `server/index.ts` | Sends the declared drift metrics and stale flag; no stable isolated test seam |
+| Static calls to instance ML services/models | `server/routes.ts` mounts the ML advanced, training, and advanced-model routes | Instantiates the services/models and narrows route parameters; no stable isolated test seam for the ML routes |
+
+The remaining T1 fixes were domain/type safety corrections rather than
+separately demonstrated runtime failures: declared trade fields replaced
+nonexistent fields, arbitrary thrown values in `AgentArena` are described
+safely, the `MLModel` persistence contract is implemented, Yahoo candle
+results are typed, `RLPositionAgent` is imported as a type, and the signal
+classifier singleton visibility matches its existing runtime use. The five
+without a stable regression-test seam are explicitly acknowledged above:
+RL metrics, live velocity, signal-price monitor, adaptive controller, and the
+ML routes.
+
+##### Boundary and client contract fixes
+
+The shared `routeParam()`/`routeParamEnum()` boundary rejects arrays, empty
+values, overlong values, and non-allowlisted values rather than coercing them.
+The active groups tightened by this boundary include agent abilities,
+API-docs, CoinGecko and CoinGecko charts, commander, composite quality,
+correlation boost, fast scanner, feature flags, live trading, live velocity,
+ML automated trading, ML multi-timeframe predictions, MTF confirmation,
+paper trading, RPG agents, scanner, scanner analysis, scanner signal,
+source analytics, strategy deployment, and chart API. Ordinary client
+call-sites remain within the accepted contracts; malformed values now receive
+validation errors rather than reaching handlers. Disabled gateway surfaces
+were typed without being mounted or given new behavior.
+
+The ML consensus client contract was corrected against the server response:
+the client now accepts `price`, `pricChangePct`, `riskLevel`, string-valued
+`volatility`, `regimeDuration`, and string-valued `maxVolatility` instead of
+the stale `probability` and numeric volatility fields. Before this fix, Zod
+rejected the server response and the widget stayed in its error state; it now
+renders the server's risk and volatility values.
+
+`RealtimeContext` no longer contains cache-update branches for
+`world_tick`, `tick`, `ui_tick`, `orderbook_update`, `market_frame`, and
+`positions_update`. The client type did not admit these event names, and a
+server-wide search found no server emission, so these were stale unreachable
+branches rather than an omitted active event contract.
+
+#### What Pass 5 does not close
+
+Pass 5 does not claim production readiness. The following remain open or
+deliberately disabled:
+
+- The main gateway router remains unmounted; importing its module still has
+  the `initializeGateway()` import-time side effect and recurring refresh
+  intervals, so the read-only compatibility router is intentionally separate.
+- Agent signal insights remain disabled until a uniform request latency
+  deadline exists.
+- Phase 6 unified backtesting, capability measurement, velocity profile,
+  adaptive holding, and clustering remain disabled pending explicit cost,
+  timeout, ownership, and consumer contracts.
+- The three signal-injection strategy routes and `DELETE /backtest/:id`
+  remain unmounted for the ownership/safety reasons above.
+- Full historical replay and `MIXED`-mode parity remain incomplete.
+- Venue-specific validation and operational validation remain outstanding.
+- The two absent chart-module dependencies remain truthful typecheck
+  residuals.
+
+The hardening direction is fail-closed, but these remaining route, cost,
+replay, venue, and dependency gaps mean Scanstream remains **not production-ready
+for live capital**.
