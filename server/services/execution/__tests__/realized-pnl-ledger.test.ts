@@ -6,6 +6,7 @@ import {
   computeRealizedClosePnl,
   RealizedPnlLedger,
 } from '../realized-pnl-ledger';
+import { QuoteCurrencyConverter } from '../quote-conversion';
 
 function ledgerPath(): string {
   return path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'scanstream-realized-')), 'ledger.json');
@@ -45,6 +46,53 @@ describe('realized PnL ledger', () => {
     });
     expect(result.pnl).toBe(10);
     expect(result.unconvertedFees).toEqual([{ currency: 'BNB', cost: 0.01 }]);
+  });
+
+  it('converts direct and inverse same-venue quotes only when the ticker is fresh', async () => {
+    const now = 1_700_000_000_000;
+    const converter = new QuoteCurrencyConverter({ maxAgeMs: 60_000, clock: () => now });
+    const exchange = {
+      markets: { 'BNB/USDT': {}, 'USDT/BTC': {} },
+      fetchTicker: async (symbol: string) => ({
+        last: symbol === 'BNB/USDT' ? 300 : 0.00002,
+        timestamp: now - 1_000,
+      }),
+    };
+    await expect(converter.convert(exchange, 'BNB', 'USDT', 0.01)).resolves.toMatchObject({
+      status: 'known',
+      conversion: { market: 'BNB/USDT', direction: 'direct', quoteAmount: 3 },
+    });
+    await expect(converter.convert(exchange, 'BTC', 'USDT', 0.01)).resolves.toMatchObject({
+      status: 'known',
+      conversion: { market: 'USDT/BTC', direction: 'inverse' },
+    });
+    const inverse = await converter.convert(exchange, 'BTC', 'USDT', 0.01);
+    expect(inverse.status === 'known' ? inverse.conversion.quoteAmount : null).toBeCloseTo(500);
+  });
+
+  it('rejects stale, timestamp-less, non-positive, missing and failed ticker data', async () => {
+    const now = 1_700_000_000_000;
+    const converter = new QuoteCurrencyConverter({ maxAgeMs: 60_000, clock: () => now });
+    await expect(converter.convert({
+      markets: { 'BNB/USDT': {} },
+      fetchTicker: async () => ({ last: 300, timestamp: now - 60_001 }),
+    }, 'BNB', 'USDT', 1)).resolves.toMatchObject({ status: 'unknown' });
+    await expect(converter.convert({
+      markets: { 'BNB/USDT': {} },
+      fetchTicker: async () => ({ last: 300 }),
+    }, 'BNB', 'USDT', 1)).resolves.toMatchObject({ status: 'unknown' });
+    await expect(converter.convert({
+      markets: { 'BNB/USDT': {} },
+      fetchTicker: async () => ({ last: 0, timestamp: now }),
+    }, 'BNB', 'USDT', 1)).resolves.toMatchObject({ status: 'unknown' });
+    await expect(converter.convert({
+      markets: {},
+      fetchTicker: async () => ({ last: 300, timestamp: now }),
+    }, 'BNB', 'USDT', 1)).resolves.toMatchObject({ status: 'unknown' });
+    await expect(converter.convert({
+      markets: { 'BNB/USDT': {} },
+      fetchTicker: async () => { throw new Error('ticker failed'); },
+    }, 'BNB', 'USDT', 1)).resolves.toMatchObject({ status: 'unknown' });
   });
 
   it('keeps unknown arithmetic unknown', () => {
@@ -113,6 +161,127 @@ describe('realized PnL ledger', () => {
     });
     expect(ledger.summary().pnl).toBeNull();
     expect(ledger.summary().unknown).toBe(true);
+  });
+
+  it('keeps unconvertible fees unknown and applies immutable conversion records once', () => {
+    const now = 1_700_000_000_000;
+    const ledger = new RealizedPnlLedger({ filePath: ledgerPath(), clock: () => now });
+    ledger.load();
+    ledger.append({
+      id: 'fee-close',
+      category: 'trade',
+      at: new Date(now).toISOString(),
+      symbol: 'BTC/USDT',
+      quoteCurrency: 'USDT',
+      pnl: 10,
+      grossPnl: 10,
+      quoteFees: 0,
+      unconvertedFees: [{ currency: 'BNB', cost: 0.01 }],
+    });
+    expect(ledger.summary()).toMatchObject({ pnl: null, unknown: true });
+    expect(ledger.appendConversion('fee-close', {
+      kind: 'fee',
+      feeIndex: 0,
+      sourceCurrency: 'BNB',
+      quoteCurrency: 'USDT',
+      sourceAmount: 0.01,
+      quoteAmount: 3,
+      rate: 300,
+      market: 'BNB/USDT',
+      direction: 'direct',
+      tickerTimestamp: now,
+      convertedAt: new Date(now).toISOString(),
+    })).toBe(true);
+    expect(ledger.appendConversion('fee-close', {
+      kind: 'fee',
+      feeIndex: 0,
+      sourceCurrency: 'BNB',
+      quoteCurrency: 'USDT',
+      sourceAmount: 0.01,
+      quoteAmount: 3,
+      rate: 300,
+      market: 'BNB/USDT',
+      direction: 'direct',
+      tickerTimestamp: now,
+      convertedAt: new Date(now).toISOString(),
+    })).toBe(false);
+    expect(ledger.summary()).toMatchObject({ pnl: 7, unknown: false, unconvertedFees: [] });
+    const original = ledger.entries().find((entry) => entry.id === 'fee-close');
+    expect(original?.pnl).toBe(10);
+    expect(original?.unconvertedFees).toEqual([{ currency: 'BNB', cost: 0.01 }]);
+    expect(ledger.entries().filter((entry) => entry.category === 'conversion')).toHaveLength(1);
+  });
+
+  it('applies signed funding conversion to the daily funding total', () => {
+    const now = 1_700_000_000_000;
+    const ledger = new RealizedPnlLedger({ filePath: ledgerPath(), clock: () => now });
+    ledger.load();
+    ledger.append({
+      id: 'funding-btc',
+      category: 'funding',
+      at: new Date(now).toISOString(),
+      symbol: 'BTC/USDT:USDT',
+      quoteCurrency: 'USDT',
+      pnl: null,
+      grossPnl: null,
+      quoteFees: 0,
+      unconvertedFees: [{ currency: 'BTC', cost: 0.01 }],
+      fundingAmount: -0.01,
+      fundingCurrency: 'BTC',
+      fundingSource: 'ledger',
+    });
+    ledger.appendConversion('funding-btc', {
+      kind: 'funding',
+      feeIndex: 0,
+      sourceCurrency: 'BTC',
+      quoteCurrency: 'USDT',
+      sourceAmount: -0.01,
+      quoteAmount: -300,
+      rate: 30_000,
+      market: 'BTC/USDT',
+      direction: 'direct',
+      tickerTimestamp: now,
+      convertedAt: new Date(now).toISOString(),
+    });
+    expect(ledger.summary()).toMatchObject({
+      pnl: -300,
+      fundingPnl: -300,
+      unknown: false,
+      unconvertedFees: [],
+    });
+  });
+
+  it('rejects fee conversions for funding entries', () => {
+    const now = 1_700_000_000_000;
+    const ledger = new RealizedPnlLedger({ filePath: ledgerPath(), clock: () => now });
+    ledger.load();
+    ledger.append({
+      id: 'funding-entry',
+      category: 'funding',
+      at: new Date(now).toISOString(),
+      symbol: 'BTC/USDT:USDT',
+      quoteCurrency: 'USDT',
+      pnl: null,
+      grossPnl: null,
+      quoteFees: 0,
+      unconvertedFees: [{ currency: 'BTC', cost: 0.01 }],
+      fundingAmount: -0.01,
+      fundingCurrency: 'BTC',
+      fundingSource: 'ledger',
+    });
+    expect(() => ledger.appendConversion('funding-entry', {
+      kind: 'fee',
+      feeIndex: 0,
+      sourceCurrency: 'BTC',
+      quoteCurrency: 'USDT',
+      sourceAmount: 0.01,
+      quoteAmount: 300,
+      rate: 30_000,
+      market: 'BTC/USDT',
+      direction: 'direct',
+      tickerTimestamp: now,
+      convertedAt: new Date(now).toISOString(),
+    })).toThrow(/trade entry/);
   });
 
   it('requires an explicit durable resolution for an unknown entry', () => {

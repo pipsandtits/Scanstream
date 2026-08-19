@@ -4,7 +4,21 @@ import { realizedPnl, type FeeTotal } from './fill-accounting';
 
 export const REALIZED_PNL_SCHEMA_VERSION = 1;
 
-export type RealizedPnlCategory = 'trade' | 'funding' | 'resolution';
+export type RealizedPnlCategory = 'trade' | 'funding' | 'resolution' | 'conversion';
+
+export interface PnlConversionRecord {
+  kind: 'fee' | 'funding';
+  feeIndex: number;
+  sourceCurrency: string;
+  quoteCurrency: string;
+  sourceAmount: number;
+  quoteAmount: number;
+  rate: number;
+  market: string;
+  direction: 'direct' | 'inverse';
+  tickerTimestamp: number;
+  convertedAt: string;
+}
 
 export interface RealizedPnlEntry {
   id: string;
@@ -21,8 +35,11 @@ export interface RealizedPnlEntry {
   exitPrice?: number | null;
   fundingAmount?: number | null;
   fundingCurrency?: string | null;
+  fundingSource?: 'funding_history' | 'ledger';
   resolutionFor?: string;
   resolution?: RealizedPnlResolution;
+  conversionFor?: string;
+  conversion?: PnlConversionRecord;
 }
 
 export type RealizedPnlResolution =
@@ -170,7 +187,11 @@ export class RealizedPnlLedger {
 
   append(entry: RealizedPnlEntry): boolean {
     if (this.state.entries.some((existing) => existing.id === entry.id)) return false;
-    const nextEntries = [...this.state.entries, { ...entry, unconvertedFees: entry.unconvertedFees.map((fee) => ({ ...fee })) }];
+    const nextEntries = [...this.state.entries, {
+      ...entry,
+      unconvertedFees: entry.unconvertedFees.map((fee) => ({ ...fee })),
+      conversion: entry.conversion ? { ...entry.conversion } : undefined,
+    }];
     const next: RealizedPnlState = {
       schemaVersion: REALIZED_PNL_SCHEMA_VERSION,
       writtenAt: new Date(this.clock()).toISOString(),
@@ -179,6 +200,54 @@ export class RealizedPnlLedger {
     this.write(next);
     this.state = next;
     return true;
+  }
+
+  appendConversion(entryId: string, conversion: PnlConversionRecord): boolean {
+    const source = this.state.entries.find((entry) => entry.id === entryId);
+    if (!source || source.category === 'conversion' || source.category === 'resolution') {
+      throw new Error('realized PnL conversion source not found');
+    }
+    if (conversion.kind === 'funding' && source.category !== 'funding') {
+      throw new Error('funding conversion requires a funding entry');
+    }
+    if (conversion.kind === 'fee' && source.category !== 'trade') {
+      throw new Error('fee conversion requires a trade entry');
+    }
+    if (!Number.isInteger(conversion.feeIndex) || conversion.feeIndex < 0 ||
+        conversion.feeIndex >= source.unconvertedFees.length) {
+      throw new Error('realized PnL conversion fee index is invalid');
+    }
+    const expectedAmount = conversion.kind === 'funding'
+      ? source.fundingAmount
+      : source.unconvertedFees[conversion.feeIndex]?.cost;
+    const expectedCurrency = conversion.kind === 'funding'
+      ? source.fundingCurrency
+      : source.unconvertedFees[conversion.feeIndex]?.currency;
+    if (!finite(expectedAmount) ||
+        conversion.sourceAmount !== expectedAmount ||
+        conversion.sourceCurrency.toUpperCase() !== expectedCurrency?.toUpperCase()) {
+      throw new Error('realized PnL conversion source does not match entry');
+    }
+    if (this.state.entries.some((entry) =>
+      entry.category === 'conversion' &&
+      entry.conversionFor === entryId &&
+      entry.conversion?.feeIndex === conversion.feeIndex
+    )) return false;
+
+    const entry: RealizedPnlEntry = {
+      id: `conversion:${entryId}:${conversion.feeIndex}`,
+      category: 'conversion',
+      at: conversion.convertedAt,
+      symbol: source.symbol,
+      quoteCurrency: source.quoteCurrency,
+      pnl: 0,
+      grossPnl: 0,
+      quoteFees: 0,
+      unconvertedFees: [],
+      conversionFor: entryId,
+      conversion: { ...conversion },
+    };
+    return this.append(entry);
   }
 
   resolveUnknown(
@@ -237,11 +306,19 @@ export class RealizedPnlLedger {
       }
     });
     const resolutions = new Map(
-      entries
+      this.state.entries
         .filter((entry) => entry.category === 'resolution' && entry.resolutionFor)
         .map((entry) => [entry.resolutionFor as string, entry.resolution])
     );
-    const baseEntries = entries.filter((entry) => entry.category !== 'resolution');
+    const conversions = new Map<string, RealizedPnlEntry[]>();
+    for (const entry of this.state.entries.filter((candidate) => candidate.category === 'conversion' && candidate.conversionFor)) {
+      const existing = conversions.get(entry.conversionFor as string) ?? [];
+      existing.push(entry);
+      conversions.set(entry.conversionFor as string, existing);
+    }
+    const baseEntries = entries.filter((entry) =>
+      entry.category !== 'resolution' && entry.category !== 'conversion'
+    );
     let pnl = 0;
     let tradePnl = 0;
     let fundingPnl = 0;
@@ -250,7 +327,32 @@ export class RealizedPnlLedger {
 
     for (const entry of baseEntries) {
       const resolution = resolutions.get(entry.id);
-      const effectivePnl = resolution?.kind === 'attested_value' ? resolution.pnl : entry.pnl;
+      const conversionEntries = conversions.get(entry.id) ?? [];
+      const feeConversions = new Map(
+        conversionEntries
+          .filter((conversion) => conversion.conversion?.kind === 'fee')
+          .map((conversion) => [conversion.conversion?.feeIndex, conversion])
+      );
+      const fundingConversions = conversionEntries.filter((conversion) => conversion.conversion?.kind === 'funding');
+      const convertedIndexes = new Set(
+        conversionEntries
+          .map((conversion) => conversion.conversion?.feeIndex)
+          .filter((index): index is number => Number.isInteger(index))
+      );
+      const allFeesConverted = entry.unconvertedFees.every((_fee, index) => convertedIndexes.has(index));
+      const convertedFeeQuoteAmount = [...feeConversions.values()]
+        .reduce((sum, conversion) => sum + (conversion.conversion?.quoteAmount ?? 0), 0);
+      const convertedFundingQuoteAmount = fundingConversions
+        .reduce((sum, conversion) => sum + (conversion.conversion?.quoteAmount ?? 0), 0);
+      let effectivePnl = resolution?.kind === 'attested_value' ? resolution.pnl : entry.pnl;
+      if (!resolution && entry.unconvertedFees.length > 0 && entry.category === 'funding' &&
+          fundingConversions.length > 0 && allFeesConverted) {
+        effectivePnl = convertedFundingQuoteAmount;
+      } else if (!resolution && entry.unconvertedFees.length > 0 && allFeesConverted && effectivePnl !== null) {
+        effectivePnl -= convertedFeeQuoteAmount;
+      } else if (!resolution && entry.unconvertedFees.length > 0) {
+        effectivePnl = null;
+      }
       if (resolution?.kind === 'excluded_unknown') {
         // Explicit exclusion removes the unknown from the daily gate, but the
         // original entry and any non-quote fees remain visible for review.
@@ -261,7 +363,8 @@ export class RealizedPnlLedger {
         if (entry.category === 'trade') tradePnl += effectivePnl;
         else fundingPnl += effectivePnl;
       }
-      for (const fee of entry.unconvertedFees) {
+      for (const [index, fee] of entry.unconvertedFees.entries()) {
+        if (convertedIndexes.has(index)) continue;
         const existing = unconvertedFees.find((candidate) => candidate.currency === fee.currency);
         if (existing) existing.cost += fee.cost;
         else unconvertedFees.push({ ...fee });
@@ -282,6 +385,7 @@ export class RealizedPnlLedger {
     return this.state.entries.map((entry) => ({
       ...entry,
       unconvertedFees: entry.unconvertedFees.map((fee) => ({ ...fee })),
+      conversion: entry.conversion ? { ...entry.conversion } : undefined,
     }));
   }
 
@@ -328,27 +432,53 @@ export class RealizedPnlLedger {
   private isValidEntry(value: unknown): value is RealizedPnlEntry {
     if (!value || typeof value !== 'object') return false;
     const entry = value as Partial<RealizedPnlEntry>;
-    return (
-      typeof entry.id === 'string' &&
-      (entry.category === 'trade' || entry.category === 'funding' || entry.category === 'resolution') &&
-      typeof entry.at === 'string' &&
-      typeof entry.symbol === 'string' &&
-      typeof entry.quoteCurrency === 'string' &&
-      (entry.pnl === null || finite(entry.pnl)) &&
-      (entry.grossPnl === null || finite(entry.grossPnl)) &&
-      (entry.quoteFees === null || finite(entry.quoteFees)) &&
-      Array.isArray(entry.unconvertedFees) &&
-      entry.unconvertedFees.every((fee) => fee && typeof fee.currency === 'string' && finite(fee.cost)) &&
-      (
-        (entry.category !== 'resolution' && !entry.resolution) ||
-        (entry.category === 'resolution' && typeof entry.resolutionFor === 'string' &&
-          !!entry.resolution &&
-          ((entry.resolution.kind === 'attested_value' && finite(entry.resolution.pnl)) ||
-            (entry.resolution.kind === 'excluded_unknown' && entry.pnl === 0)) &&
-          typeof entry.resolution.reason === 'string' &&
-          typeof entry.resolution.attestedAt === 'string')
-      )
-    );
+    if (
+      typeof entry.id !== 'string' ||
+      (entry.category !== 'trade' && entry.category !== 'funding' &&
+        entry.category !== 'resolution' && entry.category !== 'conversion') ||
+      typeof entry.at !== 'string' ||
+      typeof entry.symbol !== 'string' ||
+      typeof entry.quoteCurrency !== 'string' ||
+      (entry.fundingSource !== undefined &&
+        entry.fundingSource !== 'funding_history' &&
+        entry.fundingSource !== 'ledger') ||
+      (entry.pnl !== null && !finite(entry.pnl)) ||
+      (entry.grossPnl !== null && !finite(entry.grossPnl)) ||
+      (entry.quoteFees !== null && !finite(entry.quoteFees)) ||
+      !Array.isArray(entry.unconvertedFees) ||
+      !entry.unconvertedFees.every((fee) => fee && typeof fee.currency === 'string' && finite(fee.cost))
+    ) return false;
+
+    if (entry.category === 'resolution') {
+      return typeof entry.resolutionFor === 'string' &&
+        !!entry.resolution &&
+        ((entry.resolution.kind === 'attested_value' && finite(entry.resolution.pnl)) ||
+          (entry.resolution.kind === 'excluded_unknown' && entry.pnl === 0)) &&
+        typeof entry.resolution.reason === 'string' &&
+        typeof entry.resolution.attestedAt === 'string' &&
+        !entry.conversion &&
+        !entry.conversionFor;
+    }
+    if (entry.category === 'conversion') {
+      return typeof entry.conversionFor === 'string' &&
+        !!entry.conversion &&
+        (entry.conversion.kind === 'fee' || entry.conversion.kind === 'funding') &&
+        Number.isInteger(entry.conversion.feeIndex) &&
+        entry.conversion.feeIndex >= 0 &&
+        typeof entry.conversion.sourceCurrency === 'string' &&
+        typeof entry.conversion.quoteCurrency === 'string' &&
+        finite(entry.conversion.sourceAmount) &&
+        finite(entry.conversion.quoteAmount) &&
+        finite(entry.conversion.rate) &&
+        entry.conversion.rate > 0 &&
+        typeof entry.conversion.market === 'string' &&
+        (entry.conversion.direction === 'direct' || entry.conversion.direction === 'inverse') &&
+        finite(entry.conversion.tickerTimestamp) &&
+        typeof entry.conversion.convertedAt === 'string' &&
+        !entry.resolution &&
+        !entry.resolutionFor;
+    }
+    return !entry.resolution && !entry.resolutionFor && !entry.conversion && !entry.conversionFor;
   }
 }
 

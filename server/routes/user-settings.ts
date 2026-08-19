@@ -26,9 +26,10 @@ import {
   addApiKey,
   deleteApiKey,
 } from '../controllers/user-settings-controller';
+import type { AuthRequest } from '../middleware/auth';
 
 // Simple auth middleware
-const requireAuth = (req: Request, res: Response, next: NextFunction) => {
+const requireAuth = (req: AuthRequest, res: Response, next: NextFunction) => {
   // Check if user is authenticated (this will be set by Express auth)
   if (!req.user) {
     return res.status(401).json({ error: 'Unauthorized' });

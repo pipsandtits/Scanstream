@@ -23,7 +23,10 @@ import featureFlagsRouter from './routes/feature-flags';
 import agentAbilitiesRouter from './routes/agent-abilities';
 import gatewayRouter, { getGatewayServices } from './routes/gateway';
 import metricsRouter from './routes/metrics';
-// import logsRouter from './routes/logs'; // TODO: Debug route error
+import agentsRouter from './routes/agents';
+import tradeExecutionRouter from './routes/trade-execution';
+import modelPerformanceRouter from './routes/model-performance';
+import { getSharedService, setSharedService } from './services/shared-service-registry';
 // Removed fastScanner service import
 
 // API Registry System imports
@@ -61,8 +64,8 @@ console.log(' SERVER STARTUP - Enhanced Logging System Active');
 console.log(`${'='.repeat(70)}`);
 console.log(` Session ID:   ${sessionId}`);
 console.log(` Logs Dir:     ${getLogPath()}`);
-console.log(`API Endpoint: /api/logs/stats - View current session logs`);
-console.log(` Search:      /api/logs/search?pattern=ERROR - Search logs`);
+console.log(`API Endpoint: /api/health/logs - View current session logs`);
+console.log(` Search:      /api/health/logs?pattern=ERROR - Search logs`);
 console.log(` Features:    Auto-chunking (10MB), Automatic rotation, Full history`);
 console.log(`${'='.repeat(70)}\n`);
 
@@ -222,17 +225,6 @@ console.log('[express] API Documentation registered at /api/docs');
 app.use('/api/feature-flags', featureFlagsRouter);
 console.log('[express] Feature Flags API registered at /api/feature-flags');
 
-// Register Logs Management API (DISABLED - debug route error)
-// app.use('/api/logs', logsRouter);
-// console.log('[express] Logs API registered at /api/logs');
-// console.log('[express]   - GET /api/logs/stats - Log session statistics');
-// console.log('[express]   - GET /api/logs/session - Current session info');
-// console.log('[express]   - GET /api/logs/list - List all log files');
-// console.log('[express]   - GET /api/logs/download/:filename - Download log file');
-// console.log('[express]   - GET /api/logs/read/:filename - Read log file');
-// console.log('[express]   - GET /api/logs/tail/:filename - Tail log file');
-// console.log('[express]   - GET /api/logs/search - Search logs');
-
 // Core API routers (analytics, scanner, ml, coinGecko, paper-trading, live-trading, etc.)
 // are registered centrally inside registerRoutes(app) to avoid duplicate mounts.
 console.log('[express] Core API router mounting deferred to registerRoutes() to avoid duplicates');
@@ -287,14 +279,23 @@ import healthRouter from './routes/health';
 app.use('/api/health', healthRouter);
 console.log('[express] Health Check API registered at /api/health');
 
-// ============================================================================
-// DISABLED ROUTERS (see PRODUCTION_READINESS.md "Disabled route groups").
-//
-// These were commented out by a binary search for an import-time crash. The
-// crash was `Cannot access 'RLConfig' before initialization` in rl-guard, now
-// fixed; every router below imports and mounts cleanly again. They stay
-// disabled until each group has route-level coverage, and /api/execution needs
-// operator auth before it is exposed at all.
+// Route groups restored after isolated route-contract coverage:
+// - /api/agents/services-api is read-only/status-oriented, except for a
+//   deliberately simulated ability endpoint.
+// - /api/execution guards every state-changing endpoint with operator auth and
+//   audits the action; its status endpoint remains read-only.
+app.use('/api/agents/services-api', agentsRouter);
+console.log('[express] Agent Services API registered at /api/agents/services-api');
+app.use('/api/execution', tradeExecutionRouter);
+console.log('[express] Trade Execution API registered at /api/execution');
+app.use('/api/model-performance', modelPerformanceRouter);
+console.log('[express] Model Performance API registered at /api/model-performance');
+
+// Remaining disabled routers (see PRODUCTION_READINESS.md "Disabled route groups").
+// Import-time probing is not route-level safety evidence. Each group below
+// remains disabled until every route has bounded contract/error coverage and
+// any state-changing or capital-adjacent endpoint has the required operator
+// guard.
 // ============================================================================
 /*
 // Register Physics Agents (VFMD and Flow) routes
@@ -326,11 +327,6 @@ import agentSignalInsightsRouter from './routes/agent-signal-insights';
 app.use('/api/agents/signals', agentSignalInsightsRouter);
 console.log('[express] Agent Signal Insights API registered at /api/agents/signals');
 
-// Register Agent Services Status API
-import agentServicesRouter from './routes/agents';
-app.use('/api/agents/services-api', agentServicesRouter);
-console.log('[express] Agent Services API registered at /api/agents/services-api');
-
 // Register Optimization routes
 import optimizationRouter from './routes/optimization';
 app.use('/api/optimize', optimizationRouter);
@@ -340,11 +336,6 @@ console.log('[express] Optimization API registered at /api/optimize');
 import strategiesRouter from './routes/strategies';
 app.use('/api/strategies', strategiesRouter);
 console.log('[express] Strategies API registered at /api/strategies');
-
-// Register Model Performance & Backtesting routes
-import modelPerformanceRouter from './routes/model-performance';
-app.use('/api/model-performance', modelPerformanceRouter);
-console.log('[express] Model Performance API registered at /api/model-performance');
 
 // Register Signal Backtesting routes
 import backtestingRouter from './routes/signal-backtesting';
@@ -494,10 +485,6 @@ import signalGenerationRouter from './routes/api/signal-generation';
 app.use('/api/signal-generation', signalGenerationRouter);
 console.log('[express] Complete Signal Generation API registered at /api/signal-generation');
 
-// Register Trade Execution routes (Loss Limiter, Drawdown Monitor, Win Amplifier)
-import tradeExecutionRouter from './routes/trade-execution';
-app.use('/api/execution', tradeExecutionRouter);
-console.log('[express] Trade Execution API registered at /api/execution');
 */
 
 // Initialize WebSocket service for real-time signal streaming
@@ -682,7 +669,8 @@ app.use((req, res, next) => {
       const { TruthEngine } = await import('./services/aggregator/truth-engine');
       const truthEngine = new TruthEngine(integrityGate, crossAggregator);
       // Expose TruthEngine globally so agents and engines can access canonical consensus
-      try { (global as any).truthEngine = truthEngine; console.log('[TruthEngine] registered globally'); } catch (e) { /* ignore */ }
+      setSharedService('truthEngine', truthEngine);
+      console.log('[TruthEngine] registered in shared service registry');
 
       // Healing service for forward-fill / interpolation
       const { HealingService } = await import('./services/aggregator/healing-service');
@@ -1010,7 +998,7 @@ app.use((req, res, next) => {
         await maybeStop(globalMarketDataLayer);
         await maybeStop((global as any).crossExchangeAggregator);
         await maybeStop((global as any).executionEngine);
-        await maybeStop((global as any).truthEngine);
+        await maybeStop(getSharedService('truthEngine'));
       } catch (e) {
         console.error('[process] Error during graceful shutdown:', e);
       } finally {
@@ -1035,7 +1023,7 @@ app.use((req, res, next) => {
         await maybeStop(globalMarketDataLayer);
         await maybeStop((global as any).crossExchangeAggregator);
         await maybeStop((global as any).executionEngine);
-        await maybeStop((global as any).truthEngine);
+        await maybeStop(getSharedService('truthEngine'));
         server.close(() => {
           console.log('[process] HTTP server closed');
           process.exit(0);

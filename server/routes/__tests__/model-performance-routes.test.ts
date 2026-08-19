@@ -1,0 +1,119 @@
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import express from 'express';
+import type { Server } from 'http';
+import { AddressInfo } from 'net';
+import modelPerformanceRouter from '../model-performance';
+import { ModelPerformanceTracker } from '../../services/model-performance-tracker';
+
+let server: Server;
+let base: string;
+
+async function request(
+  route: string,
+  init: RequestInit = {},
+): Promise<{ status: number; body: any }> {
+  const response = await fetch(`${base}${route}`, {
+    ...init,
+    headers: { 'content-type': 'application/json', ...(init.headers ?? {}) },
+  });
+  return { status: response.status, body: await response.json() };
+}
+
+describe('model performance route group', () => {
+  beforeAll(async () => {
+    const app = express();
+    app.use(express.json());
+    app.use('/api/model-performance', modelPerformanceRouter);
+    await new Promise<void>((resolve) => {
+      server = app.listen(0, () => resolve());
+    });
+    base = `http://127.0.0.1:${(server.address() as AddressInfo).port}/api/model-performance`;
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  afterAll(async () => {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+
+  it('serves metrics, history, and ensemble status contracts', async () => {
+    const [metrics, history, status] = await Promise.all([
+      request('/metrics'),
+      request('/history?limit=5'),
+      request('/ensemble-status'),
+    ]);
+
+    expect(metrics.status).toBe(200);
+    expect(metrics.body).toEqual(expect.objectContaining({
+      success: true,
+      metrics: expect.any(Object),
+      timestamp: expect.any(String),
+    }));
+    expect(history.status).toBe(200);
+    expect(history.body).toEqual(expect.objectContaining({
+      success: true,
+      count: expect.any(Number),
+      history: expect.any(Array),
+    }));
+    expect(status.status).toBe(200);
+    expect(status.body.ensemble).toEqual(expect.objectContaining({
+      models: expect.any(Array),
+      totalModels: 5,
+      ready: expect.any(Boolean),
+    }));
+  });
+
+  it('validates ensemble input before invoking prediction work', async () => {
+    const response = await request('/ensemble-predict', {
+      method: 'POST',
+      body: JSON.stringify({ chartData: [] }),
+    });
+
+    expect(response.status).toBe(400);
+    expect(response.body).toEqual(expect.objectContaining({
+      error: 'Insufficient data',
+      message: expect.stringContaining('20'),
+    }));
+  });
+
+  it('validates and records a prediction, then supports pruning', async () => {
+    const validation = await request('/validate', {
+      method: 'POST',
+      body: JSON.stringify({
+        symbol: 'BTC/USDT',
+        predictedDirection: 'UP',
+        actualChange: 10,
+        predictedPrice: 100,
+        actualPrice: 110,
+      }),
+    });
+    const prune = await request('/prune', {
+      method: 'POST',
+      body: JSON.stringify({ daysToKeep: 30 }),
+    });
+
+    expect(validation.status).toBe(200);
+    expect(validation.body).toEqual(expect.objectContaining({
+      success: true,
+      result: expect.objectContaining({
+        symbol: 'BTC/USDT',
+        correct: true,
+      }),
+    }));
+    expect(prune.status).toBe(200);
+    expect(prune.body.success).toBe(true);
+  });
+
+  it('converts tracker failures into a handled response', async () => {
+    vi.spyOn(ModelPerformanceTracker.prototype, 'calculateMetrics').mockImplementation(() => {
+      throw new Error('metrics unavailable');
+    });
+
+    const response = await request('/metrics');
+
+    expect(response.status).toBe(500);
+    expect(response.body.error).toBe('metrics unavailable');
+  });
+});

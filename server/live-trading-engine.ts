@@ -33,6 +33,7 @@ import {
 } from './services/execution/fill-accounting';
 import { reconcileAtStartup, type ReconciliationReport } from './services/execution/startup-reconciler';
 import { safetyEventLog } from './services/observability/safety-event-log';
+import { getSharedService } from './services/shared-service-registry';
 import {
   DurableLocalStateStore,
   type LocalStateLoadResult,
@@ -40,9 +41,12 @@ import {
 import {
   computeRealizedClosePnl,
   RealizedPnlLedger,
+  type PnlConversionRecord,
   type RealizedPnlLoadResult,
   type RealizedPnlEntry,
 } from './services/execution/realized-pnl-ledger';
+import { QuoteCurrencyConverter } from './services/execution/quote-conversion';
+import { getTickerCache } from './services/ticker-snapshot-cache';
 import {
   FundingAccounting,
   type FundingAccountingResult,
@@ -237,6 +241,8 @@ export interface LiveTradingEngineDependencies {
   fundingAccountingPath?: string;
   fundingInitialLookbackMs?: number;
   fundingRecheckIntervalMs?: number;
+  quoteConversionMaxAgeMs?: number;
+  quoteConverter?: QuoteCurrencyConverter;
   clock?: () => number;
 }
 
@@ -270,15 +276,20 @@ export class LiveTradingEngine extends EventEmitter {
   private localStatePersistenceHealthy = true;
   private readonly realizedPnlLedger: RealizedPnlLedger;
   private readonly fundingAccounting: FundingAccounting;
+  private readonly quoteConverter: QuoteCurrencyConverter;
   private realizedPnlStatus: RealizedPnlLoadResult['status'] = 'absent';
   private fundingStatus: FundingLoadResult['status'] = 'absent';
   private realizedPnlLoaded = false;
   private fundingLoaded = false;
   private realizedPnlHealthy = true;
   private fundingHealthy = true;
+  private readonly conversionUnknownSignals = new Set<string>();
+  private readonly conversionRetryAt = new Map<string, number>();
+  private readonly clock: () => number;
 
   constructor(config?: Partial<ExecutionConfig>, dependencies: LiveTradingEngineDependencies = {}) {
     super();
+    this.clock = dependencies.clock ?? Date.now;
     this.config = {
       enabled: false,
       exchange: 'binance',
@@ -304,6 +315,10 @@ export class LiveTradingEngine extends EventEmitter {
       initialLookbackMs: dependencies.fundingInitialLookbackMs,
       recheckIntervalMs: dependencies.fundingRecheckIntervalMs,
     });
+    this.quoteConverter = dependencies.quoteConverter ?? new QuoteCurrencyConverter({
+      maxAgeMs: dependencies.quoteConversionMaxAgeMs,
+      clock: dependencies.clock,
+    });
 
     // Listen for global kill-switch events. Handlers are retained so they can
     // be detached in dispose() — the switch and breaker are process-wide
@@ -312,6 +327,7 @@ export class LiveTradingEngine extends EventEmitter {
       this.onKill = async (state: any) => {
         const logger = new ModuleLogger('LiveTrading');
         logger.warn('Global kill-switch activated, pausing trading', state);
+        this.invalidateTickerCache();
         // Pause engine immediately
         this.pause();
 
@@ -400,6 +416,7 @@ export class LiveTradingEngine extends EventEmitter {
         throw new Error(`Failed to initialize exchange ${exchangeName}`);
       }
       await this.exchange.loadMarkets();
+      this.invalidateTickerCache();
       
       const logger = new ModuleLogger('LiveTrading');
       logger.info(`Connected to ${exchangeName} (${this.config.testMode ? 'TESTNET' : 'LIVE'})`);
@@ -429,6 +446,7 @@ export class LiveTradingEngine extends EventEmitter {
     const logger = new ModuleLogger('LiveTrading');
     if (!venueName) return false;
     try {
+      const previousVenue = this.config.exchange;
       const ExchangeClass = ccxt[venueName as keyof typeof ccxt] as any;
       if (!ExchangeClass) {
         logger.warn(`switchVenue: exchange ${venueName} not supported`);
@@ -441,6 +459,8 @@ export class LiveTradingEngine extends EventEmitter {
         options: { defaultType: 'future', ...(this.config.testMode && { sandbox: true }) }
       });
       await ex.loadMarkets();
+      this.invalidateTickerCache(previousVenue);
+      this.invalidateTickerCache(venueName);
       this.exchange = ex;
       this.config.exchange = venueName;
       logger.info(`Switched venue to ${venueName}`);
@@ -448,6 +468,16 @@ export class LiveTradingEngine extends EventEmitter {
     } catch (e) {
       logger.warn('Failed to switch venue', e);
       return false;
+    }
+  }
+
+  private invalidateTickerCache(venue?: string): void {
+    try {
+      const cache = getTickerCache();
+      if (venue) cache.invalidateVenue(venue);
+      else cache.invalidateAll();
+    } catch {
+      // The gateway cache is optional in test and isolated engine processes.
     }
   }
 
@@ -642,6 +672,100 @@ export class LiveTradingEngine extends EventEmitter {
     return quote ? quote.toUpperCase() : null;
   }
 
+  private async appendQuoteConversions(
+    entryId: string,
+    quoteCurrency: string,
+    items: Array<{
+      feeIndex: number;
+      kind: 'fee' | 'funding';
+      sourceCurrency: string;
+      sourceAmount: number;
+    }>,
+  ): Promise<void> {
+    if (!this.exchange) return;
+    for (const item of items) {
+      const result = await this.quoteConverter.convert(
+        this.exchange,
+        item.sourceCurrency,
+        quoteCurrency,
+        item.sourceAmount,
+      );
+      if (result.status !== 'known') {
+        const signalKey = `${entryId}:${item.feeIndex}`;
+        if (!this.conversionUnknownSignals.has(signalKey)) {
+          this.conversionUnknownSignals.add(signalKey);
+          safetyEventLog.record({
+            type: 'conversion_unknown',
+            detail: result.reason,
+            data: {
+              entryId,
+              feeIndex: item.feeIndex,
+              kind: item.kind,
+              sourceCurrency: item.sourceCurrency,
+              quoteCurrency,
+            },
+          });
+        }
+        continue;
+      }
+      const conversion: PnlConversionRecord = {
+        kind: item.kind,
+        feeIndex: item.feeIndex,
+        ...result.conversion,
+      };
+      try {
+        this.realizedPnlLedger.appendConversion(entryId, conversion);
+      } catch (error: any) {
+        this.realizedPnlHealthy = false;
+        this.blockForExecution('realized_pnl_persistence_failed', error?.message, {
+          entryId,
+          sourceCurrency: item.sourceCurrency,
+          quoteCurrency,
+        });
+        return;
+      }
+    }
+  }
+
+  private async retryCurrentDayQuoteConversions(): Promise<void> {
+    if (!this.exchange) return;
+    const now = this.clock();
+    const today = new Date(now).toISOString().slice(0, 10);
+    const allEntries = this.realizedPnlLedger.entries();
+    let attempted = 0;
+    for (const entry of allEntries) {
+      if (attempted >= 8 || (entry.category !== 'trade' && entry.category !== 'funding') ||
+          !entry.unconvertedFees.length ||
+          !Number.isFinite(Date.parse(entry.at)) ||
+          new Date(entry.at).toISOString().slice(0, 10) !== today ||
+          entry.quoteCurrency === 'UNKNOWN') {
+        continue;
+      }
+      const convertedIndexes = new Set(
+        allEntries
+          .filter((candidate) => candidate.category === 'conversion' && candidate.conversionFor === entry.id)
+          .map((candidate) => candidate.conversion?.feeIndex)
+          .filter((index): index is number => Number.isInteger(index))
+      );
+      const items = entry.unconvertedFees.flatMap((fee, feeIndex) => {
+        if (convertedIndexes.has(feeIndex) || attempted >= 8) return [];
+        const retryKey = `${entry.id}:${feeIndex}`;
+        if ((this.conversionRetryAt.get(retryKey) ?? 0) > now - 5_000) return [];
+        this.conversionRetryAt.set(retryKey, now);
+        attempted += 1;
+        return [{
+          feeIndex,
+          kind: entry.category === 'funding' ? 'funding' as const : 'fee' as const,
+          sourceCurrency: entry.category === 'funding' ? (entry.fundingCurrency ?? fee.currency) : fee.currency,
+          sourceAmount: entry.category === 'funding' ? (entry.fundingAmount ?? fee.cost) : fee.cost,
+        }];
+      });
+      if (items.length > 0) {
+        await this.appendQuoteConversions(entry.id, entry.quoteCurrency, items);
+      }
+    }
+  }
+
   private async ensureFundingAccounted(symbol: string): Promise<boolean> {
     if (!this.fundingLoaded || !this.fundingHealthy) {
       this.blockForExecution('funding_state_unreadable', 'funding state is not trustworthy', {
@@ -678,6 +802,7 @@ export class LiveTradingEngine extends EventEmitter {
         unconvertedFees: isQuote ? [] : [{ currency: payment.currency, cost: Math.abs(payment.amount) }],
         fundingAmount: payment.amount,
         fundingCurrency: payment.currency,
+        fundingSource: payment.source,
       };
       try {
         this.realizedPnlLedger.append(entry);
@@ -688,6 +813,14 @@ export class LiveTradingEngine extends EventEmitter {
           entryId: entry.id,
         });
         return false;
+      }
+      if (!isQuote && quoteCurrency) {
+        await this.appendQuoteConversions(entry.id, quoteCurrency, [{
+          feeIndex: 0,
+          kind: 'funding',
+          sourceCurrency: payment.currency,
+          sourceAmount: payment.amount,
+        }]);
       }
     }
 
@@ -701,7 +834,10 @@ export class LiveTradingEngine extends EventEmitter {
       return true;
     }
 
-    this.blockForExecution('funding_unaccounted', result.reason, { symbol });
+    const blockReason = result.reason === 'funding_source_unsupported'
+      ? 'funding_source_unsupported'
+      : 'funding_unaccounted';
+    this.blockForExecution(blockReason, result.reason, { symbol });
     safetyEventLog.record({
       type: 'funding_unknown',
       detail: result.reason,
@@ -944,6 +1080,15 @@ export class LiveTradingEngine extends EventEmitter {
       const scored = scorer.scoreWithCurrentMode(signal.confidence, 'execution');
       if (!scored.canTrade) {
         logger.info(`Signal blocked by mode-aware scorer: ${scored.reason}`);
+        recordExecutionBlocked('confidence_scorer_refused');
+        this.emit('executionBlocked', {
+          type: 'confidence',
+          reason: 'confidence_scorer_refused',
+          detail: scored.reason,
+          timestamp: Date.now(),
+          signalId: signal.id,
+          symbol: signal.symbol,
+        });
         return null;
       }
       // Use adjusted confidence for execution threshold checks
@@ -972,7 +1117,11 @@ export class LiveTradingEngine extends EventEmitter {
       if (typeof fetched === 'number') accountBalance = fetched;
 
       const limits = portfolioRiskManager.getLimits();
-      const realizedInput = this.realizedPnlInput();
+      let realizedInput = this.realizedPnlInput();
+      if (realizedInput.dailyPnl === null || realizedInput.unknown) {
+        await this.retryCurrentDayQuoteConversions();
+        realizedInput = this.realizedPnlInput();
+      }
       if (realizedInput.dailyPnl === null || realizedInput.unknown) {
         this.blockForExecution('realized_pnl_unknown', 'daily realized PnL is unknown', {
           symbol: signal.symbol,
@@ -1036,7 +1185,7 @@ export class LiveTradingEngine extends EventEmitter {
 
     // Ensure market data is healthy for this symbol via TruthEngine
     try {
-      const truth = (global as any).truthEngine as any;
+      const truth = getSharedService('truthEngine');
       if (truth && typeof truth.isTradeable === 'function') {
         const tradeable = truth.isTradeable(signal.symbol, {
           minSources: Number(process.env.MIN_TRUTH_SOURCES) || 2,
@@ -1161,7 +1310,7 @@ export class LiveTradingEngine extends EventEmitter {
       let amount = positionSizeUSD / signal.price;
       // If TruthEngine consensus price exists, prefer it for amount calculation
       try {
-        const truth = (global as any).truthEngine as any;
+        const truth = getSharedService('truthEngine');
         if (truth && typeof truth.getConsensus === 'function') {
           const cons = truth.getConsensus(signal.symbol);
           if (cons && typeof cons.price === 'number' && cons.price > 0) {
@@ -2411,6 +2560,14 @@ export class LiveTradingEngine extends EventEmitter {
       };
       try {
         this.realizedPnlLedger.append(entry);
+        if (entry.unconvertedFees.length > 0 && entry.quoteCurrency !== 'UNKNOWN') {
+          await this.appendQuoteConversions(entry.id, entry.quoteCurrency, entry.unconvertedFees.map((fee, feeIndex) => ({
+            feeIndex,
+            kind: 'fee' as const,
+            sourceCurrency: fee.currency,
+            sourceAmount: fee.cost,
+          })));
+        }
       } catch (ledgerError: any) {
         this.realizedPnlHealthy = false;
         this.blockForExecution('realized_pnl_persistence_failed', ledgerError?.message, {
