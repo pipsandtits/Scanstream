@@ -30,6 +30,7 @@ export type SafetyEventType =
   | 'circuit_breaker'
   | 'durability_failure'
   | 'funding_unknown'
+  | 'conversion_unknown'
   | 'funding_baseline_resolved'
   | 'realized_pnl_resolved'
   | 'operator_action';

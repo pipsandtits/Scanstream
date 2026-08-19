@@ -147,7 +147,7 @@ that no longer exist and are not wired into the runner.
 | P1 | Safety metrics are process-local and reset on restart; no Prometheus/OTel exporter, no correlation IDs end-to-end |
 | P1 | `typecheck` reports 362 pre-existing errors (mostly legacy `tests/` and Express 5 `req.params` typing). CI does not gate on it; the number was unchanged by this pass and none of the new files error |
 | P2 | 36 `(global as any)` service handoffs; no DI |
-| P2 | Indicator recomputation cost unmeasured; replay/paper/live parity unverified; cache TTL/stampede behaviour unaudited |
+| P2 | Indicator recomputation cost unmeasured; replay/paper/live parity unverified |
 | P2 | Rich `/api/health` still contains hard-coded exchange counts and placeholder freshness values |
 
 ---
@@ -180,6 +180,9 @@ that no longer exist and are not wired into the runner.
 6. Ensure `data/` is on durable, writable storage. Live execution state,
    `realized-pnl-ledger.json`, `funding-accounting.json`, the kill switch,
    circuit breaker and safety events persist there and fail closed if unreadable.
+   Ticker snapshots, price/candle snapshots, gateway caches, indicator caches
+   and velocity caches are memory-only optimizations; they start empty after a
+   restart and are never treated as durable execution or exposure state.
 7. For perpetual/swap markets, configure a venue that declares either
    `fetchFundingHistory` or `fetchLedger` (with funding-type rows). The only
    deliberate escape hatch is `ALLOW_UNACCOUNTED_FUNDING=1`; setting it accepts
@@ -203,6 +206,9 @@ that no longer exist and are not wired into the runner.
   `realized_pnl_persistence_failed` → daily loss is not provable; keep live
   execution stopped and use the entry-specific operator resolution procedure
   below only after exchange records are reviewed.
+- `conversion_unknown` → a fee or funding conversion could not be proven from
+  a fresh same-venue ticker. Bounded retries may self-heal, but live execution
+  remains stopped while daily PnL is unknown.
 - `funding_unaccounted`, `funding_state_unreadable` or `funding_unknown` →
   perpetual/swap funding is not provable; reconcile the venue history before
   clearing the block. If older coverage cannot be proven from the venue
@@ -237,6 +243,10 @@ that no longer exist and are not wired into the runner.
   durably recorded in funding state and audited as `shared-operator-token`; it
   clears only that symbol's initial baseline gap. Failed or truncated later
   queries create a new unknown and must be investigated again.
+- **Stale or corrupt market-data cache:** caches are disposable and
+  memory-only. Restarting clears them; a cache read must never be used to
+  reconstruct positions or exposure. Reinitialize the venue and reload
+  markets before accepting new market-data reads.
 - **After an incident:** compare exchange positions/orders against
   `/api/live-trading/status` before clearing the kill switch — there is no
   automatic startup reconciliation yet (see §4). Clear the breaker, then resume
@@ -443,7 +453,28 @@ Subsequent queries page until a short response, advance the cursor only after
 complete pagination, and reuse only a durable known answer within the minimum
 recheck interval; unknown answers are never cached.
 
-### 9.4 Deliberately unimplemented
+### 9.4 Pass 4B — cache hardening
+
+`TickerSnapshotCache` is explicitly venue-scoped: keys contain the venue and
+symbol, and values record the venue source. Calls without an explicit venue
+return unknown rather than selecting whichever exchange answers first. Reads
+accept a caller-provided maximum age and never return an expired value. The
+cache retains single-flight requests per venue/symbol, bounds concurrent
+upstream fetches, does not store failed fetches, and applies a short per-key
+failure backoff. Per-key, per-venue and global invalidation are available and
+are invoked on venue initialization/reload, venue switching and kill-switch
+activation.
+
+The ticker cache, `PriceCache`, gateway `CacheManager`, scanner indicator and
+signal caches, and velocity caches are process-memory optimizations. They start
+empty at boot; none is a source of truth for exposure or durable local
+execution state. No cache file or database persistence is used by these paths,
+so there is no persisted cache to restore after corruption. The gateway cache
+manager records TTL as a duration from insertion and supports an explicit
+read-age bound. Historical/VFMD files under `data/cache/` are offline
+backtest/training artifacts, not live execution inputs.
+
+### 9.4.1 Deliberately unimplemented
 
 This pass does not invent exchange rates, use cross-venue prices, or triangulate
 through an unrelated asset. It does not add Prisma models, restore disabled
@@ -456,7 +487,7 @@ work is tracked below rather than hidden by this pass.
 | --- | --- |
 | P0 | **Closed in Pass 4A:** same-venue direct/inverse conversion for non-quote fees and funding; stale or unavailable prices remain unknown |
 | P0 | **Closed in Pass 4A:** funding source fallback through declared `fetchLedger` funding entries; venues declaring neither source refuse explicitly |
-| P1 | Phase 2J/2K cache uniqueness, TTL, invalidation, stampede and restart/corruption work |
+| P1 | **Cache half closed in Pass 4B:** venue-scoped keys, explicit age bounds, invalidation, concurrency limits, single-flight, failure backoff and memory-only restart semantics. Replay/paper/live parity fixtures remain open |
 | P1 | Replay/paper/live parity fixtures and full failure-injection coverage |
 | P1 | Per-route tests for the classified disabled groups and operator authentication for `/api/execution` |
 | P1 | Concurrent flatten, operator stop mid-execution and stale-cache failure-injection cases |

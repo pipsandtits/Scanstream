@@ -207,6 +207,12 @@ export class RealizedPnlLedger {
     if (!source || source.category === 'conversion' || source.category === 'resolution') {
       throw new Error('realized PnL conversion source not found');
     }
+    if (conversion.kind === 'funding' && source.category !== 'funding') {
+      throw new Error('funding conversion requires a funding entry');
+    }
+    if (conversion.kind === 'fee' && source.category !== 'trade') {
+      throw new Error('fee conversion requires a trade entry');
+    }
     if (!Number.isInteger(conversion.feeIndex) || conversion.feeIndex < 0 ||
         conversion.feeIndex >= source.unconvertedFees.length) {
       throw new Error('realized PnL conversion fee index is invalid');
@@ -214,7 +220,9 @@ export class RealizedPnlLedger {
     const expectedAmount = conversion.kind === 'funding'
       ? source.fundingAmount
       : source.unconvertedFees[conversion.feeIndex]?.cost;
-    const expectedCurrency = source.unconvertedFees[conversion.feeIndex]?.currency;
+    const expectedCurrency = conversion.kind === 'funding'
+      ? source.fundingCurrency
+      : source.unconvertedFees[conversion.feeIndex]?.currency;
     if (!finite(expectedAmount) ||
         conversion.sourceAmount !== expectedAmount ||
         conversion.sourceCurrency.toUpperCase() !== expectedCurrency?.toUpperCase()) {
@@ -326,16 +334,22 @@ export class RealizedPnlLedger {
           .map((conversion) => [conversion.conversion?.feeIndex, conversion])
       );
       const fundingConversions = conversionEntries.filter((conversion) => conversion.conversion?.kind === 'funding');
-      const allFeesConverted = entry.unconvertedFees.every((_fee, index) => feeConversions.has(index));
+      const convertedIndexes = new Set(
+        conversionEntries
+          .map((conversion) => conversion.conversion?.feeIndex)
+          .filter((index): index is number => Number.isInteger(index))
+      );
+      const allFeesConverted = entry.unconvertedFees.every((_fee, index) => convertedIndexes.has(index));
       const convertedFeeQuoteAmount = [...feeConversions.values()]
         .reduce((sum, conversion) => sum + (conversion.conversion?.quoteAmount ?? 0), 0);
       const convertedFundingQuoteAmount = fundingConversions
         .reduce((sum, conversion) => sum + (conversion.conversion?.quoteAmount ?? 0), 0);
       let effectivePnl = resolution?.kind === 'attested_value' ? resolution.pnl : entry.pnl;
-      if (!resolution && entry.unconvertedFees.length > 0 && allFeesConverted && effectivePnl !== null) {
-        effectivePnl -= convertedFeeQuoteAmount;
-      } else if (!resolution && entry.unconvertedFees.length > 0 && entry.category === 'funding' && fundingConversions.length > 0) {
+      if (!resolution && entry.unconvertedFees.length > 0 && entry.category === 'funding' &&
+          fundingConversions.length > 0 && allFeesConverted) {
         effectivePnl = convertedFundingQuoteAmount;
+      } else if (!resolution && entry.unconvertedFees.length > 0 && allFeesConverted && effectivePnl !== null) {
+        effectivePnl -= convertedFeeQuoteAmount;
       } else if (!resolution && entry.unconvertedFees.length > 0) {
         effectivePnl = null;
       }
@@ -350,7 +364,7 @@ export class RealizedPnlLedger {
         else fundingPnl += effectivePnl;
       }
       for (const [index, fee] of entry.unconvertedFees.entries()) {
-        if (feeConversions.has(index)) continue;
+        if (convertedIndexes.has(index)) continue;
         const existing = unconvertedFees.find((candidate) => candidate.currency === fee.currency);
         if (existing) existing.cost += fee.cost;
         else unconvertedFees.push({ ...fee });

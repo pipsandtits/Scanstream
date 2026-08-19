@@ -243,7 +243,45 @@ describe('realized PnL ledger', () => {
       tickerTimestamp: now,
       convertedAt: new Date(now).toISOString(),
     });
-    expect(ledger.summary()).toMatchObject({ pnl: -300, fundingPnl: -300, unknown: false });
+    expect(ledger.summary()).toMatchObject({
+      pnl: -300,
+      fundingPnl: -300,
+      unknown: false,
+      unconvertedFees: [],
+    });
+  });
+
+  it('rejects fee conversions for funding entries', () => {
+    const now = 1_700_000_000_000;
+    const ledger = new RealizedPnlLedger({ filePath: ledgerPath(), clock: () => now });
+    ledger.load();
+    ledger.append({
+      id: 'funding-entry',
+      category: 'funding',
+      at: new Date(now).toISOString(),
+      symbol: 'BTC/USDT:USDT',
+      quoteCurrency: 'USDT',
+      pnl: null,
+      grossPnl: null,
+      quoteFees: 0,
+      unconvertedFees: [{ currency: 'BTC', cost: 0.01 }],
+      fundingAmount: -0.01,
+      fundingCurrency: 'BTC',
+      fundingSource: 'ledger',
+    });
+    expect(() => ledger.appendConversion('funding-entry', {
+      kind: 'fee',
+      feeIndex: 0,
+      sourceCurrency: 'BTC',
+      quoteCurrency: 'USDT',
+      sourceAmount: 0.01,
+      quoteAmount: 300,
+      rate: 30_000,
+      market: 'BTC/USDT',
+      direction: 'direct',
+      tickerTimestamp: now,
+      convertedAt: new Date(now).toISOString(),
+    })).toThrow(/trade entry/);
   });
 
   it('requires an explicit durable resolution for an unknown entry', () => {
