@@ -6,8 +6,8 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import ScannerSignalService from '../services/scanner/scanner-signal-service';
-import type { ComputeScannerSignalRequest, ScannerSignal } from '../services/scanner/scanner-signal';
+import ScannerSignalService from '../../../services/scanner/scanner-signal-service';
+import type { ComputeScannerSignalRequest, ScannerSignal } from '../../../services/scanner/scanner-signal';
 
 describe('ScannerSignalService', () => {
   beforeEach(() => {

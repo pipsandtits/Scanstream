@@ -2,6 +2,9 @@
 import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { liveTradingEngine } from '../live-trading-engine';
+import { requireTradingOperator } from '../middleware/require-trading-operator';
+import { systemKillSwitch } from '../services/system-kill-switch';
+import { liveCircuitBreaker } from '../services/live-circuit-breaker';
 
 const router = Router();
 
@@ -22,7 +25,7 @@ router.get('/status', (_req: Request, res: Response) => {
  * POST /api/live-trading/start
  * Start live trading engine (TESTNET ONLY by default)
  */
-router.post('/start', async (_req: Request, res: Response) => {
+router.post('/start', requireTradingOperator, async (_req: Request, res: Response) => {
   try {
     await liveTradingEngine.start();
     res.json({ 
@@ -39,7 +42,7 @@ router.post('/start', async (_req: Request, res: Response) => {
  * POST /api/live-trading/stop
  * Stop live trading engine
  */
-router.post('/stop', (_req: Request, res: Response) => {
+router.post('/stop', requireTradingOperator, (_req: Request, res: Response) => {
   try {
     liveTradingEngine.stop();
     res.json({ success: true, message: 'Live trading engine stopped' });
@@ -52,16 +55,31 @@ router.post('/stop', (_req: Request, res: Response) => {
  * POST /api/live-trading/config
  * Update configuration (DANGEROUS - requires validation)
  */
-router.post('/config', (req: Request, res: Response) => {
+router.post('/config', requireTradingOperator, (req: Request, res: Response) => {
   try {
     const updates = req.body;
-    
+
     // Safety check: prevent disabling testMode without explicit confirmation
     if (updates.testMode === false && !req.body.confirmLiveTrading) {
       return res.status(400).json({
         success: false,
         error: 'Live trading requires explicit confirmation. Set confirmLiveTrading: true'
       });
+    }
+
+    // Config must never be able to widen a hard limit past the configured
+    // ceiling, and numeric fields must be sane.
+    const numericFields = ['maxPositionSize', 'maxTotalExposure', 'defaultLeverage', 'slippageTolerance', 'minConfidence'] as const;
+    for (const field of numericFields) {
+      if (updates[field] === undefined) continue;
+      const value = Number(updates[field]);
+      if (!Number.isFinite(value) || value <= 0) {
+        return res.status(400).json({ success: false, error: `Invalid ${field}: must be a positive number` });
+      }
+      updates[field] = value;
+    }
+    if (updates.minConfidence !== undefined && updates.minConfidence > 1) {
+      return res.status(400).json({ success: false, error: 'Invalid minConfidence: must be <= 1' });
     }
 
     liveTradingEngine.updateConfig(updates);
@@ -88,7 +106,7 @@ router.get('/positions', (_req: Request, res: Response) => {
  * POST /api/live-trading/close/:positionId
  * Close a specific position
  */
-router.post('/close/:positionId', async (req: Request, res: Response) => {
+router.post('/close/:positionId', requireTradingOperator, async (req: Request, res: Response) => {
   try {
     const { positionId } = req.params;
     const success = await liveTradingEngine.closePosition(positionId);
@@ -107,16 +125,35 @@ router.post('/close/:positionId', async (req: Request, res: Response) => {
  * POST /api/live-trading/execute
  * Execute a signal (CAUTION: Real money in live mode)
  */
-router.post('/execute', async (req: Request, res: Response) => {
+router.post('/execute', requireTradingOperator, async (req: Request, res: Response) => {
   try {
     const signal = req.body;
-    
-    if (!signal || !signal.symbol || !signal.type || !signal.price) {
-      return res.status(400).json({
-        success: false,
-        error: 'Invalid signal format'
-      });
+
+    if (!signal || typeof signal !== 'object') {
+      return res.status(400).json({ success: false, error: 'Invalid signal format' });
     }
+
+    const symbol = typeof signal.symbol === 'string' ? signal.symbol.trim() : '';
+    const type = typeof signal.type === 'string' ? signal.type.toUpperCase() : '';
+    const price = Number(signal.price);
+    const confidence = signal.confidence === undefined ? undefined : Number(signal.confidence);
+
+    if (!symbol || !/^[A-Z0-9]+([\/:\-][A-Z0-9]+)*$/i.test(symbol)) {
+      return res.status(400).json({ success: false, error: 'Invalid symbol' });
+    }
+    if (type !== 'BUY' && type !== 'SELL') {
+      return res.status(400).json({ success: false, error: 'Invalid type: expected BUY or SELL' });
+    }
+    if (!Number.isFinite(price) || price <= 0) {
+      return res.status(400).json({ success: false, error: 'Invalid price: must be a positive finite number' });
+    }
+    if (confidence !== undefined && (!Number.isFinite(confidence) || confidence < 0 || confidence > 1)) {
+      return res.status(400).json({ success: false, error: 'Invalid confidence: must be within [0, 1]' });
+    }
+
+    signal.symbol = symbol;
+    signal.type = type;
+    signal.price = price;
 
     const order = await liveTradingEngine.executeSignal(signal);
     
@@ -131,6 +168,34 @@ router.post('/execute', async (req: Request, res: Response) => {
   } catch (error: any) {
     res.status(500).json({ success: false, error: error.message });
   }
+});
+
+/**
+ * POST /api/live-trading/flatten-all
+ * Emergency flatten: close every open position and halt new placements.
+ */
+router.post('/flatten-all', requireTradingOperator, async (req: Request, res: Response) => {
+  try {
+    const reason = typeof req.body?.reason === 'string' ? req.body.reason.slice(0, 120) : 'manual';
+    const result = await liveTradingEngine.flattenAll(reason);
+    // Partial success is still a failure from an operator's point of view.
+    res.status(result.failed.length > 0 ? 207 : 200).json({ success: result.failed.length === 0, ...result });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * GET /api/live-trading/safety
+ * Current state of the global safety controls.
+ */
+router.get('/safety', (_req: Request, res: Response) => {
+  res.json({
+    success: true,
+    killSwitch: systemKillSwitch.getState(),
+    circuitBreaker: liveCircuitBreaker.getState(),
+    engine: liveTradingEngine.getStatus().config,
+  });
 });
 
 export default router;

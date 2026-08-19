@@ -12,6 +12,8 @@
 import * as ccxt from 'ccxt';
 import { EventEmitter } from 'events';
 import type { MarketDataAdapter, Candle, Ticker, AdapterHealth } from '../../types/market-data';
+import { normalizeOhlcvRow, isRejected, secondsToCcxtTimeframe } from './candle-normalizer';
+import { recordCandlesRejected } from '../observability/safety-metrics';
 
 /**
  * Single exchange adapter for CCXT
@@ -85,21 +87,44 @@ export class CCXTMarketDataAdapter extends EventEmitter implements MarketDataAda
         limit || 100
       );
 
-      // Normalize to our Candle format
-      const candles: Candle[] = rawCandles.map((row) => ({
-        ts: Math.floor((row[0] as any) || 0),
-        open: Math.floor((row[1] as any) || 0),
-        high: Math.floor((row[2] as any) || 0),
-        low: Math.floor((row[3] as any) || 0),
-        close: Math.floor((row[4] as any) || 0),
-        volume: row[5] || 0,
-        isFinal: this.isCandleFinal(Math.floor((row[0] as any) || 0), timeframe),
-        // fetchOHLCV is a REST/backfill call — mark as historical and record adapter origin
-        source: 'historical',
-        origin: 'ccxt',
-        venue: this.venue,
-        raw: row,
-      }));
+      // Normalize to our Candle format with full decimal precision; malformed
+      // rows are rejected rather than coerced into fake prices.
+      const candles: Candle[] = [];
+      const rejected: Array<{ reason: string; row: unknown }> = [];
+
+      for (const row of (rawCandles as unknown[]) || []) {
+        const result = normalizeOhlcvRow(row);
+        if (isRejected(result)) {
+          rejected.push(result);
+          continue;
+        }
+        candles.push({
+          ...result,
+          isFinal: this.isCandleFinal(result.ts, timeframe),
+          // fetchOHLCV is a REST/backfill call — mark as historical and record adapter origin
+          source: 'historical',
+          origin: 'ccxt',
+          venue: this.venue,
+          raw: row,
+        } as Candle);
+      }
+
+      if (rejected.length > 0) {
+        console.warn(
+          `[${this.venue}] Rejected ${rejected.length}/${rawCandles.length} malformed candles for ${symbol}:`,
+          rejected.slice(0, 3).map((r) => r.reason)
+        );
+        recordCandlesRejected(rejected.map((r) => r.reason));
+        try {
+          this.emit('candles.rejected', {
+            venue: this.venue,
+            symbol,
+            timeframe,
+            count: rejected.length,
+            reasons: rejected.map((r) => r.reason),
+          });
+        } catch (em) {}
+      }
 
       // Track success
       const elapsed = Date.now() - started;
@@ -186,19 +211,7 @@ export class CCXTMarketDataAdapter extends EventEmitter implements MarketDataAda
    * Convert seconds to CCXT timeframe string
    */
   private secondsToTimeframe(seconds: number): string {
-    const minutes = seconds / 60;
-    
-    if (minutes < 60) {
-      return `${Math.round(minutes)}m`;
-    }
-    
-    const hours = minutes / 60;
-    if (hours < 24) {
-      return `${Math.round(hours)}h`;
-    }
-    
-    const days = hours / 24;
-    return `${Math.round(days)}d`;
+    return secondsToCcxtTimeframe(seconds);
   }
 
   /**

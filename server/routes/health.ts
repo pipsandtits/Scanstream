@@ -8,6 +8,10 @@ import express, { type Request, type Response } from 'express';
 import { getErrorLogger } from '../services/error-logger';
 import { getPerformanceTracker } from '../services/model-performance-tracker';
 import { getBacktester } from '../services/signal-backtester';
+import { systemKillSwitch } from '../services/system-kill-switch';
+import { liveCircuitBreaker } from '../services/live-circuit-breaker';
+import { getSafetyMetrics } from '../services/observability/safety-metrics';
+import { db } from '../db-storage';
 
 const router = express.Router();
 const errorLogger = getErrorLogger();
@@ -240,6 +244,54 @@ router.post('/prune-logs', (req: Request, res: Response) => {
       timestamp: new Date().toISOString()
     });
   }
+});
+
+/**
+ * GET /api/health/readiness
+ *
+ * Deployment/probe-facing readiness. Unlike the informational endpoints above,
+ * this returns 503 when a subsystem that live trading depends on is unhealthy,
+ * so an orchestrator or operator dashboard sees real failures.
+ */
+router.get('/readiness', (_req: Request, res: Response) => {
+  const databaseConnected = (() => {
+    try {
+      return db.isDatabaseConnected();
+    } catch {
+      return false;
+    }
+  })();
+
+  const killSwitch = systemKillSwitch.getState();
+  const circuitBreaker = liveCircuitBreaker.getState();
+  const safety = getSafetyMetrics();
+
+  const checks = {
+    database: { ok: databaseConnected, detail: databaseConnected ? 'connected' : 'in-memory fallback active (writes are not durable)' },
+    killSwitch: { ok: !killSwitch.killed, detail: killSwitch.reason || null },
+    circuitBreaker: { ok: !circuitBreaker.active, detail: circuitBreaker.reason || null },
+    integrityGate: {
+      ok: safety.integrityBypassBlocked === 0,
+      detail: safety.integrityBypassBlocked > 0
+        ? `${safety.integrityBypassBlocked} frame batches dropped by integrity gate failures`
+        : null,
+    },
+  };
+
+  // The kill switch and circuit breaker are *intended* states, not process
+  // faults: they degrade rather than fail the probe. Losing durable storage or
+  // dropping data at the integrity gate is a genuine fault.
+  const ready = checks.database.ok && checks.integrityGate.ok;
+  const degraded = !checks.killSwitch.ok || !checks.circuitBreaker.ok;
+
+  res.status(ready ? 200 : 503).json({
+    status: !ready ? 'DOWN' : degraded ? 'DEGRADED' : 'UP',
+    ready,
+    checks,
+    safety,
+    uptime: process.uptime(),
+    timestamp: new Date().toISOString(),
+  });
 });
 
 export default router;

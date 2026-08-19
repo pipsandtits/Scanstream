@@ -48,6 +48,22 @@ export class OrderFlowAnalyzer {
     signalDirection: 'BUY' | 'SELL',
     volumeProfile: 'HEAVY' | 'NORMAL' | 'LIGHT' = 'NORMAL'
   ): OrderFlowAnalysis {
+    // Exchange order-flow payloads are frequently partial. Coerce to finite
+    // numbers so a missing field degrades the score instead of throwing on the
+    // signal path.
+    const num = (v: unknown, fallback = 0): number =>
+      typeof v === 'number' && Number.isFinite(v) ? v : fallback;
+    orderFlow = {
+      ...orderFlow,
+      bidVolume: num(orderFlow?.bidVolume),
+      askVolume: num(orderFlow?.askVolume),
+      netFlow: num(orderFlow?.netFlow),
+      spread: num(orderFlow?.spread),
+      spreadPercent: num(orderFlow?.spreadPercent),
+      volume: num(orderFlow?.volume),
+      volumeRatio: num(orderFlow?.volumeRatio, 1),
+    };
+
     const reasoning: string[] = [];
     const components = {
       bidAskRatio: 0,

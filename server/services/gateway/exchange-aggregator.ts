@@ -3,6 +3,7 @@ import { ExchangeDataFeed } from '../../trading-engine';
 import { CacheManager } from './cache-manager';
 import { RateLimiter } from './rate-limiter';
 import type { PriceData, OHLCVData, ExchangeHealth } from '../../types/gateway';
+import { recordIntegrityBypassBlocked } from '../observability/safety-metrics';
 
 /**
  * Exchange Aggregator
@@ -329,10 +330,21 @@ export class ExchangeAggregator {
             return result.stored.some((c: any) => c.ts === fTimestamp);
           });
 
-          return validatedFrames.length > 0 ? validatedFrames : frames;
+          // Only validated frames leave this boundary. Returning the raw frames
+          // when nothing validated would push rejected data downstream.
+          if (validatedFrames.length === 0 && frames.length > 0) {
+            console.warn(
+              `[Aggregator] All ${frames.length} frames for ${symbol}/${timeframe} failed integrity validation — dropped`
+            );
+          }
+          return validatedFrames;
         } catch (integrityError) {
-          console.warn('[Aggregator] Integrity gate check failed, returning frames as-is:', integrityError);
-          return frames;
+          console.error(
+            `[Aggregator] Integrity gate failed for ${symbol}/${timeframe} — frames dropped (no bypass):`,
+            integrityError
+          );
+          recordIntegrityBypassBlocked(symbol, String(timeframe), frames.length);
+          return [];
         }
       } catch (error: any) {
         this.rateLimiter.recordFailure(exchange);

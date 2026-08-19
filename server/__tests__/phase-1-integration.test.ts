@@ -17,10 +17,10 @@
  * Run with: npm test -- --testPathPattern=phase-1-integration
  */
 
-import { describe, it, expect, beforeAll, afterAll } from '@jest/globals';
-import { SignalPipeline, type AggregatedSignal, type RawMarketData, type ScannerOutput, type MLPrediction, type RLDecision } from '../../lib/signal-pipeline';
-import { SignalQualityEngine } from '../../lib/signal-quality';
-import type { SignalMetrics } from '../../lib/signal-quality';
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { SignalPipeline, type AggregatedSignal, type RawMarketData, type ScannerOutput, type MLPrediction, type RLDecision } from '../lib/signal-pipeline';
+import { SignalQualityEngine } from '../lib/signal-quality';
+import type { SignalMetrics } from '../lib/signal-quality';
 
 // ============================================================================
 // TEST SETUP - Mock Data Generators

@@ -15,7 +15,10 @@ export class RLGuard {
     const cfg: any = (RLConfig as any)?.rlGuard ?? {};
     this.windowSize = opts?.windowSize ?? cfg.windowSize ?? 50;
     this.varianceThreshold = opts?.varianceThreshold ?? (cfg.varianceThreshold ?? (Number(process.env.RL_GUARD_VARIANCE_THRESHOLD) || 8));
-    this.minExperience = opts?.minExperience ?? (cfg.minExperience ?? (RLConfig.minExperienceForRL ?? 50));
+    // RLConfig can be undefined here under circular import resolution, so it is
+    // read defensively rather than crashing module initialization.
+    this.minExperience =
+      opts?.minExperience ?? cfg.minExperience ?? (RLConfig as any)?.minExperienceForRL ?? 50;
   }
 
   recordReward(r: number, state?: any): void {
