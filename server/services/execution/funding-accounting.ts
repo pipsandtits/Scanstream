@@ -13,6 +13,7 @@ export interface FundingPayment {
   amount: number;
   currency: string;
   timestamp: number;
+  source: 'funding_history' | 'ledger';
 }
 
 interface FundingBaselineAttestation {
@@ -142,9 +143,8 @@ export class FundingAccounting {
   async reconcile(exchange: any, symbol: string): Promise<FundingAccountingResult> {
     if (isSpotMarket(exchange, symbol)) return { status: 'not_required', payments: [] };
     if (!isSwapMarket(exchange, symbol)) return { status: 'unknown', reason: 'market_type_unknown', payments: [] };
-    if (typeof exchange?.fetchFundingHistory !== 'function') {
-      return { status: 'unknown', reason: 'funding_history_unsupported', payments: [] };
-    }
+    const source = this.selectSource(exchange);
+    if (!source) return { status: 'unknown', reason: 'funding_source_unsupported', payments: [] };
 
     const now = this.clock();
     const lastKnownAt = this.state.lastKnownAt[symbol];
@@ -165,7 +165,9 @@ export class FundingAccounting {
     for (let page = 0; page < 1000; page += 1) {
       let response: unknown;
       try {
-        response = await exchange.fetchFundingHistory(symbol, pageSince, FUNDING_PAGE_LIMIT);
+        response = source === 'funding_history'
+          ? await exchange.fetchFundingHistory(symbol, pageSince, FUNDING_PAGE_LIMIT)
+          : await exchange.fetchLedger(symbol, pageSince, FUNDING_PAGE_LIMIT);
       } catch (error: any) {
         return {
           status: 'unknown',
@@ -174,7 +176,9 @@ export class FundingAccounting {
         };
       }
       if (!Array.isArray(response)) return { status: 'unknown', reason: 'funding_history_unusable', payments: [] };
-      rows.push(...response);
+      rows.push(...(source === 'ledger'
+        ? response.filter((row: any) => this.isFundingLedgerRow(row))
+        : response));
       if (firstPage) {
         firstPageShort = response.length < FUNDING_PAGE_LIMIT;
         firstPage = false;
@@ -214,6 +218,10 @@ export class FundingAccounting {
       if (typeof id !== 'string' && typeof id !== 'number') {
         return { status: 'unknown', reason: 'funding_payment_id_unknown', payments: additions };
       }
+      const rowSymbol = source === 'ledger' ? (row?.symbol ?? row?.info?.symbol) : symbol;
+      if (source === 'ledger' && rowSymbol !== symbol) {
+        return { status: 'unknown', reason: 'funding_payment_symbol_unknown', payments: additions };
+      }
       if (!finite(Number(amount)) || typeof currency !== 'string' || !currency || !finite(Number(timestamp))) {
         return { status: 'unknown', reason: 'funding_payment_fields_unknown', payments: additions };
       }
@@ -223,8 +231,12 @@ export class FundingAccounting {
         amount: Number(amount),
         currency: currency.toUpperCase(),
         timestamp: Number(timestamp),
+        source,
       };
-      if (!this.state.payments.some((existing) => existing.id === payment.id)) additions.push(payment);
+      if (!this.state.payments.some((existing) => existing.id === payment.id) &&
+          !additions.some((existing) => existing.id === payment.id)) {
+        additions.push(payment);
+      }
     }
 
     const nextLastCheckedAt = { ...this.state.lastCheckedAt };
@@ -354,9 +366,26 @@ export class FundingAccounting {
         typeof payment.symbol === 'string' &&
         finite(payment.amount) &&
         typeof payment.currency === 'string' &&
+        (payment.source === 'funding_history' || payment.source === 'ledger') &&
         finite(payment.timestamp)
       )
     );
+  }
+
+  private selectSource(exchange: any): 'funding_history' | 'ledger' | null {
+    const has = exchange?.has ?? {};
+    if (has.fetchFundingHistory === true || has.fetchFundingHistory === 'emulated') {
+      return 'funding_history';
+    }
+    if (has.fetchLedger === true || has.fetchLedger === 'emulated') {
+      return 'ledger';
+    }
+    return null;
+  }
+
+  private isFundingLedgerRow(row: any): boolean {
+    const type = String(row?.type ?? row?.info?.type ?? '').toLowerCase();
+    return type.includes('funding');
   }
 
   private normalizeState(value: unknown): unknown {
@@ -364,6 +393,13 @@ export class FundingAccounting {
     const state = value as Record<string, unknown>;
     return {
       ...state,
+      payments: Array.isArray(state.payments)
+        ? state.payments.map((payment) => (
+          payment && typeof payment === 'object' && (payment as Record<string, unknown>).source === undefined
+            ? { ...(payment as Record<string, unknown>), source: 'funding_history' }
+            : payment
+        ))
+        : state.payments,
       initialLookbackSince:
         state.initialLookbackSince === undefined
           ? { ...((state.lastCheckedAt as Record<string, number> | undefined) ?? {}) }

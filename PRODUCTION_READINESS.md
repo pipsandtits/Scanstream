@@ -180,10 +180,12 @@ that no longer exist and are not wired into the runner.
 6. Ensure `data/` is on durable, writable storage. Live execution state,
    `realized-pnl-ledger.json`, `funding-accounting.json`, the kill switch,
    circuit breaker and safety events persist there and fail closed if unreadable.
-7. For perpetual/swap markets, configure a working CCXT
-   `fetchFundingHistory` implementation. The only deliberate escape hatch is
-   `ALLOW_UNACCOUNTED_FUNDING=1`; setting it accepts unknown funding risk and
-   must be an explicitly documented operator decision.
+7. For perpetual/swap markets, configure a venue that declares either
+   `fetchFundingHistory` or `fetchLedger` (with funding-type rows). The only
+   deliberate escape hatch is `ALLOW_UNACCOUNTED_FUNDING=1`; setting it accepts
+   unknown funding risk and must be an explicitly documented operator decision.
+   Configure `PNL_CONVERSION_MAX_AGE_MS` when the venue requires a tighter
+   freshness bound than the conservative one-minute default.
 8. Start in `testMode`/paper, verify signals and `executionBlocked` events, then
    hand over to live with a small `RISK_MAX_TOTAL_EXPOSURE_USD`.
 
@@ -394,7 +396,14 @@ quantity; only a confirmed full fill removes the position.
 
 `realized-pnl-ledger.ts` computes long and short close PnL from entry cost basis
 and actual exit fills. Quote fees are subtracted. Non-quote fees remain
-unconverted and are reported separately, and unknown arithmetic remains null.
+unconverted until the same-venue conversion path proves a fresh direct or
+inverse market price. Conversion accepts only a positive finite ticker price
+with an explicit timestamp inside `PNL_CONVERSION_MAX_AGE_MS` (one minute by
+default), and never uses a stale, timestamp-less, cross-venue, or estimated
+rate. Each successful fee or funding conversion is an immutable append-only
+ledger record containing the source amount, quote amount, rate, market,
+direction, ticker timestamp and original entry reference; failed conversion
+keeps the original entry unknown.
 The ledger is append-only by event ID, atomically persisted under
 `data/realized-pnl-ledger.json`, loaded before live exchange access, and treated
 as unknown if corrupt or unreadable. Daily loss uses ledger PnL and the more
@@ -409,12 +418,15 @@ windows use UTC calendar dates.
 ### 9.3 Phase B — funding
 
 `funding-accounting.ts` queries CCXT `fetchFundingHistory` for swap/perpetual
-markets, persists payment IDs idempotently under
+markets and falls back to funding-type entries from `fetchLedger` when the
+venue declares that capability. It persists payment IDs idempotently under
 `data/funding-accounting.json`, and feeds quote-currency payments into the
-realized ledger as a separate funding category. Unsupported methods, failed
-queries, unusable responses and unknown market type are unknown, not zero, and
-block live execution for contract markets. Spot markets do not require funding
-accounting. `ALLOW_UNACCOUNTED_FUNDING=1` is the sole deliberate escape hatch;
+realized ledger as a separate funding category with its source recorded.
+Unsupported sources, failed queries and unusable responses are unknown, not
+zero; a venue declaring neither source produces the explicit
+`funding_source_unsupported` refusal for contract markets. Spot markets do not
+require funding accounting. `ALLOW_UNACCOUNTED_FUNDING=1` is the sole
+deliberate escape hatch;
 it is recorded as an operator-visible safety event and must not be treated as a
 normal operating mode. The first reconciliation uses an explicit bounded
 initial lookback. Coverage becomes known without attestation only when the
@@ -433,18 +445,17 @@ recheck interval; unknown answers are never cached.
 
 ### 9.4 Deliberately unimplemented
 
-This pass does not invent exchange rates for non-quote fees or non-quote funding,
-simulate funding, or claim venue support where a funding-history endpoint is
-absent. It does not add Prisma models, restore disabled route groups, or add
-operator authentication to `/api/execution`. The remaining work is tracked
-below rather than hidden by this pass.
+This pass does not invent exchange rates, use cross-venue prices, or triangulate
+through an unrelated asset. It does not add Prisma models, restore disabled
+route groups, or add operator authentication to `/api/execution`. The remaining
+work is tracked below rather than hidden by this pass.
 
 ### 9.5 Pass 4
 
 | Priority | Item |
 | --- | --- |
-| P0 | Non-quote fee and funding conversion requires explicit, venue-backed pricing; no invented conversion is permitted |
-| P0 | Funding support on venues without a reliable funding-history endpoint |
+| P0 | **Closed in Pass 4A:** same-venue direct/inverse conversion for non-quote fees and funding; stale or unavailable prices remain unknown |
+| P0 | **Closed in Pass 4A:** funding source fallback through declared `fetchLedger` funding entries; venues declaring neither source refuse explicitly |
 | P1 | Phase 2J/2K cache uniqueness, TTL, invalidation, stampede and restart/corruption work |
 | P1 | Replay/paper/live parity fixtures and full failure-injection coverage |
 | P1 | Per-route tests for the classified disabled groups and operator authentication for `/api/execution` |

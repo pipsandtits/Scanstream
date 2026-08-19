@@ -16,6 +16,7 @@ describe('funding accounting', () => {
     accounting.load();
     const exchange = {
       markets: { 'BTC/USDT:USDT': { type: 'swap' } },
+      has: { fetchFundingHistory: true },
       fetchFundingHistory: async () => [{
         id: 'payment-1',
         amount: -2,
@@ -45,6 +46,7 @@ describe('funding accounting', () => {
     }));
     const exchange = {
       markets: { BTC: { type: 'swap' } },
+      has: { fetchFundingHistory: true },
       fetchFundingHistory: async (_symbol: string, since: number, limit: number) => {
         calls.push(since);
         return calls.length === 1 ? full : [{ id: 'p-last', amount: 1, currency: 'USDT', timestamp: since + 1 }];
@@ -69,6 +71,7 @@ describe('funding accounting', () => {
     accounting.load();
     const exchange = {
       markets: { BTC: { type: 'swap' } },
+      has: { fetchFundingHistory: true },
       fetchFundingHistory: async () => {
         queries += 1;
         throw new Error('history unavailable');
@@ -98,6 +101,7 @@ describe('funding accounting', () => {
     let queries = 0;
     const exchange = {
       markets: { BTC: { type: 'swap' } },
+      has: { fetchFundingHistory: true },
       fetchFundingHistory: async () => {
         queries += 1;
         return [];
@@ -119,6 +123,7 @@ describe('funding accounting', () => {
     accounting.load();
     expect(await accounting.reconcile({
       markets: { BTC: { type: 'swap' } },
+      has: { fetchFundingHistory: true },
       fetchFundingHistory: async () => [{
         id: 'p1',
         amount: 1,
@@ -146,6 +151,7 @@ describe('funding accounting', () => {
     const calls: Record<string, number> = {};
     const exchange = {
       markets: { BTC: { type: 'swap' }, ETH: { type: 'swap' } },
+      has: { fetchFundingHistory: true },
       fetchFundingHistory: async (symbol: string) => {
         calls[symbol] = (calls[symbol] ?? 0) + 1;
         if (calls[symbol] <= 2) return calls[symbol] === 1 ? full : [];
@@ -178,15 +184,60 @@ describe('funding accounting', () => {
     unsupported.load();
     expect(await unsupported.reconcile({ markets: { BTC: { type: 'swap' } } }, 'BTC')).toMatchObject({
       status: 'unknown',
-      reason: 'funding_history_unsupported',
+      reason: 'funding_source_unsupported',
     });
 
     const failed = new FundingAccounting({ filePath: statePath() });
     failed.load();
     expect(await failed.reconcile({
       markets: { BTC: { type: 'swap' } },
+      has: { fetchFundingHistory: true },
       fetchFundingHistory: async () => { throw new Error('exchange unavailable'); },
     }, 'BTC')).toMatchObject({ status: 'unknown' });
+  });
+
+  it('uses declared ledger funding capability, pages it, and deduplicates payment IDs', async () => {
+    const calls: number[] = [];
+    const accounting = new FundingAccounting({
+      filePath: statePath(),
+      clock: () => 1_800_000_000_000,
+      initialLookbackMs: 1_000,
+    });
+    accounting.load();
+    const full = Array.from({ length: 200 }, (_, index) => ({
+      id: `ledger-${index}`,
+      type: 'funding',
+      symbol: 'BTC',
+      amount: -1,
+      currency: 'USDT',
+      timestamp: 1_800_000_000_000 - index,
+    }));
+    const exchange = {
+      markets: { BTC: { type: 'swap' } },
+      has: { fetchFundingHistory: false, fetchLedger: true },
+      fetchLedger: async (_symbol: string, since: number) => {
+        calls.push(since);
+        return calls.length === 1
+          ? full
+          : [
+            { id: 'ledger-0', type: 'funding', symbol: 'BTC', amount: -1, currency: 'USDT', timestamp: since },
+            { id: 'trade-1', type: 'trade', symbol: 'BTC', amount: 5, currency: 'USDT', timestamp: since },
+          ];
+      },
+    };
+    expect((await accounting.reconcile(exchange, 'BTC')).status).toBe('unknown');
+    expect(calls).toHaveLength(2);
+    expect(accounting.payments()).toHaveLength(200);
+    expect(accounting.payments()[0].source).toBe('ledger');
+  });
+
+  it('does not let unsupported-source venues be cleared by baseline attestation', async () => {
+    const accounting = new FundingAccounting({ filePath: statePath() });
+    accounting.load();
+    expect(await accounting.reconcile({ markets: { BTC: { type: 'swap' } }, has: {} }, 'BTC'))
+      .toMatchObject({ status: 'unknown', reason: 'funding_source_unsupported' });
+    expect(() => accounting.attestInitialCoverage('BTC', 'operator reviewed venue'))
+      .toThrow(/not awaiting attestation/);
   });
 
   it('does not require funding accounting for spot markets', async () => {
