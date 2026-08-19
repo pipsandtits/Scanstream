@@ -966,11 +966,14 @@ The follow-up review fixes preserve the same fail-closed boundaries:
 - Ledger funding fallback now resolves the requested market, queries CCXT by
   its settle currency (or quote only when settle is absent), and resolves
   row identifiers through the venue's own market lookup/index. Rows for
-  another market sharing the currency are skipped; funding rows without
-  resolvable attribution remain `unknown` and block execution. The earlier
-  Pass 4A ledger claim was therefore corrected: the fallback had been
-  non-functional when it queried by market symbol and required a direct
-  symbol field, and it works only on venues with resolvable attribution.
+  another market sharing the currency are skipped only when exactly one
+  contract market is resolved; rows with no contract attribution return
+  `funding_ledger_unattributable`, and rows resolving to multiple contract
+  markets return `funding_ledger_attribution_ambiguous`. Both remain
+  `unknown` and block execution. The earlier Pass 4A ledger claim was
+  therefore corrected: the fallback had been non-functional when it queried
+  by market symbol and required a direct symbol field, and it works only on
+  venues with resolvable, unambiguous contract attribution.
 - The model-performance mutations (`validate`, `ensemble-predict`, and
   `prune`) and simulated agent ability use are authenticated with
   `requireAuth`. Numeric fields are finite, ensemble input is capped, prune

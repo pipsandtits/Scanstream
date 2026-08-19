@@ -114,30 +114,39 @@ function resolveMarketRecord(exchange: unknown, candidate: string): Record<strin
   return null;
 }
 
-function resolveMarket(exchange: unknown, candidate: string): string | null {
-  const market = resolveMarketRecord(exchange, candidate);
-  return typeof market?.symbol === 'string' && market.symbol ? market.symbol : null;
+function isContractMarket(market: Record<string, unknown>): boolean {
+  const type = typeof market.type === 'string' ? market.type.toLowerCase() : '';
+  const info = recordValue(market.info);
+  const contractType = typeof info?.contractType === 'string'
+    ? info.contractType.toLowerCase()
+    : '';
+  return market.swap === true
+    || market.contract === true
+    || ['swap', 'future', 'futures', 'contract', 'perpetual'].includes(type)
+    || ['swap', 'future', 'futures', 'contract', 'perpetual'].includes(contractType);
 }
 
 function ledgerAttribution(
   exchange: unknown,
   row: unknown,
   requestedSymbol: string,
-): { attributable: boolean; matches: boolean } {
+): 'unattributable' | 'ambiguous' | 'other' | 'matched' {
   const rowRecord = recordValue(row);
   const info = recordValue(rowRecord?.info);
   const candidates = [
     rowRecord?.symbol,
     ...(info ? Object.values(info) : []),
   ].filter((candidate): candidate is string => typeof candidate === 'string' && candidate.length > 0);
-  const resolvedSymbols = candidates
-    .map((candidate) => resolveMarket(exchange, candidate))
-    .filter((symbol): symbol is string => symbol !== null);
+  const resolvedSymbols = new Set<string>();
+  for (const candidate of candidates) {
+    const market = resolveMarketRecord(exchange, candidate);
+    const symbol = typeof market?.symbol === 'string' && market.symbol ? market.symbol : null;
+    if (market && symbol && isContractMarket(market)) resolvedSymbols.add(symbol);
+  }
 
-  return {
-    attributable: resolvedSymbols.length > 0,
-    matches: resolvedSymbols.includes(requestedSymbol),
-  };
+  if (resolvedSymbols.size === 0) return 'unattributable';
+  if (resolvedSymbols.size > 1) return 'ambiguous';
+  return resolvedSymbols.has(requestedSymbol) ? 'matched' : 'other';
 }
 
 export class FundingAccounting {
@@ -283,10 +292,13 @@ export class FundingAccounting {
     for (const row of rows) {
       if (source === 'ledger') {
         const attribution = ledgerAttribution(exchange, row, symbol);
-        if (!attribution.attributable) {
+        if (attribution === 'unattributable') {
           return { status: 'unknown', reason: 'funding_ledger_unattributable', payments: additions };
         }
-        if (!attribution.matches) continue;
+        if (attribution === 'ambiguous') {
+          return { status: 'unknown', reason: 'funding_ledger_attribution_ambiguous', payments: additions };
+        }
+        if (attribution === 'other') continue;
       }
       const id = row?.id ?? row?.info?.id ?? row?.info?.paymentId;
       const amount = row?.amount ?? row?.cost ?? row?.info?.amount;

@@ -319,6 +319,59 @@ describe('funding accounting', () => {
     });
   });
 
+  it('refuses unrelated non-contract ledger identifiers instead of skipping the row', async () => {
+    const accounting = new FundingAccounting({ filePath: statePath(), clock: () => 1_800_000_000_000 });
+    accounting.load();
+    const exchange = {
+      markets: {
+        'BTC/USDT:USDT': { symbol: 'BTC/USDT:USDT', type: 'swap', settle: 'USDT' },
+        USDT: { symbol: 'USDT', type: 'spot' },
+      },
+      has: { fetchFundingHistory: false, fetchLedger: true },
+      fetchLedger: async () => [{
+        id: 'ledger-spot-info',
+        type: 'funding',
+        amount: -1,
+        currency: 'USDT',
+        timestamp: 1_800_000_000_000,
+        info: { currency: 'USDT' },
+      }],
+    };
+
+    await expect(accounting.reconcile(exchange, 'BTC/USDT:USDT')).resolves.toMatchObject({
+      status: 'unknown',
+      reason: 'funding_ledger_unattributable',
+    });
+  });
+
+  it('refuses ledger rows resolving to multiple contract markets', async () => {
+    const accounting = new FundingAccounting({ filePath: statePath(), clock: () => 1_800_000_000_000 });
+    accounting.load();
+    const exchange = {
+      markets: {
+        'BTC/USDT:USDT': { symbol: 'BTC/USDT:USDT', type: 'swap', settle: 'USDT' },
+        'ETH/USDT:USDT': { symbol: 'ETH/USDT:USDT', type: 'swap', settle: 'USDT' },
+      },
+      has: { fetchFundingHistory: false, fetchLedger: true },
+      fetchLedger: async () => [{
+        id: 'ledger-ambiguous',
+        type: 'funding',
+        amount: -1,
+        currency: 'USDT',
+        timestamp: 1_800_000_000_000,
+        info: {
+          firstMarket: 'BTC/USDT:USDT',
+          secondMarket: 'ETH/USDT:USDT',
+        },
+      }],
+    };
+
+    await expect(accounting.reconcile(exchange, 'BTC/USDT:USDT')).resolves.toMatchObject({
+      status: 'unknown',
+      reason: 'funding_ledger_attribution_ambiguous',
+    });
+  });
+
   it('does not let unsupported-source venues be cleared by baseline attestation', async () => {
     const accounting = new FundingAccounting({ filePath: statePath() });
     accounting.load();
