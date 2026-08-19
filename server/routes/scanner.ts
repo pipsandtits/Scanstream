@@ -9,7 +9,7 @@ import { CCXTScanner } from '../services/gateway/ccxt-scanner';
 import { initAggregator } from '../../src/core/aggregator.singleton';
 import MultiExchangeScanner from '../services/scanner/multi-exchange-scanner';
 import ScannerPersistenceService from '../services/scanner/scanner-persistence';
-import { routeParam } from '../utils/route-params';
+import { respondToInvalidRouteParam, routeParam } from '../utils/route-params';
 
 const router = Router();
 // In-memory last scan results (for /results endpoint)
@@ -220,6 +220,7 @@ router.get('/quick/:symbol', (req: Request, res: Response) => {
     if (!cached) return res.status(404).json({ success: false, error: 'Symbol not in cache' });
     return res.json({ success: true, symbol, data: cached, timestamp: new Date().toISOString() });
   } catch (err: any) {
+    if (respondToInvalidRouteParam(err, res)) return;
     console.error('[Scanner /quick] Error:', err?.message || err);
     res.status(500).json({ success: false, error: 'Internal error' });
   }
@@ -472,6 +473,7 @@ router.get('/symbol/:symbol/stats', async (req: Request, res: Response) => {
       }
     });
   } catch (error: any) {
+    if (respondToInvalidRouteParam(error, res)) return;
     res.status(500).json({
       success: false,
       error: 'Failed to compute statistics',
@@ -510,6 +512,7 @@ router.get('/symbol/:symbol/history', async (req: Request, res: Response) => {
       history
     });
   } catch (error: any) {
+    if (respondToInvalidRouteParam(error, res)) return;
     res.status(500).json({
       success: false,
       error: 'Failed to retrieve history',
@@ -543,6 +546,7 @@ router.get('/symbol/:symbol/cross-exchange', async (req: Request, res: Response)
       signals
     });
   } catch (error: any) {
+    if (respondToInvalidRouteParam(error, res)) return;
     res.status(500).json({
       success: false,
       error: 'Failed to retrieve cross-exchange signals',

@@ -4,7 +4,7 @@ import { storage } from '../storage';
 import { paperTradingEngine } from '../paper-trading-engine';
 import { db } from '../db-storage'; // Assuming db is imported from a config file
 import { apiRegistry } from '../services/api-registry';
-import { routeParam } from '../utils/route-params';
+import { respondToInvalidRouteParam, routeParam } from '../utils/route-params';
 
 const router = express.Router();
 
@@ -193,6 +193,7 @@ router.post('/close/:tradeId', async (req: Request, res: Response) => {
     await paperTradingEngine.closeTrade(tradeId, exitPrice, 'MANUAL');
     res.json({ success: true });
   } catch (error: any) {
+    if (respondToInvalidRouteParam(error, res)) return;
     res.status(500).json({ success: false, error: error.message });
   }
 });

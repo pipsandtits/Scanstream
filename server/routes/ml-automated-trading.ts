@@ -16,7 +16,7 @@
  */
 
 import { Router, Request, Response } from 'express';
-import { routeParam } from '../utils/route-params';
+import { respondToInvalidRouteParam, routeParam } from '../utils/route-params';
 import { MLAutomatedTradingService, TradeExecutionRequest, RiskManagementConfig } from '../services/ml-automated-trading-service';
 import { Logger } from '../services/logger';
 
@@ -114,6 +114,7 @@ router.get('/:id', async (req: Request, res: Response) => {
 
     res.json(trade);
   } catch (error) {
+    if (respondToInvalidRouteParam(error, res)) return;
     logger.error(`Error fetching trade: ${error}`);
     res.status(500).json({ error: 'Internal server error' });
   }
@@ -149,6 +150,7 @@ router.post('/:id/close', async (req: Request, res: Response) => {
       message: `Trade closed: P&L $${trade.profitLoss?.toFixed(2)} (${trade.profitLossPercent?.toFixed(2)}%)`,
     });
   } catch (error) {
+    if (respondToInvalidRouteParam(error, res)) return;
     logger.error(`Error closing trade: ${error}`);
     res.status(500).json({ error: 'Internal server error' });
   }

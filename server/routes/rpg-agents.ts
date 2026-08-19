@@ -9,7 +9,7 @@ import { TradingAgent } from '../services/rpg-agents/TradingAgent';
 import { TrendRider } from '../services/rpg-agents/TrendRider';
 import { SupportSniper } from '../services/rpg-agents/SupportSniper';
 import { ReversalMaster } from '../services/rpg-agents/ReversalMaster';
-import { routeParam } from '../utils/route-params';
+import { respondToInvalidRouteParam, routeParam } from '../utils/route-params';
 
 const router = express.Router();
 
@@ -78,6 +78,7 @@ router.get('/status/:agentName', (req: Request, res: Response) => {
     if (!agent) return res.status(404).json({ success: false, error: 'Agent not found' });
     respondOk(res, agent.getStatus ? agent.getStatus() : agent);
   } catch (error: any) {
+    if (respondToInvalidRouteParam(error, res)) return;
     res.status(500).json({ success: false, error: error?.message ?? String(error) });
   }
 });
@@ -181,6 +182,7 @@ router.get('/:agentName/achievements', async (req: Request, res: Response) => {
     const achievements = arena?.getAgentAchievements ? arena.getAgentAchievements(agentName) : [];
     respondOk(res, achievements);
   } catch (error: any) {
+    if (respondToInvalidRouteParam(error, res)) return;
     res.status(500).json({ success: false, error: error?.message ?? String(error) });
   }
 });
@@ -238,6 +240,7 @@ router.post('/:agentName/probation', async (req: Request, res: Response) => {
     if (arena?.putAgentOnProbation) arena.putAgentOnProbation(agentName);
     res.json({ success: true, message: `${agentName} placed on probation` });
   } catch (error: any) {
+    if (respondToInvalidRouteParam(error, res)) return;
     res.status(500).json({ success: false, error: error?.message ?? String(error) });
   }
 });
@@ -249,6 +252,7 @@ router.post('/:agentName/hibernate', async (req: Request, res: Response) => {
     if (arena?.hibernateAgent) arena.hibernateAgent(agentName, reason);
     res.json({ success: true, message: `${agentName} hibernated` });
   } catch (error: any) {
+    if (respondToInvalidRouteParam(error, res)) return;
     res.status(500).json({ success: false, error: error?.message ?? String(error) });
   }
 });
@@ -259,6 +263,7 @@ router.post('/:agentName/wake', async (req: Request, res: Response) => {
     if (arena?.wakeAgent) arena.wakeAgent(agentName);
     res.json({ success: true, message: `${agentName} awakened` });
   } catch (error: any) {
+    if (respondToInvalidRouteParam(error, res)) return;
     res.status(500).json({ success: false, error: error?.message ?? String(error) });
   }
 });
@@ -281,6 +286,7 @@ router.post('/:agentName/spawn', async (req: Request, res: Response) => {
     const subAgent = agent.spawnSubAgent ? agent.spawnSubAgent(specialization) : null;
     res.json({ success: !!subAgent, subAgent: subAgent ? subAgent.getStatus() : null });
   } catch (error: any) {
+    if (respondToInvalidRouteParam(error, res)) return;
     res.status(500).json({ success: false, error: error?.message ?? String(error) });
   }
 });
@@ -349,6 +355,7 @@ router.get('/:agentName/allocation', async (req: Request, res: Response) => {
     if (!allocation) return res.status(404).json({ success: false, error: 'No allocation found for agent' });
     respondOk(res, allocation);
   } catch (error: any) {
+    if (respondToInvalidRouteParam(error, res)) return;
     res.status(500).json({ success: false, error: error?.message ?? String(error) });
   }
 });
@@ -361,6 +368,7 @@ router.get('/:agentName/learning-metrics', async (req: Request, res: Response) =
     if (!metrics) return res.status(404).json({ success: false, error: 'Agent not found' });
     respondOk(res, metrics);
   } catch (error: any) {
+    if (respondToInvalidRouteParam(error, res)) return;
     res.status(500).json({ success: false, error: error?.message ?? String(error) });
   }
 });
@@ -412,6 +420,7 @@ router.get('/:agentName/feature-recommendations', (req: Request, res: Response) 
     const recommendations = arena?.getChannelSystem ? arena.getChannelSystem().getFeatureRecommendations(agentName, regime as string) : [];
     res.json({ success: true, agentName, regime, recommendations, timestamp: new Date().toISOString() });
   } catch (error: any) {
+    if (respondToInvalidRouteParam(error, res)) return;
     res.status(500).json({ success: false, error: error?.message ?? String(error) });
   }
 });
@@ -485,6 +494,7 @@ router.post('/force-spawn/:agentType', (req: Request, res: Response) => {
       message: `${agentType} agent "${agentName}" spawned successfully`
     });
   } catch (error: any) {
+    if (respondToInvalidRouteParam(error, res)) return;
     res.status(500).json({ success: false, error: error?.message ?? String(error) });
   }
 });
@@ -589,6 +599,7 @@ router.post('/:agentName/configure', (req: Request, res: Response) => {
       message: `Configuration updated for ${agentName}`
     });
   } catch (error: any) {
+    if (respondToInvalidRouteParam(error, res)) return;
     res.status(500).json({ success: false, error: error?.message ?? String(error) });
   }
 });
@@ -613,6 +624,7 @@ router.post('/:agentName/force-retire', (req: Request, res: Response) => {
       message: `Agent ${agentName} forcibly retired`
     });
   } catch (error: any) {
+    if (respondToInvalidRouteParam(error, res)) return;
     res.status(500).json({ success: false, error: error?.message ?? String(error) });
   }
 });

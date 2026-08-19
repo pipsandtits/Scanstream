@@ -954,7 +954,11 @@ ML automated trading, ML multi-timeframe predictions, MTF confirmation,
 paper trading, RPG agents, scanner, scanner analysis, scanner signal,
 source analytics, strategy deployment, and chart API. Ordinary client
 call-sites remain within the accepted contracts; malformed values now receive
-validation errors rather than reaching handlers. Disabled gateway surfaces
+validation errors rather than reaching handlers. Repo-wide, malformed route
+parameters answer 400 through local `respondToInvalidRouteParam()` handling
+where broad catches would otherwise swallow them and the app-wide
+`routeParamErrorHandler` mounted after route registration for propagated errors.
+Disabled gateway surfaces
 were typed without being mounted or given new behavior.
 
 The ML consensus client contract was corrected against the server response:

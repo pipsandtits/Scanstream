@@ -48,6 +48,7 @@ import { apiRegistry } from './services/api-registry';
 import { setupAPITracking } from './middleware/api-tracker';
 import apiDocsRouter from './routes/api-docs';
 import { attachApiIdentity } from './middleware/api-access-auth';
+import { routeParamErrorHandler } from './middleware/route-param-error-handler';
 
 // Commander System imports
 import { setupCommanderRoutes } from './routes/commander';
@@ -900,6 +901,7 @@ app.use((req, res, next) => {
   }
 
   // Error handler LAST, after all other middleware and static serving
+  app.use(routeParamErrorHandler);
   app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
     const status = err.status || err.statusCode || 500;
     const message = err.message || "Internal Server Error";

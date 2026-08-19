@@ -29,12 +29,18 @@ describe('feature flag category routes', () => {
   it('serves valid categories and reports unknown categories as validation errors', async () => {
     const valid = await request('/category/strategy');
     const unknown = await request('/category/unknown');
+    const overlong = await request(`/category/${'x'.repeat(33)}`);
 
     expect(valid.status).toBe(200);
     expect(valid.body.category).toBe('strategy');
     expect(unknown.status).toBe(400);
     expect(unknown.body).toEqual(expect.objectContaining({
       error: 'Invalid category: unknown',
+      valid_categories: ['strategy', 'service', 'analysis', 'experimental', 'admin'],
+    }));
+    expect(overlong.status).toBe(400);
+    expect(overlong.body).toEqual(expect.objectContaining({
+      error: `Invalid category: ${'x'.repeat(33)}`,
       valid_categories: ['strategy', 'service', 'analysis', 'experimental', 'admin'],
     }));
   });

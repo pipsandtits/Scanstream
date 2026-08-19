@@ -6,7 +6,7 @@
 import { Router, Request, Response } from 'express';
 import axios from 'axios';
 import { coinGeckoService } from '../services/coingecko';
-import { routeParam } from '../utils/route-params';
+import { respondToInvalidRouteParam, routeParam } from '../utils/route-params';
 
 const router = Router();
 
@@ -161,6 +161,7 @@ router.get('/sentiment/:symbol', async (req: Request, res: Response) => {
       attribution: 'Data provided by CoinGecko (coingecko.com)'
     });
   } catch (error: any) {
+    if (respondToInvalidRouteParam(error, res)) return;
     console.error(`[CoinGecko] Sentiment error for ${rawSymbol}:`, error);
     res.status(500).json({
       success: false,
@@ -270,7 +271,8 @@ router.get('/ohlc/:coinId', async (req: Request, res: Response) => {
       attribution: 'Data provided by CoinGecko (coingecko.com)'
     });
   } catch (error: any) {
-    console.error(`[CoinGecko] OHLC error for ${routeParam(req.params.coinId, 'coinId')}:`, error);
+    if (respondToInvalidRouteParam(error, res)) return;
+    console.error(`[CoinGecko] OHLC error for ${req.params.coinId}:`, error);
     res.status(500).json({
       success: false,
       error: error.message || 'Failed to fetch OHLC data'
@@ -294,7 +296,8 @@ router.get('/coin/:coinId', async (req: Request, res: Response) => {
       attribution: 'Data provided by CoinGecko (coingecko.com)'
     });
   } catch (error: any) {
-    console.error(`[CoinGecko] Coin details error for ${routeParam(req.params.coinId, 'coinId')}:`, error);
+    if (respondToInvalidRouteParam(error, res)) return;
+    console.error(`[CoinGecko] Coin details error for ${req.params.coinId}:`, error);
     res.status(500).json({
       success: false,
       error: error.message || 'Failed to fetch coin details'
@@ -342,7 +345,8 @@ router.get('/metrics/:coinId', async (req: Request, res: Response) => {
       attribution: 'Data provided by CoinGecko (coingecko.com)'
     });
   } catch (error: any) {
-    console.error(`[CoinGecko] Metrics error for ${routeParam(req.params.coinId, 'coinId')}:`, error);
+    if (respondToInvalidRouteParam(error, res)) return;
+    console.error(`[CoinGecko] Metrics error for ${req.params.coinId}:`, error);
     res.status(500).json({
       success: false,
       error: error.message || 'Failed to fetch coin metrics'

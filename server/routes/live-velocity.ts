@@ -13,7 +13,7 @@
 import express, { Router, Request, Response } from 'express';
 import { liveVelocityCalculator } from '../services/live-velocity-calculator';
 import { AssetVelocityProfiler } from '../services/asset-velocity-profile';
-import { routeParam } from '../utils/route-params';
+import { respondToInvalidRouteParam, routeParam } from '../utils/route-params';
 
 const router = Router();
 const velocityProfiler = new AssetVelocityProfiler();
@@ -63,6 +63,7 @@ router.get('/live/:symbol', async (req: Request, res: Response) => {
       timestamp: Date.now(),
     });
   } catch (error: any) {
+    if (respondToInvalidRouteParam(error, res)) return;
     console.error('[VelocityAPI] Error:', error.message);
     res.status(500).json({
       success: false,
@@ -111,6 +112,7 @@ router.get('/regime/:symbol', async (req: Request, res: Response) => {
       timestamp: Date.now(),
     });
   } catch (error: any) {
+    if (respondToInvalidRouteParam(error, res)) return;
     console.error('[VelocityAPI] Regime detection error:', error.message);
     res.status(500).json({
       success: false,
@@ -205,6 +207,7 @@ router.get('/regimes/:symbol', async (req: Request, res: Response) => {
       timestamp: Date.now(),
     });
   } catch (error: any) {
+    if (respondToInvalidRouteParam(error, res)) return;
     console.error('[VelocityAPI] Regime comparison error:', error.message);
     res.status(500).json({
       success: false,

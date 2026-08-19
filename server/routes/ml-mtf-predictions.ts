@@ -13,7 +13,7 @@
  */
 
 import { Router, Request, Response } from 'express';
-import { routeParam } from '../utils/route-params';
+import { respondToInvalidRouteParam, routeParam } from '../utils/route-params';
 import { multiTimeframeMLService } from '../services/multi-timeframe-ml-service';
 import { lstmBacktestEngine } from '../services/lstm-backtest-engine';
 
@@ -139,6 +139,7 @@ router.get('/predictions/:symbol', async (req: Request, res: Response) => {
 
     return res.json(response);
   } catch (error) {
+    if (respondToInvalidRouteParam(error, res)) return;
     console.error('[ML MTF API] Error fetching predictions:', error);
     return res.status(500).json({
       error: 'Failed to fetch predictions',
@@ -448,6 +449,7 @@ router.get('/confidence/:symbol', async (req: Request, res: Response) => {
       },
     });
   } catch (error) {
+    if (respondToInvalidRouteParam(error, res)) return;
     console.error('[ML MTF API] Error fetching confidence metrics:', error);
     return res.status(500).json({
       error: 'Failed to fetch confidence metrics',

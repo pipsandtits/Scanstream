@@ -84,11 +84,14 @@ router.get('/:flag', (req: Request, res: Response) => {
 router.get(
   '/category/:category',
   (req: Request, res: Response) => {
-    const category = routeParam(req.params.category, 'category', 32);
+    const rawCategory = req.params.category;
+    const category = typeof rawCategory === 'string' && rawCategory.length <= 32
+      ? rawCategory
+      : '';
 
     if (!isFeatureCategory(category)) {
       return res.status(400).json({
-        error: `Invalid category: ${category}`,
+        error: `Invalid category: ${typeof rawCategory === 'string' ? rawCategory : 'category'}`,
         valid_categories: validCategories,
       });
     }

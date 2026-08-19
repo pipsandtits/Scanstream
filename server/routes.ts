@@ -44,6 +44,7 @@ import liveTradingRouter from './routes/live-trading';
 import { requireTradingOperator } from './middleware/require-trading-operator';
 import { requireAuth } from './middleware/auth';
 import { auditOperatorAction } from './middleware/audit-operator-action';
+import { respondToInvalidRouteParam } from './utils/route-params';
 
 // Import Portfolio Risk and Source Analytics routes
 import portfolioRiskRouter from './routes/portfolio-risk';
@@ -1214,6 +1215,7 @@ app.get('/api/assets/performance', async (req: Request, res: Response) => {
 
     // Global error handler middleware
     app.use((err: any, _req: Request, res: Response, _next: any) => {
+      if (respondToInvalidRouteParam(err, res)) return;
       console.error(err);
       res.status(500).json({ error: err.message || 'Internal server error' });
     });

@@ -2,7 +2,7 @@
 import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { signalSourceAnalytics } from '../services/signal-source-analytics';
-import { routeParam } from '../utils/route-params';
+import { respondToInvalidRouteParam, routeParam } from '../utils/route-params';
 
 const router = Router();
 
@@ -34,6 +34,7 @@ router.get('/metrics/:source', (req: Request, res: Response) => {
     const metrics = signalSourceAnalytics.getSourceMetrics(source.toUpperCase());
     res.json({ success: true, metrics });
   } catch (error: any) {
+    if (respondToInvalidRouteParam(error, res)) return;
     res.status(500).json({ success: false, error: error.message });
   }
 });

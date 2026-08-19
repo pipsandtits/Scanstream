@@ -5,7 +5,7 @@
 
 import express, { type Request, type Response } from 'express';
 import { fastScanner } from '../services/fast-scanner';
-import { routeParam } from '../utils/route-params';
+import { respondToInvalidRouteParam, routeParam } from '../utils/route-params';
 
 const router = express.Router();
 
@@ -85,6 +85,7 @@ router.get('/symbol/:symbol', (req: Request, res: Response) => {
       timestamp: new Date().toISOString()
     });
   } catch (error: any) {
+    if (respondToInvalidRouteParam(error, res)) return;
     res.status(500).json({
       success: false,
       error: error.message

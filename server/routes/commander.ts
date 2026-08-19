@@ -12,7 +12,7 @@ import { ExchangeDataFeed } from '../trading-engine';
 import { PatternDetectionEngine } from '../services/pattern-detection-contribution';
 import MLPredictionService from '../services/ml-predictions';
 import { EnhancedPortfolioSimulator } from '../portfolio-simulator';
-import { routeParam } from '../utils/route-params';
+import { respondToInvalidRouteParam, routeParam } from '../utils/route-params';
 
 export function setupCommanderRoutes(
   router: Router,
@@ -218,6 +218,7 @@ export function setupCommanderRoutes(
         reason
       });
     } catch (error: any) {
+      if (respondToInvalidRouteParam(error, res)) return;
       res.status(500).json({ error: error.message });
     }
   });
@@ -237,6 +238,7 @@ export function setupCommanderRoutes(
         message: `${agentName} awakened`
       });
     } catch (error: any) {
+      if (respondToInvalidRouteParam(error, res)) return;
       res.status(500).json({ error: error.message });
     }
   });

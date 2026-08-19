@@ -16,7 +16,7 @@ import gatewayMetricsRouter from './gateway-metrics';
 import { SignalEngine, defaultTradingConfig } from '../trading-engine';
 import { signalPerformanceTracker } from '../services/signal-performance-tracker';
 import { generateModuleSignal, type ArmDetectionInput, type ModuleState } from '../services/arm-template';
-import { routeParam } from '../utils/route-params';
+import { respondToInvalidRouteParam, routeParam } from '../utils/route-params';
 import type { OHLCVData } from '../types/gateway';
 
 interface GatewayFrame {
@@ -433,7 +433,8 @@ router.get('/price/:symbol', async (req: Request, res: Response) => {
 
     res.json(priceData);
   } catch (error: any) {
-    const symbol = routeParam(req.params.symbol, 'symbol', 64);
+    if (respondToInvalidRouteParam(error, res)) return;
+    const symbol = req.params.symbol;
     console.error(`[Gateway] Price fetch error for ${symbol}:`, error.message);
     res.status(500).json({ error: error.message, symbol });
   }
@@ -570,7 +571,8 @@ router.get('/ohlcv/:symbol', async (req: Request, res: Response) => {
       data: dataWithIndicators
     });
   } catch (error: any) {
-    const symbol = routeParam(req.params.symbol, 'symbol', 64);
+    if (respondToInvalidRouteParam(error, res)) return;
+    const symbol = req.params.symbol;
     console.error(`[Gateway] OHLCV fetch error for ${symbol}:`, error.message);
     res.status(500).json({ error: error.message, symbol });
   }
@@ -597,6 +599,7 @@ router.get('/market-frames/:symbol', async (req: Request, res: Response) => {
       frames
     });
   } catch (error: any) {
+    if (respondToInvalidRouteParam(error, res)) return;
     res.status(500).json({ error: error.message });
   }
 });
@@ -888,6 +891,7 @@ router.get('/dataframe/:symbol', async (req: Request, res: Response) => {
       timestamp: new Date().toISOString()
     });
   } catch (error: any) {
+    if (respondToInvalidRouteParam(error, res)) return;
     console.error(`[Gateway] Dataframe error for ${req.params.symbol}:`, error.message);
     res.status(500).json({ error: error.message, symbol: req.params.symbol });
   }
@@ -919,6 +923,7 @@ router.get('/liquidity/:symbol', async (req: Request, res: Response) => {
       timestamp: new Date().toISOString()
     });
   } catch (error: any) {
+    if (respondToInvalidRouteParam(error, res)) return;
     console.error('[Gateway] Liquidity check error:', error);
     res.status(500).json({
       success: false,
@@ -969,6 +974,7 @@ router.get('/gas/:chain', async (req: Request, res: Response) => {
       timestamp: new Date().toISOString()
     });
   } catch (error: any) {
+    if (respondToInvalidRouteParam(error, res)) return;
     res.status(500).json({ success: false, error: error.message });
   }
 });
@@ -1020,6 +1026,7 @@ router.post('/alerts/:id/acknowledge', (req: Request, res: Response) => {
 
     res.json({ success, message: success ? 'Alert acknowledged' : 'Alert not found' });
   } catch (error: any) {
+    if (respondToInvalidRouteParam(error, res)) return;
     res.status(500).json({ success: false, error: error.message });
   }
 });
@@ -1080,6 +1087,7 @@ router.post('/exchanges/:name/reset-rate-limit', (req: Request, res: Response) =
       newStats: rateLimiter.getStats(name)
     });
   } catch (error: any) {
+    if (respondToInvalidRouteParam(error, res)) return;
     res.status(500).json({ error: error.message });
   }
 });
@@ -2273,6 +2281,7 @@ router.get('/dataframe-validated/:symbol', async (req: Request, res: Response) =
       });
     }
   } catch (error: any) {
+    if (respondToInvalidRouteParam(error, res)) return;
     res.status(500).json({
       error: error.message,
       validated: false

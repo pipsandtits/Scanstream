@@ -2,7 +2,7 @@
 import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { assetCorrelationAnalyzer } from '../services/asset-correlation-analyzer';
-import { routeParam } from '../utils/route-params';
+import { respondToInvalidRouteParam, routeParam } from '../utils/route-params';
 
 const router = Router();
 
@@ -86,6 +86,7 @@ router.get('/report/:symbol', (req: Request, res: Response) => {
       timestamp: new Date().toISOString()
     });
   } catch (error: any) {
+    if (respondToInvalidRouteParam(error, res)) return;
     res.status(500).json({
       error: error.message
     });

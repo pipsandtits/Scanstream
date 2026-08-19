@@ -2,7 +2,7 @@
 import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { strategyDeploymentManager } from '../services/strategy-deployment-manager';
-import { routeParam } from '../utils/route-params';
+import { respondToInvalidRouteParam, routeParam } from '../utils/route-params';
 
 const router = Router();
 
@@ -52,6 +52,7 @@ router.post('/stop/:strategyId', (req: Request, res: Response) => {
 
     res.json(result);
   } catch (error: any) {
+    if (respondToInvalidRouteParam(error, res)) return;
     res.status(500).json({
       success: false,
       message: error.message
@@ -76,6 +77,7 @@ router.get('/status/:strategyId', (req: Request, res: Response) => {
 
     res.json({ success: true, deployment: status });
   } catch (error: any) {
+    if (respondToInvalidRouteParam(error, res)) return;
     res.status(500).json({
       error: error.message
     });
@@ -125,6 +127,7 @@ router.get('/mode/:mode', (req: Request, res: Response) => {
       total: deployments.length
     });
   } catch (error: any) {
+    if (respondToInvalidRouteParam(error, res)) return;
     res.status(500).json({
       error: error.message
     });

@@ -5,7 +5,7 @@ import fs from 'fs/promises';
 import { NextFunction, Request, Response } from 'express'; // Ensure Request and Response are imported
 import { storage } from '../storage';
 import { formatError } from '../utils/logger';
-import { routeParam } from '../utils/route-params';
+import { respondToInvalidRouteParam, routeParam } from '../utils/route-params';
 
 const router = Router();
 
@@ -530,6 +530,7 @@ router.delete('/backtest/:id', async (req: Request, res: Response) => {
     await storage.deleteBacktestResult(id);
     res.json({ success: true });
   } catch (error: any) {
+    if (respondToInvalidRouteParam(error, res)) return;
     const fe = formatError(error);
     console.error('Failed to delete backtest:', fe.message, { stack: fe.stack });
     res.status(500).json({ error: fe.message });
@@ -663,6 +664,7 @@ router.post('/:id/execute', async (req: Request, res: Response) => {
       }
     });
   } catch (error) {
+    if (respondToInvalidRouteParam(error, res)) return;
     const fe = formatError(error);
     console.error('Error executing strategy:', fe.message, { stack: fe.stack });
     res.status(500).json({ success: false, error: 'Failed to execute strategy' });
@@ -744,6 +746,7 @@ router.post('/:id/backtest', async (req: Request, res: Response) => {
       }
     });
   } catch (error) {
+    if (respondToInvalidRouteParam(error, res)) return;
     const fe = formatError(error);
     console.error('Error backtesting strategy:', fe.message, { stack: fe.stack });
     res.status(500).json({ success: false, error: 'Failed to backtest strategy' });

@@ -3,7 +3,7 @@ import { Router } from 'express';
 import { compositeEntryQualityEngine } from '../services/composite-entry-quality';
 import { storage } from '../storage';
 import type { MarketFrame } from '@shared/schema';
-import { routeParam } from '../utils/route-params';
+import { respondToInvalidRouteParam, routeParam } from '../utils/route-params';
 
 const router = Router();
 
@@ -52,6 +52,7 @@ router.get('/:symbol', async (req, res) => {
         : 'AVOID'
     });
   } catch (err: any) {
+    if (respondToInvalidRouteParam(err, res)) return;
     res.status(500).json({ error: err.message });
   }
 });
@@ -151,6 +152,7 @@ router.get('/filter/:minQuality', async (req, res) => {
       }))
     });
   } catch (err: any) {
+    if (respondToInvalidRouteParam(err, res)) return;
     res.status(500).json({ error: err.message });
   }
 });

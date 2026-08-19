@@ -7,7 +7,7 @@
 
 import { Router, Request, Response } from 'express';
 import ScannerSignalService from '../services/scanner/scanner-signal-service';
-import { routeParam } from '../utils/route-params';
+import { respondToInvalidRouteParam, routeParam } from '../utils/route-params';
 import type {
   ComputeScannerSignalRequest,
   ComputeScannerSignalResponse,
@@ -193,6 +193,7 @@ router.get('/signal/cached/:symbol/:timeframe', async (req: Request, res: Respon
       cached: true,
     });
   } catch (error: any) {
+    if (respondToInvalidRouteParam(error, res)) return;
     console.error('[Scanner Signal] Error retrieving cached signal:', error);
     res.status(500).json({
       success: false,

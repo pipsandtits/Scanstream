@@ -4,7 +4,7 @@ import { gatewayAlertSystem } from '../services/gateway-alerts';
 import { db } from '../db-storage';
 import { signalWebSocketService } from '../services/websocket-signals';
 import { coinGeckoService } from '../services/coingecko';
-import { routeParam } from '../utils/route-params';
+import { respondToInvalidRouteParam, routeParam } from '../utils/route-params';
 
 const router = Router();
 
@@ -197,6 +197,7 @@ router.get('/quick/:symbol', async (req: Request, res: Response) => {
       timestamp: new Date().toISOString()
     });
   } catch (error: any) {
+    if (respondToInvalidRouteParam(error, res)) return;
     console.error('[Scanner /quick/:symbol] Error:', error.message);
     res.status(500).json({
       success: false,
@@ -230,6 +231,7 @@ router.get('/results/:scanId', async (req: Request, res: Response) => {
 
     res.json({ success: true, scanId, ...data });
   } catch (error: any) {
+    if (respondToInvalidRouteParam(error, res)) return;
     res.status(500).json({
       success: false,
       error: error.message
@@ -271,6 +273,7 @@ router.get('/agent-analysis/:symbol', async (req: Request, res: Response) => {
       timestamp: new Date().toISOString()
     });
   } catch (error: any) {
+    if (respondToInvalidRouteParam(error, res)) return;
     console.error('[Scanner Agent Analysis] Error:', error.message);
     res.status(500).json({
       success: false,

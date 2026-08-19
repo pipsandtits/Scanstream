@@ -6,7 +6,7 @@
 import { Router, Request, Response } from 'express';
 import axios from 'axios';
 import { coinGeckoService } from '../services/coingecko';
-import { routeParam } from '../utils/route-params';
+import { respondToInvalidRouteParam, routeParam } from '../utils/route-params';
 
 const router = Router();
 
@@ -120,6 +120,7 @@ router.get('/api/coingecko/chart/:coinId', async (req: Request, res: Response) =
     res.json(result);
     
   } catch (error: any) {
+    if (respondToInvalidRouteParam(error, res)) return;
     console.error('[CoinGecko Chart] Error fetching chart data:', error.message);
     
     if (error.response?.status === 429) {
@@ -182,6 +183,7 @@ router.get('/api/coingecko/coin-from-symbol/:symbol', async (req: Request, res: 
       res.json({ success: false, error: 'Symbol not found', symbol: cleanSymbol });
     }
   } catch (error: any) {
+    if (respondToInvalidRouteParam(error, res)) return;
     res.status(500).json({
       success: false,
       error: 'Failed to map symbol',
@@ -272,6 +274,7 @@ router.get('/api/coingecko/chart/:coinId/multi-timeframe', async (req: Request, 
     res.json(result);
     
   } catch (error: any) {
+    if (respondToInvalidRouteParam(error, res)) return;
     console.error('[CoinGecko Chart] Multi-timeframe error:', error.message);
     res.status(500).json({
       success: false,
