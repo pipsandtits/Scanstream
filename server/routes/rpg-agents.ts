@@ -9,6 +9,7 @@ import { TradingAgent } from '../services/rpg-agents/TradingAgent';
 import { TrendRider } from '../services/rpg-agents/TrendRider';
 import { SupportSniper } from '../services/rpg-agents/SupportSniper';
 import { ReversalMaster } from '../services/rpg-agents/ReversalMaster';
+import { routeParam } from '../utils/route-params';
 
 const router = express.Router();
 
@@ -72,7 +73,7 @@ router.get('/leaderboard', (req: Request, res: Response) => {
 // Agent status
 router.get('/status/:agentName', (req: Request, res: Response) => {
   try {
-    const { agentName } = req.params;
+    const agentName = routeParam(req.params.agentName, 'agentName');
     const agent = arena?.getAgent ? arena.getAgent(agentName) : null;
     if (!agent) return res.status(404).json({ success: false, error: 'Agent not found' });
     respondOk(res, agent.getStatus ? agent.getStatus() : agent);
@@ -176,7 +177,7 @@ router.get('/market-oracle', async (req: Request, res: Response) => {
 // Achievements
 router.get('/:agentName/achievements', async (req: Request, res: Response) => {
   try {
-    const { agentName } = req.params;
+    const agentName = routeParam(req.params.agentName, 'agentName');
     const achievements = arena?.getAgentAchievements ? arena.getAgentAchievements(agentName) : [];
     respondOk(res, achievements);
   } catch (error: any) {
@@ -233,7 +234,7 @@ router.get('/team-health', async (req: Request, res: Response) => {
 
 router.post('/:agentName/probation', async (req: Request, res: Response) => {
   try {
-    const { agentName } = req.params;
+    const agentName = routeParam(req.params.agentName, 'agentName');
     if (arena?.putAgentOnProbation) arena.putAgentOnProbation(agentName);
     res.json({ success: true, message: `${agentName} placed on probation` });
   } catch (error: any) {
@@ -243,7 +244,7 @@ router.post('/:agentName/probation', async (req: Request, res: Response) => {
 
 router.post('/:agentName/hibernate', async (req: Request, res: Response) => {
   try {
-    const { agentName } = req.params;
+    const agentName = routeParam(req.params.agentName, 'agentName');
     const { reason } = req.body;
     if (arena?.hibernateAgent) arena.hibernateAgent(agentName, reason);
     res.json({ success: true, message: `${agentName} hibernated` });
@@ -254,7 +255,7 @@ router.post('/:agentName/hibernate', async (req: Request, res: Response) => {
 
 router.post('/:agentName/wake', async (req: Request, res: Response) => {
   try {
-    const { agentName } = req.params;
+    const agentName = routeParam(req.params.agentName, 'agentName');
     if (arena?.wakeAgent) arena.wakeAgent(agentName);
     res.json({ success: true, message: `${agentName} awakened` });
   } catch (error: any) {
@@ -273,7 +274,7 @@ router.get('/channels/stats', async (req: Request, res: Response) => {
 
 router.post('/:agentName/spawn', async (req: Request, res: Response) => {
   try {
-    const { agentName } = req.params;
+    const agentName = routeParam(req.params.agentName, 'agentName');
     const { specialization } = req.body;
     const agent = arena?.getAgent ? arena.getAgent(agentName) : null;
     if (!agent) return res.status(404).json({ success: false, error: 'Agent not found' });
@@ -343,7 +344,7 @@ router.get('/portfolio/metrics', async (req: Request, res: Response) => {
 
 router.get('/:agentName/allocation', async (req: Request, res: Response) => {
   try {
-    const { agentName } = req.params;
+    const agentName = routeParam(req.params.agentName, 'agentName');
     const allocation = arena?.getAgentAllocation ? arena.getAgentAllocation(agentName) : null;
     if (!allocation) return res.status(404).json({ success: false, error: 'No allocation found for agent' });
     respondOk(res, allocation);
@@ -355,7 +356,7 @@ router.get('/:agentName/allocation', async (req: Request, res: Response) => {
 // Online learning
 router.get('/:agentName/learning-metrics', async (req: Request, res: Response) => {
   try {
-    const { agentName } = req.params;
+    const agentName = routeParam(req.params.agentName, 'agentName');
     const metrics = arena?.getLearningMetrics ? arena.getLearningMetrics(agentName) : null;
     if (!metrics) return res.status(404).json({ success: false, error: 'Agent not found' });
     respondOk(res, metrics);
@@ -406,7 +407,7 @@ router.get('/feature-insights', (req: Request, res: Response) => {
 
 router.get('/:agentName/feature-recommendations', (req: Request, res: Response) => {
   try {
-    const { agentName } = req.params;
+    const agentName = routeParam(req.params.agentName, 'agentName');
     const { regime = 'NEUTRAL' } = req.query;
     const recommendations = arena?.getChannelSystem ? arena.getChannelSystem().getFeatureRecommendations(agentName, regime as string) : [];
     res.json({ success: true, agentName, regime, recommendations, timestamp: new Date().toISOString() });
@@ -423,7 +424,7 @@ router.get('/:agentName/feature-recommendations', (req: Request, res: Response) 
  */
 router.post('/force-spawn/:agentType', (req: Request, res: Response) => {
   try {
-    const { agentType } = req.params;
+    const agentType = routeParam(req.params.agentType, 'agentType', 64);
     const { name, config } = req.body;
     
     let agent: any = null;
@@ -559,7 +560,7 @@ router.post('/force-spawn-team', (req: Request, res: Response) => {
  */
 router.post('/:agentName/configure', (req: Request, res: Response) => {
   try {
-    const { agentName } = req.params;
+    const agentName = routeParam(req.params.agentName, 'agentName');
     const { config } = req.body;
     
     const agent = arena?.getAgent ? arena.getAgent(agentName) : null;
@@ -597,7 +598,7 @@ router.post('/:agentName/configure', (req: Request, res: Response) => {
  */
 router.post('/:agentName/force-retire', (req: Request, res: Response) => {
   try {
-    const { agentName } = req.params;
+    const agentName = routeParam(req.params.agentName, 'agentName');
     
     const agent = arena?.getAgent ? arena.getAgent(agentName) : null;
     if (!agent) return res.status(404).json({ success: false, error: 'Agent not found' });

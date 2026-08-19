@@ -10,6 +10,7 @@
  */
 
 import { Router, Request, Response } from 'express';
+import { routeParam, routeParamEnum } from '../utils/route-params';
 import {
   isFeatureEnabled,
   getAllFlags,
@@ -53,7 +54,7 @@ router.get('/', (req: Request, res: Response) => {
  * Check if a specific flag is enabled
  */
 router.get('/:flag', (req: Request, res: Response) => {
-  const flagName = req.params.flag;
+  const flagName = routeParam(req.params.flag, 'flag', 128);
   const flags = getAllFlags();
 
   if (!flags[flagName]) {
@@ -78,7 +79,7 @@ router.get('/:flag', (req: Request, res: Response) => {
 router.get(
   '/category/:category',
   (req: Request, res: Response) => {
-    const category = req.params.category as any;
+    const category = routeParamEnum(req.params.category, 'category', ['strategy', 'service', 'analysis', 'experimental', 'admin'] as const);
     const validCategories = ['strategy', 'service', 'analysis', 'experimental', 'admin'];
 
     if (!validCategories.includes(category)) {
@@ -102,7 +103,7 @@ router.get(
  * Toggle a feature flag on/off (dev-only)
  */
 router.post('/:flag/toggle', devOnly, (req: Request, res: Response) => {
-  const flagName = req.params.flag;
+  const flagName = routeParam(req.params.flag, 'flag', 128);
   const flags = getAllFlags();
 
   if (!flags[flagName]) {
@@ -129,7 +130,7 @@ router.post('/:flag/toggle', devOnly, (req: Request, res: Response) => {
  * Set a feature flag to a specific state (dev-only)
  */
 router.post('/:flag/set', devOnly, (req: Request, res: Response) => {
-  const flagName = req.params.flag;
+  const flagName = routeParam(req.params.flag, 'flag', 128);
   const { enabled } = req.body;
 
   if (typeof enabled !== 'boolean') {

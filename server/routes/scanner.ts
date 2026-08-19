@@ -9,6 +9,7 @@ import { CCXTScanner } from '../services/gateway/ccxt-scanner';
 import { initAggregator } from '../../src/core/aggregator.singleton';
 import MultiExchangeScanner from '../services/scanner/multi-exchange-scanner';
 import ScannerPersistenceService from '../services/scanner/scanner-persistence';
+import { routeParam } from '../utils/route-params';
 
 const router = Router();
 // In-memory last scan results (for /results endpoint)
@@ -124,7 +125,10 @@ router.get('/signals', async (req: Request, res: Response) => {
         }
       }
     } catch (error) {
-      console.warn('[Scanner API] Failed to fetch CoinGecko price changes via service:', error?.message || error);
+      console.warn(
+        '[Scanner API] Failed to fetch CoinGecko price changes via service:',
+        error instanceof Error ? error.message : String(error),
+      );
     }
 
     const signals = scanResults
@@ -210,7 +214,7 @@ try {
  */
 router.get('/quick/:symbol', (req: Request, res: Response) => {
   try {
-    const raw = req.params.symbol || '';
+    const raw = routeParam(req.params.symbol, 'symbol', 64);
     const symbol = raw.toUpperCase().includes('/') ? raw.toUpperCase() : `${raw.toUpperCase()}/USDT`;
     const cached = priceCache.get(symbol) || priceCache.get(symbol.replace('/USDT','/USD'));
     if (!cached) return res.status(404).json({ success: false, error: 'Symbol not in cache' });
@@ -442,7 +446,7 @@ router.post('/multi-exchange-scan', async (req: Request, res: Response) => {
  */
 router.get('/symbol/:symbol/stats', async (req: Request, res: Response) => {
   try {
-    const { symbol } = req.params;
+    const symbol = routeParam(req.params.symbol, 'symbol', 64);
     const { days } = req.query;
     const daysNum = parseInt(days as string) || 7;
 
@@ -482,7 +486,7 @@ router.get('/symbol/:symbol/stats', async (req: Request, res: Response) => {
  */
 router.get('/symbol/:symbol/history', async (req: Request, res: Response) => {
   try {
-    const { symbol } = req.params;
+    const symbol = routeParam(req.params.symbol, 'symbol', 64);
     const { exchange, hours } = req.query;
     const hoursNum = parseInt(hours as string) || 24;
 
@@ -520,7 +524,7 @@ router.get('/symbol/:symbol/history', async (req: Request, res: Response) => {
  */
 router.get('/symbol/:symbol/cross-exchange', async (req: Request, res: Response) => {
   try {
-    const { symbol } = req.params;
+    const symbol = routeParam(req.params.symbol, 'symbol', 64);
     const { days } = req.query;
     const daysNum = parseInt(days as string) || 7;
 

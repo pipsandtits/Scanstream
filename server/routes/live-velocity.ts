@@ -13,6 +13,7 @@
 import express, { Router, Request, Response } from 'express';
 import { liveVelocityCalculator } from '../services/live-velocity-calculator';
 import { AssetVelocityProfiler } from '../services/asset-velocity-profile';
+import { routeParam } from '../utils/route-params';
 
 const router = Router();
 const velocityProfiler = new AssetVelocityProfiler();
@@ -39,7 +40,7 @@ export async function initializeLiveVelocityRoutes() {
  */
 router.get('/live/:symbol', async (req: Request, res: Response) => {
   try {
-    const { symbol } = req.params;
+    const symbol = routeParam(req.params.symbol, 'symbol', 64);
     const lookbackDays = parseInt(req.query.lookbackDays as string) || 365;
     const regime = req.query.regime as 'BULL' | 'BEAR' | 'SIDEWAYS' | undefined;
 
@@ -90,7 +91,7 @@ router.get('/live/:symbol', async (req: Request, res: Response) => {
  */
 router.get('/regime/:symbol', async (req: Request, res: Response) => {
   try {
-    const { symbol } = req.params;
+    const symbol = routeParam(req.params.symbol, 'symbol', 64);
     const lookbackDays = parseInt(req.query.lookbackDays as string) || 365;
 
     console.log(`[VelocityAPI] Detecting regime for ${symbol}`);
@@ -138,7 +139,7 @@ router.get('/regime/:symbol', async (req: Request, res: Response) => {
  */
 router.get('/regimes/:symbol', async (req: Request, res: Response) => {
   try {
-    const { symbol } = req.params;
+    const symbol = routeParam(req.params.symbol, 'symbol', 64);
     const lookbackDays = parseInt(req.query.lookbackDays as string) || 730;
 
     console.log(`[VelocityAPI] Comparing regimes for ${symbol}`);

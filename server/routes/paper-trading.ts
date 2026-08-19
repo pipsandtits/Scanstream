@@ -4,6 +4,7 @@ import { storage } from '../storage';
 import { paperTradingEngine } from '../paper-trading-engine';
 import { db } from '../db-storage'; // Assuming db is imported from a config file
 import { apiRegistry } from '../services/api-registry';
+import { routeParam } from '../utils/route-params';
 
 const router = express.Router();
 
@@ -179,7 +180,7 @@ router.post('/trade', async (req: Request, res: Response) => {
  */
 router.post('/close/:tradeId', async (req: Request, res: Response) => {
   try {
-    const { tradeId } = req.params;
+    const tradeId = routeParam(req.params.tradeId, 'tradeId');
     const { exitPrice } = req.body;
 
     if (exitPrice === undefined) {

@@ -5,6 +5,7 @@ import fs from 'fs/promises';
 import { NextFunction, Request, Response } from 'express'; // Ensure Request and Response are imported
 import { storage } from '../storage';
 import { formatError } from '../utils/logger';
+import { routeParam } from '../utils/route-params';
 
 const router = Router();
 
@@ -525,7 +526,7 @@ router.post('/backtest/run', async (req: Request, res: Response) => {
 // DELETE /api/strategies/backtest/:id - Delete a backtest result (must come before /:id)
 router.delete('/backtest/:id', async (req: Request, res: Response) => {
   try {
-    const { id } = req.params;
+    const id = routeParam(req.params.id, 'id');
     await storage.deleteBacktestResult(id);
     res.json({ success: true });
   } catch (error: any) {
@@ -538,7 +539,7 @@ router.delete('/backtest/:id', async (req: Request, res: Response) => {
 // GET /api/strategies/:id - Get strategy details
 router.get('/:id', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { id } = req.params;
+    const id = routeParam(req.params.id, 'id');
     if (id === 'feature-enabled' || id === 'compare-durations') {
       return next();
     }
@@ -616,7 +617,7 @@ router.post('/enhanced-bounce/execute', async (req: Request, res: Response) => {
 // POST /api/strategies/:id/execute - Execute strategy and create signal
 router.post('/:id/execute', async (req: Request, res: Response) => {
   try {
-    const { id } = req.params;
+    const id = routeParam(req.params.id, 'id');
     const { symbol, timeframe, parameters } = req.body;
 
     const strategy = STRATEGIES.find(s => s.id === id);
@@ -721,7 +722,7 @@ router.post('/consensus', async (req: Request, res: Response) => {
 // POST /api/strategies/:id/backtest - Backtest strategy
 router.post('/:id/backtest', async (req: Request, res: Response) => {
   try {
-    const { id } = req.params;
+    const id = routeParam(req.params.id, 'id');
     const { symbol, timeframe, startDate, endDate, parameters } = req.body;
 
     const strategy = STRATEGIES.find(s => s.id === id);

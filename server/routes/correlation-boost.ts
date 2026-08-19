@@ -2,6 +2,7 @@
 import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { assetCorrelationAnalyzer } from '../services/asset-correlation-analyzer';
+import { routeParam } from '../utils/route-params';
 
 const router = Router();
 
@@ -76,7 +77,7 @@ router.post('/track', (req: Request, res: Response) => {
  */
 router.get('/report/:symbol', (req: Request, res: Response) => {
   try {
-    const { symbol } = req.params;
+    const symbol = routeParam(req.params.symbol, 'symbol', 64);
     const report = assetCorrelationAnalyzer.getCorrelationReport(symbol);
 
     res.json({

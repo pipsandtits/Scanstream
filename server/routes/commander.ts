@@ -12,6 +12,7 @@ import { ExchangeDataFeed } from '../trading-engine';
 import { PatternDetectionEngine } from '../services/pattern-detection-contribution';
 import MLPredictionService from '../services/ml-predictions';
 import { EnhancedPortfolioSimulator } from '../portfolio-simulator';
+import { routeParam } from '../utils/route-params';
 
 export function setupCommanderRoutes(
   router: Router,
@@ -75,7 +76,7 @@ export function setupCommanderRoutes(
    */
   router.post('/commander/decisions/:decisionId/approve', async (req: Request, res: Response) => {
     try {
-      const { decisionId } = req.params;
+      const decisionId = routeParam(req.params.decisionId, 'decisionId');
       const { decision, notes, modifiedParameters } = req.body;
 
       // decision: "APPROVE", "REJECT", "MODIFY"
@@ -129,7 +130,7 @@ export function setupCommanderRoutes(
    */
   router.post('/commander/alerts/:alertId/respond', async (req: Request, res: Response) => {
     try {
-      const { alertId } = req.params;
+      const alertId = routeParam(req.params.alertId, 'alertId');
       const { action, reason } = req.body;
 
       const result = approvalSystem.respondToAlert(alertId, action, reason);
@@ -205,7 +206,7 @@ export function setupCommanderRoutes(
    */
   router.post('/commander/agent/:agentName/hibernate', async (req: Request, res: Response) => {
     try {
-      const { agentName } = req.params;
+      const agentName = routeParam(req.params.agentName, 'agentName');
       const { reason, duration } = req.body;
 
       arena.hibernateAgent(agentName, reason);
@@ -227,7 +228,7 @@ export function setupCommanderRoutes(
    */
   router.post('/commander/agent/:agentName/wake', async (req: Request, res: Response) => {
     try {
-      const { agentName } = req.params;
+      const agentName = routeParam(req.params.agentName, 'agentName');
 
       arena.wakeAgent(agentName);
 

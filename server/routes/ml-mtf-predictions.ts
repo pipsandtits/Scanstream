@@ -13,6 +13,7 @@
  */
 
 import { Router, Request, Response } from 'express';
+import { routeParam } from '../utils/route-params';
 import { multiTimeframeMLService } from '../services/multi-timeframe-ml-service';
 import { lstmBacktestEngine } from '../services/lstm-backtest-engine';
 
@@ -30,7 +31,7 @@ const router = Router();
  */
 router.get('/predictions/:symbol', async (req: Request, res: Response) => {
   try {
-    const { symbol } = req.params;
+    const symbol = routeParam(req.params.symbol, 'symbol', 64);
     const { timeframe, includeReasons } = req.query;
     const includeReasonsFlag = includeReasons !== 'false';
 
@@ -404,7 +405,7 @@ router.post('/backtest/run', async (req: Request, res: Response) => {
  */
 router.get('/confidence/:symbol', async (req: Request, res: Response) => {
   try {
-    const { symbol } = req.params;
+    const symbol = routeParam(req.params.symbol, 'symbol', 64);
 
     console.log(`[ML MTF API] Fetching confidence metrics for ${symbol}`);
 

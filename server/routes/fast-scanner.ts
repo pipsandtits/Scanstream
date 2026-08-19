@@ -5,6 +5,7 @@
 
 import express, { type Request, type Response } from 'express';
 import { fastScanner } from '../services/fast-scanner';
+import { routeParam } from '../utils/route-params';
 
 const router = express.Router();
 
@@ -66,7 +67,7 @@ router.get('/results', (req: Request, res: Response) => {
  */
 router.get('/symbol/:symbol', (req: Request, res: Response) => {
   try {
-    const { symbol } = req.params;
+    const symbol = routeParam(req.params.symbol, 'symbol', 64);
     const data = fastScanner.getSymbolData(symbol);
     
     if (!data.signal) {
@@ -120,4 +121,3 @@ router.get('/scan-status', (req: Request, res: Response) => {
  */
 
 export default router;
-

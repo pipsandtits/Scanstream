@@ -3,6 +3,7 @@
 import type { Express, Request, Response } from "express";
 import { storage } from "./storage";
 import { ChartJSNodeCanvas } from "chartjs-node-canvas";
+import { routeParam } from "./utils/route-params";
 
 // Helper to get chart data for a symbol
 export async function getChartData(symbol: string, limit: number = 100) {
@@ -25,7 +26,7 @@ export function registerChartApi(app: Express) {
   // Raw chart data endpoint
   console.log('Registering GET /api/chart-data/:symbol');
   app.get("/api/chart-data/:symbol", async (req: Request, res: Response) => {
-    const symbol = req.params.symbol;
+    const symbol = routeParam(req.params.symbol, 'symbol', 64);
     const limit = parseInt(req.query.limit as string) || 100;
     const data = await getChartData(symbol, limit);
     res.json(data);
@@ -34,7 +35,7 @@ export function registerChartApi(app: Express) {
   // Chart image endpoint (PNG)
   console.log('Registering GET /api/chart-image/:symbol');
   app.get("/api/chart-image/:symbol", async (req: Request, res: Response) => {
-    const symbol = req.params.symbol;
+    const symbol = routeParam(req.params.symbol, 'symbol', 64);
     const limit = parseInt(req.query.limit as string) || 100;
     const data = await getChartData(symbol, limit);
     const width = parseInt(req.query.width as string) || 800;

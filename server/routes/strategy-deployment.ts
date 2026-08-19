@@ -2,6 +2,7 @@
 import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { strategyDeploymentManager } from '../services/strategy-deployment-manager';
+import { routeParam } from '../utils/route-params';
 
 const router = Router();
 
@@ -46,7 +47,7 @@ router.post('/deploy', async (req: Request, res: Response) => {
  */
 router.post('/stop/:strategyId', (req: Request, res: Response) => {
   try {
-    const { strategyId } = req.params;
+    const strategyId = routeParam(req.params.strategyId, 'strategyId');
     const result = strategyDeploymentManager.stopStrategy(strategyId);
 
     res.json(result);
@@ -64,7 +65,7 @@ router.post('/stop/:strategyId', (req: Request, res: Response) => {
  */
 router.get('/status/:strategyId', (req: Request, res: Response) => {
   try {
-    const { strategyId } = req.params;
+    const strategyId = routeParam(req.params.strategyId, 'strategyId');
     const status = strategyDeploymentManager.getDeploymentStatus(strategyId);
 
     if (!status) {
@@ -107,7 +108,7 @@ router.get('/all', (req: Request, res: Response) => {
  */
 router.get('/mode/:mode', (req: Request, res: Response) => {
   try {
-    const { mode } = req.params;
+    const mode = routeParam(req.params.mode, 'mode', 32);
 
     if (!['backtest', 'paper', 'live'].includes(mode)) {
       return res.status(400).json({

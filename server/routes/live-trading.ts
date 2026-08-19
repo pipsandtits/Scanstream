@@ -7,6 +7,7 @@ import { systemKillSwitch } from '../services/system-kill-switch';
 import { liveCircuitBreaker } from '../services/live-circuit-breaker';
 import { auditOperatorAction } from '../middleware/audit-operator-action';
 import { safetyEventLog } from '../services/observability/safety-event-log';
+import { routeParam } from '../utils/route-params';
 
 const router = Router();
 
@@ -195,7 +196,7 @@ router.get('/positions', (_req: Request, res: Response) => {
  */
 router.post('/close/:positionId', requireTradingOperator, audit('close', (req) => String(req.params.positionId)), async (req: Request, res: Response) => {
   try {
-    const { positionId } = req.params;
+    const positionId = routeParam(req.params.positionId, 'positionId');
     const success = await liveTradingEngine.closePosition(positionId);
     
     if (success) {

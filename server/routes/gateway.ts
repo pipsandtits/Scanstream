@@ -16,6 +16,15 @@ import gatewayMetricsRouter from './gateway-metrics';
 import { SignalEngine, defaultTradingConfig } from '../trading-engine';
 import { signalPerformanceTracker } from '../services/signal-performance-tracker';
 import { generateModuleSignal, type ArmDetectionInput, type ModuleState } from '../services/arm-template';
+import { routeParam } from '../utils/route-params';
+
+interface GatewayFrame {
+  price?: { close?: number; high?: number; low?: number };
+  close?: number;
+  high?: number;
+  low?: number;
+  volume?: number;
+}
 
 
 const router = Router();
@@ -404,7 +413,7 @@ router.post('/cache/invalidate', (req: Request, res: Response) => {
  */
 router.get('/price/:symbol', async (req: Request, res: Response) => {
   try {
-    let symbol = req.params.symbol;
+    let symbol = routeParam(req.params.symbol, 'symbol', 64);
 
     // Handle URL-encoded slashes (BTC%2FUSDT -> BTC/USDT)
     symbol = decodeURIComponent(symbol).replace(/%2F/gi, '/');
@@ -418,8 +427,9 @@ router.get('/price/:symbol', async (req: Request, res: Response) => {
 
     res.json(priceData);
   } catch (error: any) {
-    console.error(`[Gateway] Price fetch error for ${req.params.symbol}:`, error.message);
-    res.status(500).json({ error: error.message, symbol: req.params.symbol });
+    const symbol = routeParam(req.params.symbol, 'symbol', 64);
+    console.error(`[Gateway] Price fetch error for ${symbol}:`, error.message);
+    res.status(500).json({ error: error.message, symbol });
   }
 });
 
@@ -428,7 +438,7 @@ router.get('/price/:symbol', async (req: Request, res: Response) => {
  */
 router.get('/ohlcv/:symbol', async (req: Request, res: Response) => {
   try {
-    let symbol = req.params.symbol;
+    let symbol = routeParam(req.params.symbol, 'symbol', 64);
 
     // Handle URL-encoded slashes
     symbol = decodeURIComponent(symbol).replace(/%2F/gi, '/');
@@ -544,8 +554,9 @@ router.get('/ohlcv/:symbol', async (req: Request, res: Response) => {
       data: dataWithIndicators
     });
   } catch (error: any) {
-    console.error(`[Gateway] OHLCV fetch error for ${req.params.symbol}:`, error.message);
-    res.status(500).json({ error: error.message, symbol: req.params.symbol });
+    const symbol = routeParam(req.params.symbol, 'symbol', 64);
+    console.error(`[Gateway] OHLCV fetch error for ${symbol}:`, error.message);
+    res.status(500).json({ error: error.message, symbol });
   }
 });
 
@@ -554,7 +565,7 @@ router.get('/ohlcv/:symbol', async (req: Request, res: Response) => {
  */
 router.get('/market-frames/:symbol', async (req: Request, res: Response) => {
   try {
-    const { symbol } = req.params;
+    const symbol = routeParam(req.params.symbol, 'symbol', 64);
     const { timeframe = '1m', limit = '100' } = req.query;
 
     const frames = await aggregator.getMarketFrames(
@@ -580,7 +591,7 @@ router.get('/market-frames/:symbol', async (req: Request, res: Response) => {
  */
 router.get('/dataframe/:symbol', async (req: Request, res: Response) => {
   try {
-    let symbol = req.params.symbol;
+    let symbol = routeParam(req.params.symbol, 'symbol', 64);
     symbol = decodeURIComponent(symbol).replace(/%2F/gi, '/');
 
     const { timeframe = '1h', limit = '100' } = req.query;
@@ -630,8 +641,8 @@ router.get('/dataframe/:symbol', async (req: Request, res: Response) => {
     });
 
     // Calculate indicators from raw OHLC data
-    const closes = frames.map(f => ((f.price as any)?.close || (f as any).close || 0));
-    const volumes = frames.map(f => f.volume || 0);
+    const closes: number[] = frames.map((f: GatewayFrame) => f.price?.close || f.close || 0);
+    const volumes: number[] = frames.map((f: GatewayFrame) => f.volume || 0);
 
     // Simple RSI calculation
     const rsi = calculateRSI(closes, 14);
@@ -875,7 +886,7 @@ router.get('/dataframe/:symbol', async (req: Request, res: Response) => {
  */
 router.get('/liquidity/:symbol', async (req: Request, res: Response) => {
   try {
-    let symbol = req.params.symbol;
+    let symbol = routeParam(req.params.symbol, 'symbol', 64);
     symbol = decodeURIComponent(symbol).replace(/%2F/gi, '/');
 
     const { amount } = req.query;
@@ -932,7 +943,7 @@ router.post('/liquidity/batch', async (req: Request, res: Response) => {
  */
 router.get('/gas/:chain', async (req: Request, res: Response) => {
   try {
-    const { chain } = req.params;
+    const chain = routeParam(req.params.chain, 'chain', 32);
     const gasPrice = await gasProvider.getGasPrice(chain || 'ethereum');
 
     res.json({
@@ -988,7 +999,7 @@ router.get('/alerts', (req: Request, res: Response) => {
  */
 router.post('/alerts/:id/acknowledge', (req: Request, res: Response) => {
   try {
-    const { id } = req.params;
+    const id = routeParam(req.params.id, 'id');
     const success = gatewayAlertSystem.acknowledgeAlert(id);
 
     res.json({ success, message: success ? 'Alert acknowledged' : 'Alert not found' });
@@ -1043,7 +1054,7 @@ router.get('/exchanges/status', (req: Request, res: Response) => {
  */
 router.post('/exchanges/:name/reset-rate-limit', (req: Request, res: Response) => {
   try {
-    const { name } = req.params;
+    const name = routeParam(req.params.name, 'name', 64);
     // This will be called automatically, but can be triggered manually
     console.log(`[Gateway] Manually resetting rate limit for ${name}`);
     
@@ -2000,7 +2011,7 @@ function createDataQualityStatus(quality: { score: number; reasons: string[]; su
  * Reset exchange health
  */
 router.post('/exchange/:name/reset', (req: Request, res: Response) => {
-  const { name } = req.params;
+  const name = routeParam(req.params.name, 'name', 64);
   aggregator.resetExchangeHealth(name);
   res.json({ success: true, message: `Exchange ${name} health reset` });
 });
@@ -2149,7 +2160,7 @@ router.get('/signals/performance/recent', (req: Request, res: Response) => {
  */
 router.get('/dataframe-validated/:symbol', async (req: Request, res: Response) => {
   try {
-    let symbol = req.params.symbol;
+    let symbol = routeParam(req.params.symbol, 'symbol', 64);
     symbol = decodeURIComponent(symbol).replace(/%2F/gi, '/');
 
     const { timeframe = '1h', limit = '100' } = req.query;
