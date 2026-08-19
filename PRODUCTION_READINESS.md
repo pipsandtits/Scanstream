@@ -171,9 +171,14 @@ that no longer exist and are not wired into the runner.
    `RISK_MAX_SYMBOL_EXPOSURE_USD`, `RISK_MAX_OPEN_POSITIONS`,
    `RISK_MAX_LEVERAGE`, `RISK_MAX_SIGNAL_AGE_MS`. Values above
    `HARD_LIMIT_CEILINGS` are clamped, not honoured.
-6. Ensure `data/` is on durable, writable storage — the kill switch and circuit
-   breaker persist there and fail closed if unreadable.
-7. Start in `testMode`/paper, verify signals and `executionBlocked` events, then
+6. Ensure `data/` is on durable, writable storage. Live execution state,
+   `realized-pnl-ledger.json`, `funding-accounting.json`, the kill switch,
+   circuit breaker and safety events persist there and fail closed if unreadable.
+7. For perpetual/swap markets, configure a working CCXT
+   `fetchFundingHistory` implementation. The only deliberate escape hatch is
+   `ALLOW_UNACCOUNTED_FUNDING=1`; setting it accepts unknown funding risk and
+   must be an explicitly documented operator decision.
+8. Start in `testMode`/paper, verify signals and `executionBlocked` events, then
    hand over to live with a small `RISK_MAX_TOTAL_EXPOSURE_USD`.
 
 ## 6. Monitoring (minimum)
@@ -186,6 +191,13 @@ that no longer exist and are not wired into the runner.
   intervene manually on the exchange.
 - `orderReconciliations.unknown` > 0 → an order may exist that the system does
   not know about; reconcile by hand.
+- `realized_pnl_unknown`, `realized_pnl_ledger_unreadable` or
+  `realized_pnl_persistence_failed` → daily loss is not provable; keep live
+  execution stopped until the ledger is repaired and reviewed.
+- `funding_unaccounted`, `funding_state_unreadable` or `funding_unknown` →
+  perpetual/swap funding is not provable; reconcile the venue history before
+  clearing the block. Treat `ALLOW_UNACCOUNTED_FUNDING=1` as an incident-level
+  exception, not normal operation.
 
 ## 7. Rollback and incident recovery
 
@@ -301,8 +313,8 @@ distinctions are unchanged.
 | Priority | Item |
 | --- | --- |
 | P0 | **Closed in Hardening Pass 3 Phase A:** local positions/orders are atomically persisted under `data/`, loaded before live exchange queries, and included in the startup reconciliation barrier |
-| P0 | Realized PnL/daily-loss do not yet consume the new fill+fee accounting end to end; `closePosition` does not record actual fills |
-| P0 | Funding is not accounted for at all — do not run funding-sensitive strategies |
+| P0 | **Closed in Hardening Pass 3 Phase B:** fill-aware close orders and durable realized PnL/daily-loss accounting are covered in §9.2 |
+| P0 | **Closed in Hardening Pass 3 Phase B:** funding accounting and the unknown-funding gate are covered in §9.3; venue support remains a Pass 4 item |
 | P1 | **Closed in Hardening Pass 3 Phase A:** `resume()` awaits startup and reports failure when durability, local state, initialization or reconciliation refuses the start |
 | P1 | Phase 2J/2K untouched: cache key uniqueness, TTL, invalidation, stampede and restart/corruption behaviour; replay/paper/live parity fixtures |
 | P1 | Phase 2Q failure-injection matrix only partially covered (durability, reconciliation, fills). Stale cache, operator stop mid-execution and concurrent flatten remain untested |
@@ -311,4 +323,89 @@ distinctions are unchanged.
 
 Scanstream is **not** production-ready for live capital on this branch. The
 direction of failure is now defensive — it refuses to trade when it cannot prove
-state — but §8.8 P0s mean it still cannot fully account for what it did.
+state — but the Pass 4 items in §9.5 and venue-specific validation remain open.
+
+## 9. Hardening Pass 3
+
+Pass 3 closes the restart-state and asynchronous-resume failures identified in
+§8.8, then carries fill-aware close accounting through daily loss and funding
+gates. It does not claim that venue-specific accounting or the wider
+production-readiness programme is complete.
+
+### 9.1 Phase A — durable local execution state
+
+The Phase A defect was that `this.orders` and `this.positions` were memory-only.
+After a process restart, startup reconciliation received empty local views and
+could pass vacuously: a locally open order missing from the exchange response or
+a locally known position absent from the exchange could not block trading.
+
+`durable-local-state.ts` now stores the local order and symbol-keyed position
+view under `data/live-execution-state.json` with schema-version metadata,
+written-at metadata, temp-file plus fsync plus rename persistence, and
+injectable test seams. Live startup loads it before any exchange query.
+`absent`, `ok` and `unreadable` are distinct outcomes; unreadable state and
+failed writes block live execution and create durable safety events. Client order
+IDs are persisted so ambiguous orders can be matched after restart.
+`resume()` awaits startup, durability and reconciliation instead of reporting
+success before asynchronous work finishes. Paper/test mode remains intentionally
+less strict.
+
+The review fixes in this phase also ensure a confirmed exchange order is still
+returned and emitted when its local persistence fails, unchanged order polls do
+not rewrite the state file, and exchange reconciliation updates the fill ledger
+instead of bypassing it.
+
+### 9.2 Phase B — fills, realized PnL and daily loss
+
+The remaining defect was that closing a position discarded the exchange response,
+deleted exposure on partial or ambiguous outcomes, and sent mark-price PnL to
+the RL callback. Close orders now carry client IDs, use reduce-only parameters
+when the loaded market is contract-based, retain their own fill account and
+fees, and reconcile ambiguous placement before any decision. Unknown outcomes
+retain the position and block execution. Confirmed partial fills reduce
+quantity; only a confirmed full fill removes the position.
+
+`realized-pnl-ledger.ts` computes long and short close PnL from entry cost basis
+and actual exit fills. Quote fees are subtracted. Non-quote fees remain
+unconverted and are reported separately, and unknown arithmetic remains null.
+The ledger is append-only by event ID, atomically persisted under
+`data/realized-pnl-ledger.json`, loaded before live exchange access, and treated
+as unknown if corrupt or unreadable. Daily loss uses ledger PnL and the more
+conservative of balance-derived and ledger-derived results; unknown daily PnL
+blocks live execution. The RL callback receives realized PnL or explicit null.
+
+### 9.3 Phase B — funding
+
+`funding-accounting.ts` queries CCXT `fetchFundingHistory` for swap/perpetual
+markets, persists payment IDs idempotently under
+`data/funding-accounting.json`, and feeds quote-currency payments into the
+realized ledger as a separate funding category. Unsupported methods, failed
+queries, unusable responses and unknown market type are unknown, not zero, and
+block live execution for contract markets. Spot markets do not require funding
+accounting. `ALLOW_UNACCOUNTED_FUNDING=1` is the sole deliberate escape hatch;
+it is recorded as an operator-visible safety event and must not be treated as a
+normal operating mode.
+
+### 9.4 Deliberately unimplemented
+
+This pass does not invent exchange rates for non-quote fees or non-quote funding,
+simulate funding, or claim venue support where a funding-history endpoint is
+absent. It does not add Prisma models, restore disabled route groups, or add
+operator authentication to `/api/execution`. The remaining work is tracked
+below rather than hidden by this pass.
+
+### 9.5 Pass 4
+
+| Priority | Item |
+| --- | --- |
+| P0 | Non-quote fee and funding conversion requires explicit, venue-backed pricing; no invented conversion is permitted |
+| P0 | Funding support on venues without a reliable funding-history endpoint |
+| P1 | Phase 2J/2K cache uniqueness, TTL, invalidation, stampede and restart/corruption work |
+| P1 | Replay/paper/live parity fixtures and full failure-injection coverage |
+| P1 | Per-route tests for the classified disabled groups and operator authentication for `/api/execution` |
+| P1 | Concurrent flatten, operator stop mid-execution and stale-cache failure-injection cases |
+| P2 | Legacy 362-error typecheck baseline classification, `(global as any)` handoffs and indicator cost measurement |
+
+Scanstream remains **not production-ready for live capital**. The hardening
+direction is fail-closed, but the Pass 4 items and venue-specific operational
+validation are still required.

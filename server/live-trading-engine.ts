@@ -37,6 +37,18 @@ import {
   DurableLocalStateStore,
   type LocalStateLoadResult,
 } from './services/execution/durable-local-state';
+import {
+  computeRealizedClosePnl,
+  RealizedPnlLedger,
+  type RealizedPnlLoadResult,
+  type RealizedPnlEntry,
+} from './services/execution/realized-pnl-ledger';
+import {
+  FundingAccounting,
+  type FundingAccountingResult,
+  type FundingLoadResult,
+} from './services/execution/funding-accounting';
+import type { RealizedPnlRiskInput } from './services/portfolio-risk-manager';
 
 // Small helper to bound a promise with a timeout. Returns null on timeout or error.
 async function promiseWithTimeout<T>(p: Promise<T>, ms: number): Promise<T | null> {
@@ -136,6 +148,10 @@ interface ExecutionConfig {
 export interface LiveTradingEngineDependencies {
   localStateStore?: DurableLocalStateStore;
   localStatePath?: string;
+  realizedPnlLedger?: RealizedPnlLedger;
+  realizedPnlLedgerPath?: string;
+  fundingAccounting?: FundingAccounting;
+  fundingAccountingPath?: string;
   clock?: () => number;
 }
 
@@ -167,6 +183,14 @@ export class LiveTradingEngine extends EventEmitter {
   private localStateStatus: LocalStateLoadResult['status'] = 'absent';
   private localStateLoaded = false;
   private localStatePersistenceHealthy = true;
+  private readonly realizedPnlLedger: RealizedPnlLedger;
+  private readonly fundingAccounting: FundingAccounting;
+  private realizedPnlStatus: RealizedPnlLoadResult['status'] = 'absent';
+  private fundingStatus: FundingLoadResult['status'] = 'absent';
+  private realizedPnlLoaded = false;
+  private fundingLoaded = false;
+  private realizedPnlHealthy = true;
+  private fundingHealthy = true;
 
   constructor(config?: Partial<ExecutionConfig>, dependencies: LiveTradingEngineDependencies = {}) {
     super();
@@ -183,6 +207,14 @@ export class LiveTradingEngine extends EventEmitter {
     };
     this.localStateStore = dependencies.localStateStore ?? new DurableLocalStateStore({
       filePath: dependencies.localStatePath,
+      clock: dependencies.clock,
+    });
+    this.realizedPnlLedger = dependencies.realizedPnlLedger ?? new RealizedPnlLedger({
+      filePath: dependencies.realizedPnlLedgerPath,
+      clock: dependencies.clock,
+    });
+    this.fundingAccounting = dependencies.fundingAccounting ?? new FundingAccounting({
+      filePath: dependencies.fundingAccountingPath,
       clock: dependencies.clock,
     });
 
@@ -435,6 +467,162 @@ export class LiveTradingEngine extends EventEmitter {
     }
   }
 
+  private loadRealizedPnlLedger(): boolean {
+    const result = this.realizedPnlLedger.load();
+    this.realizedPnlStatus = result.status;
+    if (result.status === 'absent' || result.status === 'ok') {
+      this.realizedPnlLoaded = true;
+      this.realizedPnlHealthy = true;
+      return true;
+    }
+
+    this.realizedPnlHealthy = false;
+    recordExecutionBlocked('realized_pnl_ledger_unreadable');
+    safetyEventLog.record({
+      type: 'durability_failure',
+      detail: `realized PnL ledger unreadable: ${result.reason}`,
+      data: { stateFile: this.realizedPnlLedger.getPath() },
+    });
+    this.emit('executionBlocked', {
+      type: 'realized_pnl',
+      reason: 'realized_pnl_ledger_unreadable',
+      detail: result.reason,
+      timestamp: Date.now(),
+    });
+    this.emit('startRefused', {
+      reason: 'realized_pnl_ledger_unreadable',
+      detail: result.reason,
+    });
+    return false;
+  }
+
+  private loadFundingState(): boolean {
+    const result = this.fundingAccounting.load();
+    this.fundingStatus = result.status;
+    if (result.status === 'absent' || result.status === 'ok') {
+      this.fundingLoaded = true;
+      this.fundingHealthy = true;
+      return true;
+    }
+
+    this.fundingHealthy = false;
+    recordExecutionBlocked('funding_state_unreadable');
+    safetyEventLog.record({
+      type: 'durability_failure',
+      detail: `funding state unreadable: ${result.reason}`,
+      data: { stateFile: this.fundingAccounting.getPath() },
+    });
+    this.emit('executionBlocked', {
+      type: 'funding',
+      reason: 'funding_state_unreadable',
+      detail: result.reason,
+      timestamp: Date.now(),
+    });
+    this.emit('startRefused', {
+      reason: 'funding_state_unreadable',
+      detail: result.reason,
+    });
+    return false;
+  }
+
+  private blockForExecution(reason: string, detail?: string, data?: Record<string, unknown>): void {
+    recordExecutionBlocked(reason);
+    safetyEventLog.record({
+      type: 'execution_blocked',
+      detail: detail ?? reason,
+      data,
+    });
+    this.emit('executionBlocked', {
+      type: 'execution_safety',
+      reason,
+      detail,
+      timestamp: Date.now(),
+      ...data,
+    });
+  }
+
+  private realizedPnlInput(): RealizedPnlRiskInput {
+    const summary = this.realizedPnlLedger.summary();
+    return {
+      dailyPnl: summary.pnl,
+      unknown: summary.unknown,
+      unconvertedFees: summary.unconvertedFees,
+    };
+  }
+
+  private quoteCurrency(symbol: string): string | null {
+    const quote = symbol.split('/')[1]?.split(':')[0];
+    return quote ? quote.toUpperCase() : null;
+  }
+
+  private async ensureFundingAccounted(symbol: string): Promise<boolean> {
+    if (!this.fundingLoaded || !this.fundingHealthy) {
+      this.blockForExecution('funding_state_unreadable', 'funding state is not trustworthy', {
+        symbol,
+      });
+      return false;
+    }
+
+    let result: FundingAccountingResult;
+    try {
+      result = await this.fundingAccounting.reconcile(this.exchange, symbol);
+    } catch (error: any) {
+      result = {
+        status: 'unknown',
+        reason: error?.message ? String(error.message) : 'funding accounting failed',
+        payments: [],
+      };
+    }
+
+    if (result.status === 'not_required') return true;
+
+    const quoteCurrency = this.quoteCurrency(symbol);
+    for (const payment of result.payments) {
+      const isQuote = quoteCurrency !== null && payment.currency === quoteCurrency;
+      const entry: RealizedPnlEntry = {
+        id: `funding:${payment.id}`,
+        category: 'funding',
+        at: new Date(payment.timestamp).toISOString(),
+        symbol: payment.symbol,
+        quoteCurrency: quoteCurrency ?? payment.currency,
+        pnl: isQuote ? payment.amount : null,
+        grossPnl: isQuote ? payment.amount : null,
+        quoteFees: 0,
+        unconvertedFees: isQuote ? [] : [{ currency: payment.currency, cost: Math.abs(payment.amount) }],
+        fundingAmount: payment.amount,
+        fundingCurrency: payment.currency,
+      };
+      try {
+        this.realizedPnlLedger.append(entry);
+      } catch (error: any) {
+        this.realizedPnlHealthy = false;
+        this.blockForExecution('realized_pnl_persistence_failed', error?.message, {
+          symbol,
+          entryId: entry.id,
+        });
+        return false;
+      }
+    }
+
+    if (result.status === 'known') return true;
+    if (process.env.ALLOW_UNACCOUNTED_FUNDING === '1') {
+      safetyEventLog.record({
+        type: 'funding_unknown',
+        detail: 'unaccounted funding explicitly allowed by operator',
+        data: { symbol, reason: result.reason },
+      });
+      return true;
+    }
+
+    this.blockForExecution('funding_unaccounted', result.reason, { symbol });
+    safetyEventLog.record({
+      type: 'funding_unknown',
+      detail: result.reason,
+      data: { symbol },
+    });
+    return false;
+  }
+
   /**
    * Start live trading engine
    */
@@ -448,6 +636,12 @@ export class LiveTradingEngine extends EventEmitter {
 
     if (!this.config.testMode && !this.loadLocalState()) {
       throw new Error('Cannot start live trading: local execution state is unreadable');
+    }
+    if (!this.config.testMode && !this.loadRealizedPnlLedger()) {
+      throw new Error('Cannot start live trading: realized PnL ledger is unreadable');
+    }
+    if (!this.config.testMode && !this.loadFundingState()) {
+      throw new Error('Cannot start live trading: funding state is unreadable');
     }
 
     // Live trading without durable persistence would leave real exchange
@@ -543,6 +737,15 @@ export class LiveTradingEngine extends EventEmitter {
       return null;
     }
     if (!this.config.testMode && !this.localStateLoaded && !this.loadLocalState()) return null;
+    if (!this.config.testMode && !this.realizedPnlLoaded && !this.loadRealizedPnlLedger()) return null;
+    if (!this.config.testMode && !this.fundingLoaded && !this.loadFundingState()) return null;
+    if (!this.config.testMode && !this.realizedPnlHealthy) {
+      this.blockForExecution('realized_pnl_persistence_failed', 'realized PnL ledger is not healthy', {
+        symbol: signal.symbol,
+        signalId: signal.id,
+      });
+      return null;
+    }
 
     if (!this.exchange) {
       logger.info('Engine not initialized');
@@ -593,6 +796,10 @@ export class LiveTradingEngine extends EventEmitter {
         signalId: signal.id,
         timestamp: Date.now(),
       });
+      return null;
+    }
+
+    if (!this.config.testMode && !(await this.ensureFundingAccounted(signal.symbol))) {
       return null;
     }
 
@@ -649,7 +856,15 @@ export class LiveTradingEngine extends EventEmitter {
       if (typeof fetched === 'number') accountBalance = fetched;
 
       const limits = portfolioRiskManager.getLimits();
-      const metrics = portfolioRiskManager.getPortfolioMetrics(accountBalance);
+      const realizedInput = this.realizedPnlInput();
+      if (realizedInput.dailyPnl === null || realizedInput.unknown) {
+        this.blockForExecution('realized_pnl_unknown', 'daily realized PnL is unknown', {
+          symbol: signal.symbol,
+          signalId: signal.id,
+        });
+        return null;
+      }
+      const metrics = portfolioRiskManager.getPortfolioMetrics(accountBalance, realizedInput);
 
       if (metrics.dailyPnlPercent < -limits.maxDailyLoss) {
         const reason = `dailyLoss:${metrics.dailyPnlPercent.toFixed(2)}%`;
@@ -662,7 +877,7 @@ export class LiveTradingEngine extends EventEmitter {
           symbol: signal.symbol,
           accountBalance,
           limits,
-          metrics
+          metrics,
         });
         return null;
       }
@@ -678,7 +893,7 @@ export class LiveTradingEngine extends EventEmitter {
           symbol: signal.symbol,
           accountBalance,
           limits,
-          metrics
+          metrics,
         });
         return null;
       }
@@ -760,7 +975,8 @@ export class LiveTradingEngine extends EventEmitter {
           signal.price || 0,
           atr,
           'TRENDING',
-          ''
+          '',
+          this.realizedPnlInput()
         );
 
         if (!consensus.approved || consensus.finalSize <= 0) {
@@ -1169,8 +1385,20 @@ export class LiveTradingEngine extends EventEmitter {
         logger.warn('Failed to add position to PortfolioRiskManager', pmErr);
       }
       this.orders.set(liveOrder.id, liveOrder);
-      if (!this.persistLocalState()) return null;
+      const persisted = this.persistLocalState();
       this.emit('orderPlaced', liveOrder);
+      if (!persisted) {
+        safetyEventLog.record({
+          type: 'execution_blocked',
+          detail: 'order placed but local exposure could not be durably recorded',
+          data: {
+            orderId: liveOrder.id,
+            exchangeOrderId: liveOrder.exchangeOrderId,
+            symbol: liveOrder.symbol,
+            unrecordableExposure: true,
+          },
+        });
+      }
 
       // Detect potential self-influencing trades (feedback loop) and tag audit
       try {
@@ -1207,19 +1435,21 @@ export class LiveTradingEngine extends EventEmitter {
       this.consecutiveFailures = 0;
 
       // Place stop-loss and take-profit orders; collect any extra reservations for multi-leg orders
-      let childPlacementOk = true;
-      try {
-        if (signal.stopLoss) {
-          const ok = await this.placeStopLoss(signal.symbol, signal.type, amount, signal.stopLoss, reservationTokens, signal.symbol);
-          if (!ok) childPlacementOk = false;
+      let childPlacementOk = persisted;
+      if (persisted) {
+        try {
+          if (signal.stopLoss) {
+            const ok = await this.placeStopLoss(signal.symbol, signal.type, amount, signal.stopLoss, reservationTokens, signal.symbol);
+            if (!ok) childPlacementOk = false;
+          }
+          if (signal.takeProfit) {
+            const ok = await this.placeTakeProfit(signal.symbol, signal.type, amount, signal.takeProfit, reservationTokens, signal.symbol);
+            if (!ok) childPlacementOk = false;
+          }
+        } catch (childErr) {
+          logger.warn('Child order placement error', childErr);
+          childPlacementOk = false;
         }
-        if (signal.takeProfit) {
-          const ok = await this.placeTakeProfit(signal.symbol, signal.type, amount, signal.takeProfit, reservationTokens, signal.symbol);
-          if (!ok) childPlacementOk = false;
-        }
-      } catch (childErr) {
-        logger.warn('Child order placement error', childErr);
-        childPlacementOk = false;
       }
 
       // Commit or release all reservations based on child placements
@@ -1677,11 +1907,15 @@ export class LiveTradingEngine extends EventEmitter {
           ? localByClientId.get(String(exchangeOrder.clientOrderId))
           : undefined);
       if (!local) continue;
+      const before = JSON.stringify(local);
       local.exchangeOrderId = exchangeOrder.exchangeOrderId;
-      local.status = exchangeOrder.status as LiveOrder['status'];
-      local.filled = exchangeOrder.filled;
-      local.remaining = exchangeOrder.remaining;
-      stateMutated = true;
+      await this.applyOrderSnapshot(local, {
+        status: exchangeOrder.status,
+        filled: exchangeOrder.filled,
+        average: local.avgPrice,
+        cost: local.cost,
+      });
+      stateMutated = stateMutated || before !== JSON.stringify(local);
     }
 
     // Adopting exchange positions is idempotent: keyed by symbol, replacing
@@ -1795,8 +2029,20 @@ export class LiveTradingEngine extends EventEmitter {
    */
   private async applyOrderSnapshot(order: LiveOrder, snapshot: any): Promise<void> {
     const logger = new ModuleLogger('LiveTrading');
+    const previousLocalState = JSON.stringify({
+      account: order.account,
+      filled: order.filled,
+      cost: order.cost,
+      remaining: order.remaining,
+      avgPrice: order.avgPrice,
+      fees: order.fees,
+      fee: order.fee,
+      slippagePct: order.slippagePct,
+      outcome: order.outcome,
+      status: order.status,
+      exchangeOrderId: order.exchangeOrderId,
+    });
     const previousFilled = order.filled;
-    const previousStatus = order.status;
 
     if (!order.account) order.account = createFillAccount();
 
@@ -1855,8 +2101,20 @@ export class LiveTradingEngine extends EventEmitter {
     order.status = (typeof snapshot?.status === 'string' ? snapshot.status : order.status) as LiveOrder['status'];
 
     const filledDelta = order.filled - previousFilled;
-    if (filledDelta === 0 && order.status === previousStatus) {
-      this.persistLocalState();
+    const currentLocalState = JSON.stringify({
+      account: order.account,
+      filled: order.filled,
+      cost: order.cost,
+      remaining: order.remaining,
+      avgPrice: order.avgPrice,
+      fees: order.fees,
+      fee: order.fee,
+      slippagePct: order.slippagePct,
+      outcome: order.outcome,
+      status: order.status,
+      exchangeOrderId: order.exchangeOrderId,
+    });
+    if (previousLocalState === currentLocalState) {
       return;
     }
 
@@ -1927,47 +2185,208 @@ export class LiveTradingEngine extends EventEmitter {
     const position = this.positions.get(positionId);
     if (!position || !this.exchange) return false;
 
+    const side = position.side === 'long' ? 'sell' : 'buy';
+    const clientOrderId = buildClientOrderId('ssclose', positionId);
+    let exchangeOrder: any;
     try {
-      const side = position.side === 'long' ? 'sell' : 'buy';
-      await this.exchange.createOrder(
+      const params: Record<string, unknown> = {
+        clientOrderId,
+        newClientOrderId: clientOrderId,
+      };
+      const market = (this.exchange as any).markets?.[position.symbol];
+      const defaultType = String((this.exchange as any).options?.defaultType ?? '').toLowerCase();
+      if (
+        market?.type === 'swap' ||
+        market?.type === 'future' ||
+        market?.contract === true ||
+        /swap|future|perpetual/.test(defaultType)
+      ) {
+        params.reduceOnly = true;
+      }
+      exchangeOrder = await this.exchange.createOrder(
         position.symbol,
         'market',
         side,
-        position.quantity
+        position.quantity,
+        undefined,
+        params,
       );
+    } catch (error) {
+      if (isAmbiguousError(error)) {
+        const reconciliation = await reconcileByClientOrderId(
+          this.exchange,
+          position.symbol,
+          clientOrderId,
+        );
+        recordOrderReconciliation(reconciliation.state);
+        safetyEventLog.record({
+          type: reconciliation.state === 'unknown' ? 'order_state_unknown' : 'order_reconciled',
+          detail: `close order ${reconciliation.state}`,
+          data: { positionId, symbol: position.symbol, clientOrderId },
+        });
+        if (reconciliation.state === 'exists') {
+          exchangeOrder = reconciliation.order;
+        } else {
+          if (reconciliation.state === 'unknown') {
+            this.blockForExecution('close_order_state_unknown', 'close placement outcome could not be reconciled', {
+              positionId,
+              symbol: position.symbol,
+              clientOrderId,
+            });
+          }
+          return false;
+        }
+      } else {
+        const fe = formatError(error);
+        console.error('[Live Trading] Failed to close position:', fe.message, { stack: fe.stack });
+        return false;
+      }
+    }
 
+    const closeOrder: LiveOrder = {
+      id: typeof randomUUID === 'function' ? randomUUID() : `close-${Date.now()}`,
+      exchangeOrderId: String(exchangeOrder?.id ?? exchangeOrder?.orderId ?? clientOrderId),
+      clientOrderId,
+      symbol: position.symbol,
+      side,
+      type: 'market',
+      price: Number.isFinite(Number(exchangeOrder?.price)) ? Number(exchangeOrder.price) : position.currentPrice,
+      amount: position.quantity,
+      status: (typeof exchangeOrder?.status === 'string' ? exchangeOrder.status : 'open') as LiveOrder['status'],
+      filled: 0,
+      remaining: position.quantity,
+      cost: 0,
+      requestedPrice: position.currentPrice,
+      slippagePct: null,
+      timestamp: Date.now(),
+      account: this.buildInitialFillAccount(exchangeOrder, position.quantity),
+    };
+    closeOrder.filled = closeOrder.account?.filled ?? 0;
+    closeOrder.cost = closeOrder.account?.cost ?? 0;
+    closeOrder.remaining = closeOrder.account?.remaining ?? position.quantity;
+    closeOrder.avgPrice = closeOrder.account?.avgPrice ?? null;
+    closeOrder.fees = closeOrder.account?.fees ?? [];
+    closeOrder.fee = closeOrder.fees[0] ? { ...closeOrder.fees[0] } : undefined;
+    if (
+      this.config.testMode &&
+      closeOrder.filled === 0 &&
+      !exchangeOrder?.status &&
+      !Array.isArray(exchangeOrder?.trades)
+    ) {
+      closeOrder.filled = position.quantity;
+      closeOrder.remaining = 0;
+      closeOrder.cost = position.quantity * (closeOrder.price ?? position.currentPrice);
+      closeOrder.avgPrice = closeOrder.price ?? position.currentPrice;
+      closeOrder.account = {
+        ...(closeOrder.account ?? createFillAccount()),
+        filled: closeOrder.filled,
+        cost: closeOrder.cost,
+        avgPrice: closeOrder.avgPrice,
+        remaining: 0,
+      };
+      closeOrder.status = 'closed';
+    }
+    closeOrder.outcome = classifyOutcome(closeOrder.status, closeOrder.account ?? createFillAccount(), closeOrder.amount);
+    closeOrder.slippagePct = computeSlippagePct(closeOrder.requestedPrice ?? null, closeOrder.avgPrice ?? null, side);
+    this.orders.set(closeOrder.id, closeOrder);
+    position.orders = [...(position.orders ?? []), closeOrder];
+
+    const filled = Math.min(position.quantity, Math.max(0, closeOrder.filled));
+    const remaining = Math.max(0, position.quantity - filled);
+    let realized: ReturnType<typeof computeRealizedClosePnl> | null = null;
+    if (filled > 0) {
+      realized = computeRealizedClosePnl({
+        side: position.side,
+        entryPrice: position.entryPrice,
+        exitPrice: closeOrder.avgPrice ?? null,
+        quantity: filled,
+        fees: closeOrder.fees ?? [],
+        quoteCurrency: this.quoteCurrency(position.symbol),
+      });
+      const entry: RealizedPnlEntry = {
+        id: `trade-close:${closeOrder.exchangeOrderId}`,
+        category: 'trade',
+        at: new Date(Date.now()).toISOString(),
+        symbol: position.symbol,
+        quoteCurrency: this.quoteCurrency(position.symbol) ?? 'UNKNOWN',
+        pnl: realized.pnl,
+        grossPnl: realized.grossPnl,
+        quoteFees: realized.quoteFees,
+        unconvertedFees: realized.unconvertedFees,
+        quantity: filled,
+        entryPrice: position.entryPrice,
+        exitPrice: closeOrder.avgPrice,
+      };
+      try {
+        this.realizedPnlLedger.append(entry);
+      } catch (ledgerError: any) {
+        this.realizedPnlHealthy = false;
+        this.blockForExecution('realized_pnl_persistence_failed', ledgerError?.message, {
+          positionId,
+          symbol: position.symbol,
+          entryId: entry.id,
+        });
+      }
+    }
+
+    if (remaining <= Math.max(1e-12, position.quantity * 1e-9)) {
       this.positions.delete(positionId);
-      if (!this.persistLocalState()) return false;
-      this.emit('positionClosed', position);
-
-      // Remove from portfolio risk manager
       try {
         portfolioRiskManager.removePosition(position.symbol);
       } catch (pmErr) {
         console.warn('[Live Trading] Failed to remove position from PortfolioRiskManager', pmErr);
       }
-      //  RL CALLBACK: Calculate rewards and trigger learning
+      this.emit('positionClosed', position);
+    } else if (filled > 0) {
+      position.quantity = remaining;
+      position.currentPrice = closeOrder.avgPrice ?? position.currentPrice;
+      position.pnl = position.side === 'long'
+        ? (position.currentPrice - position.entryPrice) * remaining
+        : (position.entryPrice - position.currentPrice) * remaining;
+      position.pnlPercent = position.entryPrice > 0
+        ? (position.pnl / (position.entryPrice * remaining)) * 100
+        : 0;
+      this.positions.set(positionId, position);
+      this.emit('positionPartiallyClosed', {
+        position,
+        order: closeOrder,
+        filled,
+        remaining,
+      });
+    }
+
+    const persisted = this.persistLocalState();
+    if (!persisted) {
+      safetyEventLog.record({
+        type: 'execution_blocked',
+        detail: 'close order outcome known but local exposure could not be durably recorded',
+        data: { positionId, symbol: position.symbol, unrecordableExposure: true },
+      });
+    }
+
+    if (filled > 0) {
       try {
         RLFeedbackCallbacks.onTradeClose(positionId, {
-          exitPrice: position.currentPrice,
+          exitPrice: closeOrder.avgPrice ?? null,
           exitTime: new Date(),
-          exitReason: 'MANUAL',
-          pnl: position.pnl,
-          pnlPercent: position.pnlPercent,
+          exitReason: remaining > 0 ? 'PARTIAL' : 'MANUAL',
+          pnl: realized?.pnl ?? null,
+          pnlPercent: realized?.pnl !== null && realized?.pnl !== undefined && position.entryPrice > 0
+            ? (realized.pnl / (position.entryPrice * filled)) * 100
+            : null,
+          pnlUnknown: realized?.pnl === null || realized === null,
           maxProfit: 0,
-          maxLoss: 0
+          maxLoss: 0,
         });
       } catch (rlError) {
         console.warn(`[Live Trading] RL onTradeClose callback error: ${rlError}`);
       }
-      
-      console.log(`[Live Trading] Position closed: ${position.symbol}`);
-      return true;
-    } catch (error) {
-      const fe = formatError(error);
-      console.error('[Live Trading] Failed to close position:', fe.message, { stack: fe.stack });
+    }
+
+    if (filled <= 0 || remaining > Math.max(1e-12, position.quantity * 1e-9)) {
       return false;
     }
+    return persisted;
   }
 
   /**

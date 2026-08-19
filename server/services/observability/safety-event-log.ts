@@ -29,6 +29,7 @@ export type SafetyEventType =
   | 'kill_switch'
   | 'circuit_breaker'
   | 'durability_failure'
+  | 'funding_unknown'
   | 'operator_action';
 
 export type OperatorAction =
