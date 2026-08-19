@@ -29,6 +29,9 @@ export type SafetyEventType =
   | 'kill_switch'
   | 'circuit_breaker'
   | 'durability_failure'
+  | 'funding_unknown'
+  | 'funding_baseline_resolved'
+  | 'realized_pnl_resolved'
   | 'operator_action';
 
 export type OperatorAction =
@@ -43,7 +46,9 @@ export type OperatorAction =
   | 'kill_switch_activate'
   | 'kill_switch_clear'
   | 'circuit_breaker_activate'
-  | 'circuit_breaker_clear';
+  | 'circuit_breaker_clear'
+  | 'resolve_realized_pnl'
+  | 'resolve_funding_baseline';
 
 export interface SafetyEvent {
   type: SafetyEventType;

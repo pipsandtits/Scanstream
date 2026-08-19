@@ -109,6 +109,73 @@ router.post('/config', requireTradingOperator, audit('config', (req) => Object.k
   }
 });
 
+router.post(
+  '/realized-pnl/:entryId/resolve',
+  requireTradingOperator,
+  audit('resolve_realized_pnl', (req) => String(req.params.entryId)),
+  (req: Request, res: Response) => {
+    const entryId = String(req.params.entryId || '');
+    const body = req.body ?? {};
+    if (!entryId || entryId === '*' || entryId.includes('*')) {
+      return res.status(400).json({ success: false, error: 'A specific realized PnL entry ID is required' });
+    }
+    const reason = typeof body.reason === 'string' ? body.reason.trim() : '';
+    if (!reason) return res.status(400).json({ success: false, error: 'Resolution reason is required' });
+
+    let resolution:
+      | { kind: 'attested_value'; pnl: number; reason: string }
+      | { kind: 'excluded_unknown'; reason: string };
+    if (body.resolution === 'attested_value') {
+      const pnl = Number(body.pnl);
+      if (!Number.isFinite(pnl)) {
+        return res.status(400).json({ success: false, error: 'A finite pnl attestation is required' });
+      }
+      resolution = { kind: 'attested_value', pnl, reason };
+    } else if (body.resolution === 'excluded_unknown') {
+      if (body.pnl !== undefined) {
+        return res.status(400).json({ success: false, error: 'excluded_unknown cannot include pnl' });
+      }
+      resolution = { kind: 'excluded_unknown', reason };
+    } else {
+      return res.status(400).json({
+        success: false,
+        error: 'resolution must be attested_value or excluded_unknown',
+      });
+    }
+
+    try {
+      const entry = liveTradingEngine.resolveRealizedPnlEntry(entryId, resolution);
+      return res.json({ success: true, entry });
+    } catch (error: any) {
+      const message = error?.message ? String(error.message) : 'Unable to resolve realized PnL entry';
+      const status = message.includes('not found') ? 404 : 409;
+      return res.status(status).json({ success: false, error: message });
+    }
+  }
+);
+
+router.post(
+  '/funding/attest',
+  requireTradingOperator,
+  audit('resolve_funding_baseline', (req) => String(req.body?.symbol ?? '')),
+  (req: Request, res: Response) => {
+    const body = req.body ?? {};
+    const symbol = typeof body.symbol === 'string' ? body.symbol.trim() : '';
+    const reason = typeof body.reason === 'string' ? body.reason.trim() : '';
+    if (!symbol || symbol === '*' || symbol.includes('*')) {
+      return res.status(400).json({ success: false, error: 'A specific funding symbol is required' });
+    }
+    if (!reason) return res.status(400).json({ success: false, error: 'Baseline reason is required' });
+    try {
+      liveTradingEngine.resolveFundingBaseline(symbol, reason);
+      return res.json({ success: true, symbol });
+    } catch (error: any) {
+      const message = error?.message ? String(error.message) : 'Unable to attest funding baseline';
+      return res.status(409).json({ success: false, error: message });
+    }
+  }
+);
+
 /**
  * GET /api/live-trading/positions
  * Get open positions
