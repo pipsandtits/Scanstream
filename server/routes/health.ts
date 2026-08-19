@@ -36,12 +36,10 @@ router.get('/', async (req: Request, res: Response) => {
     // Get backtest stats
     const backtestStats = backtester.getStats();
 
-    // Check data freshness (this would be integrated with actual data fetcher)
-    const dataFreshness = {
-      lastUpdate: Date.now(),
-      stale: false,
-      age: 0 // milliseconds
-    };
+    // Data freshness is not tracked by this router. It reports `null` rather
+    // than a fabricated "fresh" value, which would let an operator believe
+    // market data is current when nothing has verified that.
+    const dataFreshness = null;
 
     // Determine overall health status
     const errorRateLastHour = errorSummary.totalErrors < 10 ? 'healthy' : 'degraded';
@@ -68,9 +66,10 @@ router.get('/', async (req: Request, res: Response) => {
         responseTimeMs: Date.now() - startTime
       },
       exchanges: {
-        status: 'monitoring',
-        connectedExchanges: 6, // binance, coinbase, kraken, kucoinfutures, okx, bybit
-        dataFreshness
+        status: 'unknown',
+        connectedExchanges: null,
+        dataFreshness,
+        detail: 'exchange connectivity is not probed by this endpoint',
       },
       models: {
         ready: modelReady,
@@ -156,30 +155,26 @@ router.get('/detailed', (req: Request, res: Response) => {
  */
 router.get('/exchanges', (req: Request, res: Response) => {
   try {
-    const exchanges = [
-      { name: 'binance', status: 'geo-restricted' },
-      { name: 'coinbase', status: 'active' },
-      { name: 'kraken', status: 'active' },
-      { name: 'kucoinfutures', status: 'active' },
-      { name: 'okx', status: 'active' },
-      { name: 'bybit', status: 'geo-restricted' }
-    ];
-
+    // Per-exchange status was previously a hardcoded list claiming exchanges
+    // were "active" without ever contacting them. Only the error counts here
+    // are observed, so status is reported as unknown.
     const errorSummary = errorLogger.getErrorSummary();
+    const exchanges = ['binance', 'coinbase', 'kraken', 'kucoinfutures', 'okx', 'bybit'];
 
-    const exchangeHealth = exchanges.map(ex => ({
-      ...ex,
-      errors: errorSummary.errorsByExchange[ex.name] || 0,
-      lastCheck: Date.now()
+    const exchangeHealth = exchanges.map(name => ({
+      name,
+      status: 'unknown',
+      errors: errorSummary.errorsByExchange[name] || 0,
+      lastCheck: null,
     }));
 
     res.json({
       success: true,
       exchanges: exchangeHealth,
       summary: {
-        active: exchangeHealth.filter(e => e.status === 'active').length,
-        restricted: exchangeHealth.filter(e => e.status === 'geo-restricted').length,
-        errors: exchangeHealth.reduce((sum, e) => sum + e.errors, 0)
+        probed: false,
+        errors: exchangeHealth.reduce((sum, e) => sum + e.errors, 0),
+        detail: 'connectivity is not probed here; see /api/health/readiness for live-trading gates',
       },
       timestamp: new Date().toISOString()
     });

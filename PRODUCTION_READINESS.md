@@ -194,3 +194,115 @@ that no longer exist and are not wired into the runner.
   `/api/live-trading/status` before clearing the kill switch — there is no
   automatic startup reconciliation yet (see §4). Clear the breaker, then resume
   explicitly; resume is refused while either control is active.
+
+---
+
+## 8. Hardening Pass 2
+
+Pass 2 targets the question "after a crash, timeout, partial fill, restart,
+duplicate event or exchange failure, can Scanstream determine what actually
+happened and refuse to trade until it knows?". Everything below is code plus
+tests in this branch; the phases listed as outstanding are *not* done.
+
+### 8.1 Durable state is now a hard precondition for live execution
+
+`server/services/execution/durability-gate.ts` is checked before live start,
+before resume and immediately before every live order. Without `DATABASE_URL`,
+or when a probe of the database fails, live paths fail closed
+(`executionBlocked` with `durable_state_unavailable`) and a durable
+`durability_failure` event is recorded. `testMode`/paper deliberately still runs
+on the in-memory store. Failed durable writes invalidate the cached probe, so a
+database lost *after* startup stops execution rather than being discovered later.
+
+This closes the first P0 in §4: the gap was previously only *reported* by
+readiness, never enforced. Readiness alone is still not a safety control.
+
+### 8.2 Fill, fee and slippage accounting
+
+`server/services/execution/fill-accounting.ts` accumulates fills per order:
+duplicate fill IDs are idempotent, partial and late fills accumulate, average
+execution price is cost-weighted, remaining quantity is explicit, maker and taker
+volume are separated, and fees are kept **per currency**. Non-quote fees are
+returned as `unconvertedFees` rather than converted with an invented rate.
+Slippage is computed from requested versus achieved price and is `null` when
+unknown. Cancelled-but-partially-filled orders keep their exposure.
+
+Funding is **not** implemented and is not simulated anywhere.
+
+### 8.3 Positions and risk
+
+Positions are keyed by symbol, so repeated refreshes cannot duplicate exposure.
+Exposure uses notional (`|qty| * price`) rather than margin alone. An exchange
+response that is incomplete, unusable or failed never silently erases local
+exposure — only an explicit flat position removes it.
+
+### 8.4 Startup reconciliation barrier
+
+`server/services/execution/startup-reconciler.ts` queries balances, positions and
+open orders, diffs them against local state, and returns a report. Live start and
+live order creation are refused unless the report is `complete`. Unknown exchange
+positions are adopted; unknown open orders, locally-open orders missing from the
+exchange, and any query failure block trading. Reconciliation is idempotent.
+Conservative by design: an order missing from the open-order response is
+*unknown*, never inferred as filled or cancelled.
+
+### 8.5 Operator audit trail and durable safety events
+
+`server/services/observability/safety-event-log.ts` appends JSONL to
+`data/safety-events.jsonl` (8 MB rotation, one previous generation) so blocked
+executions, rejected candles, unknown order states, flatten-all outcomes, kill
+switch/breaker transitions, reconciliation results and durability failures
+survive restart. `server/middleware/audit-operator-action.ts` records each
+capital-moving request with previous state, resulting state, outcome, reason and
+request ID. The operator token is never persisted; the identity is recorded as
+`shared-operator-token`. Read them via
+`GET /api/live-trading/safety-events` (operator auth).
+
+### 8.6 Disabled route groups — classified, not blindly re-enabled
+
+Root cause found: `server/rl-guard.ts` built its singleton at module scope and
+read `RLConfig` from `rl-system-integration` in the constructor. Those modules
+form an import cycle, so the read hit a temporal dead zone and threw
+`Cannot access 'RLConfig' before initialization`; optional chaining does not
+protect against a TDZ. Every router transitively importing that chain crashed at
+import, which is what the "BINARY SEARCH: TEMPORARILY DISABLE ALL ROUTERS"
+comment was bisecting. Config is now resolved lazily on first use.
+
+`npx tsx scripts/probe-disabled-routers.ts` mounts each formerly disabled router
+in isolation and prints the real failure. After the fix, all of them import and
+mount cleanly:
+
+| Route group | Classification |
+| --- | --- |
+| `/api/health` | **Safe — restored** (read-only; readiness was unreachable, so no operator could verify durable storage). Covered by `server/routes/__tests__/health-routes.test.ts` |
+| `/api/logs` | **Obsolete** — `server/routes/logs.ts` does not exist; logs are served by `/api/health/logs` |
+| physics, exit agents, scout, agent interactions/signals/services, optimization, strategies, model performance, backtesting, velocity, adaptive holding, clustering, phase 5/6, symbol universe, user settings, multi-timeframe, signal generation | **Requires tests before restore** — imports fine, no route-level coverage exists, and several call heavy analytical services on request |
+| `/api/execution` (trade execution) | **Requires fix before restore** — capital-adjacent surface with no `requireTradingOperator` guard; must not be exposed as-is |
+
+Only `/api/health` was restored. Nothing was deleted.
+
+### 8.7 Health endpoint no longer publishes fabricated data
+
+`/api/health` previously reported `connectedExchanges: 6` and a synthetic
+`dataFreshness` of "0 ms old, not stale" without contacting anything, and
+`/api/health/exchanges` returned a hardcoded active/geo-restricted list. Those
+now report `unknown`/`null` with an explicit note. The liveness (`/api/health`
+in `routes.ts`), readiness (`/api/health/readiness`) and live-trading gate
+distinctions are unchanged.
+
+### 8.8 Still outstanding (Pass 3)
+
+| Priority | Item |
+| --- | --- |
+| P0 | Reconciled positions/orders are held in engine memory: durable local state is not yet loaded *before* the exchange queries, nor persisted after them, so restart recovery still leans on the exchange being answerable |
+| P0 | Realized PnL/daily-loss do not yet consume the new fill+fee accounting end to end; `closePosition` does not record actual fills |
+| P0 | Funding is not accounted for at all — do not run funding-sensitive strategies |
+| P1 | `resume()` is synchronous and returns `true` before async durable startup work finishes |
+| P1 | Phase 2J/2K untouched: cache key uniqueness, TTL, invalidation, stampede and restart/corruption behaviour; replay/paper/live parity fixtures |
+| P1 | Phase 2Q failure-injection matrix only partially covered (durability, reconciliation, fills). Crash/restart-with-open-order, stale cache, operator stop mid-execution and concurrent flatten remain untested |
+| P1 | Route groups classified above still need per-group tests, and `/api/execution` needs operator auth |
+| P2 | Legacy `tests/` suites and the 362-error typecheck baseline are still unclassified; `(global as any)` handoffs and indicator cost remain unmeasured |
+
+Scanstream is **not** production-ready for live capital on this branch. The
+direction of failure is now defensive — it refuses to trade when it cannot prove
+state — but §8.8 P0s mean it still cannot fully account for what it did.
