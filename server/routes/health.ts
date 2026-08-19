@@ -8,6 +8,10 @@ import express, { type Request, type Response } from 'express';
 import { getErrorLogger } from '../services/error-logger';
 import { getPerformanceTracker } from '../services/model-performance-tracker';
 import { getBacktester } from '../services/signal-backtester';
+import { systemKillSwitch } from '../services/system-kill-switch';
+import { liveCircuitBreaker } from '../services/live-circuit-breaker';
+import { getSafetyMetrics } from '../services/observability/safety-metrics';
+import { db } from '../db-storage';
 
 const router = express.Router();
 const errorLogger = getErrorLogger();
@@ -32,12 +36,10 @@ router.get('/', async (req: Request, res: Response) => {
     // Get backtest stats
     const backtestStats = backtester.getStats();
 
-    // Check data freshness (this would be integrated with actual data fetcher)
-    const dataFreshness = {
-      lastUpdate: Date.now(),
-      stale: false,
-      age: 0 // milliseconds
-    };
+    // Data freshness is not tracked by this router. It reports `null` rather
+    // than a fabricated "fresh" value, which would let an operator believe
+    // market data is current when nothing has verified that.
+    const dataFreshness = null;
 
     // Determine overall health status
     const errorRateLastHour = errorSummary.totalErrors < 10 ? 'healthy' : 'degraded';
@@ -64,9 +66,10 @@ router.get('/', async (req: Request, res: Response) => {
         responseTimeMs: Date.now() - startTime
       },
       exchanges: {
-        status: 'monitoring',
-        connectedExchanges: 6, // binance, coinbase, kraken, kucoinfutures, okx, bybit
-        dataFreshness
+        status: 'unknown',
+        connectedExchanges: null,
+        dataFreshness,
+        detail: 'exchange connectivity is not probed by this endpoint',
       },
       models: {
         ready: modelReady,
@@ -152,30 +155,26 @@ router.get('/detailed', (req: Request, res: Response) => {
  */
 router.get('/exchanges', (req: Request, res: Response) => {
   try {
-    const exchanges = [
-      { name: 'binance', status: 'geo-restricted' },
-      { name: 'coinbase', status: 'active' },
-      { name: 'kraken', status: 'active' },
-      { name: 'kucoinfutures', status: 'active' },
-      { name: 'okx', status: 'active' },
-      { name: 'bybit', status: 'geo-restricted' }
-    ];
-
+    // Per-exchange status was previously a hardcoded list claiming exchanges
+    // were "active" without ever contacting them. Only the error counts here
+    // are observed, so status is reported as unknown.
     const errorSummary = errorLogger.getErrorSummary();
+    const exchanges = ['binance', 'coinbase', 'kraken', 'kucoinfutures', 'okx', 'bybit'];
 
-    const exchangeHealth = exchanges.map(ex => ({
-      ...ex,
-      errors: errorSummary.errorsByExchange[ex.name] || 0,
-      lastCheck: Date.now()
+    const exchangeHealth = exchanges.map(name => ({
+      name,
+      status: 'unknown',
+      errors: errorSummary.errorsByExchange[name] || 0,
+      lastCheck: null,
     }));
 
     res.json({
       success: true,
       exchanges: exchangeHealth,
       summary: {
-        active: exchangeHealth.filter(e => e.status === 'active').length,
-        restricted: exchangeHealth.filter(e => e.status === 'geo-restricted').length,
-        errors: exchangeHealth.reduce((sum, e) => sum + e.errors, 0)
+        probed: false,
+        errors: exchangeHealth.reduce((sum, e) => sum + e.errors, 0),
+        detail: 'connectivity is not probed here; see /api/health/readiness for live-trading gates',
       },
       timestamp: new Date().toISOString()
     });
@@ -240,6 +239,54 @@ router.post('/prune-logs', (req: Request, res: Response) => {
       timestamp: new Date().toISOString()
     });
   }
+});
+
+/**
+ * GET /api/health/readiness
+ *
+ * Deployment/probe-facing readiness. Unlike the informational endpoints above,
+ * this returns 503 when a subsystem that live trading depends on is unhealthy,
+ * so an orchestrator or operator dashboard sees real failures.
+ */
+router.get('/readiness', (_req: Request, res: Response) => {
+  const databaseConnected = (() => {
+    try {
+      return db.isDatabaseConnected();
+    } catch {
+      return false;
+    }
+  })();
+
+  const killSwitch = systemKillSwitch.getState();
+  const circuitBreaker = liveCircuitBreaker.getState();
+  const safety = getSafetyMetrics();
+
+  const checks = {
+    database: { ok: databaseConnected, detail: databaseConnected ? 'connected' : 'in-memory fallback active (writes are not durable)' },
+    killSwitch: { ok: !killSwitch.killed, detail: killSwitch.reason || null },
+    circuitBreaker: { ok: !circuitBreaker.active, detail: circuitBreaker.reason || null },
+    integrityGate: {
+      ok: safety.integrityBypassBlocked === 0,
+      detail: safety.integrityBypassBlocked > 0
+        ? `${safety.integrityBypassBlocked} frame batches dropped by integrity gate failures`
+        : null,
+    },
+  };
+
+  // The kill switch and circuit breaker are *intended* states, not process
+  // faults: they degrade rather than fail the probe. Losing durable storage or
+  // dropping data at the integrity gate is a genuine fault.
+  const ready = checks.database.ok && checks.integrityGate.ok;
+  const degraded = !checks.killSwitch.ok || !checks.circuitBreaker.ok;
+
+  res.status(ready ? 200 : 503).json({
+    status: !ready ? 'DOWN' : degraded ? 'DEGRADED' : 'UP',
+    ready,
+    checks,
+    safety,
+    uptime: process.uptime(),
+    timestamp: new Date().toISOString(),
+  });
 });
 
 export default router;

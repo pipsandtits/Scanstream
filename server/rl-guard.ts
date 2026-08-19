@@ -7,15 +7,44 @@ try { phase5EventBridge = require('./services/phase5-event-bridge').phase5EventB
 export class RLGuard {
   private rewards: number[] = [];
   private lastFrozenState = false;
-  private readonly windowSize: number;
-  private readonly varianceThreshold: number;
-  private readonly minExperience: number;
+  private readonly opts: { windowSize?: number; varianceThreshold?: number; minExperience?: number };
 
   constructor(opts?: { windowSize?: number; varianceThreshold?: number; minExperience?: number }) {
-    const cfg: any = (RLConfig as any)?.rlGuard ?? {};
-    this.windowSize = opts?.windowSize ?? cfg.windowSize ?? 50;
-    this.varianceThreshold = opts?.varianceThreshold ?? (cfg.varianceThreshold ?? (Number(process.env.RL_GUARD_VARIANCE_THRESHOLD) || 8));
-    this.minExperience = opts?.minExperience ?? (cfg.minExperience ?? (RLConfig.minExperienceForRL ?? 50));
+    // Config is NOT read here. This module is constructed at import time and
+    // sits inside an import cycle with rl-system-integration, where `RLConfig`
+    // is still in its temporal dead zone: touching it — even with `?.` — throws
+    // "Cannot access 'RLConfig' before initialization" and takes down every
+    // route group transitively importing it. Config is resolved on first use
+    // instead, once the cycle has settled.
+    this.opts = opts ?? {};
+  }
+
+  private static config(): any {
+    try {
+      return (RLConfig as any) ?? {};
+    } catch {
+      return {};
+    }
+  }
+
+  private get windowSize(): number {
+    const cfg = RLGuard.config().rlGuard ?? {};
+    return this.opts.windowSize ?? cfg.windowSize ?? 50;
+  }
+
+  private get varianceThreshold(): number {
+    const cfg = RLGuard.config().rlGuard ?? {};
+    return (
+      this.opts.varianceThreshold ??
+      cfg.varianceThreshold ??
+      (Number(process.env.RL_GUARD_VARIANCE_THRESHOLD) || 8)
+    );
+  }
+
+  private get minExperience(): number {
+    const config = RLGuard.config();
+    const cfg = config.rlGuard ?? {};
+    return this.opts.minExperience ?? cfg.minExperience ?? config.minExperienceForRL ?? 50;
   }
 
   recordReward(r: number, state?: any): void {

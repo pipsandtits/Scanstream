@@ -1555,9 +1555,11 @@ app.get('/api/assets/performance', async (req: Request, res: Response) => {
   app.use('/api/live-trading', liveTradingRouter);
   console.log('[express] Live Trading API registered at /api/live-trading');
 
-  // Health check endpoint
-  app.get('/api/health', (_req: Request, res: Response) => {
-    res.status(200).json({ status: 'UP', timestamp: new Date().toISOString() });
+  // Liveness only: process is up and the event loop is responsive. Real health
+  // and readiness live on the /api/health router (see routes/health.ts), which
+  // reports subsystem state and fails a probe when storage or integrity is bad.
+  app.get('/api/live', (_req: Request, res: Response) => {
+    res.status(200).json({ status: 'UP', uptime: process.uptime(), timestamp: new Date().toISOString() });
   });
 
   try {
@@ -1598,8 +1600,7 @@ app.get('/api/assets/performance', async (req: Request, res: Response) => {
   app.use('/api/mtf-confirmation', mtfConfirmationRouter);
   // Mount position sizing v2 endpoint
   app.use('/api/position-sizing-v2', positionSizingRouter); // Assuming positionSizingRouter is intended for v2 as well
-  // Mount live trading routes
-  app.use('/api/live-trading', liveTradingRouter);
+  // (live trading routes are mounted once, above)
 
   // Register portfolio risk and source analytics routes
   app.use('/api/portfolio-risk', portfolioRiskRouter);

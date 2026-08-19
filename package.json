@@ -11,6 +11,9 @@
     "build:server": "tsup server/index.ts --format esm --target es2022 --out-dir dist --external vite --external @vitejs/plugin-react --external lightningcss --external chartjs-node-canvas --external @babel/preset-typescript",
     "preview": "vite preview",
     "start": "node dist/index.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
     "docker:up": "docker compose up -d",
     "docker:down": "docker compose down",
     "docker:logs": "docker compose logs -f",
@@ -35,15 +38,16 @@
     "@types/recharts": "^2.0.1",
     "@types/ws": "^8.18.1",
     "@vitejs/plugin-react": "^6.0.2",
-    "prisma": "^7.8.0",
+    "prisma": "^6.19.3",
     "rollup-plugin-visualizer": "^7.0.1",
     "tsup": "^8.5.1",
     "tsx": "^4.22.3",
     "typescript": "^6.0.3",
-    "vite": "^8.0.14"
+    "vite": "^8.0.14",
+    "vitest": "4.1.10"
   },
   "dependencies": {
-    "@prisma/client": "^7.8.0",
+    "@prisma/client": "^6.19.3",
     "@radix-ui/react-accordion": "^1.2.12",
     "@radix-ui/react-alert-dialog": "^1.1.15",
     "@radix-ui/react-aspect-ratio": "^1.1.8",
@@ -105,6 +109,7 @@
     "openid-client": "^6.8.4",
     "p-queue": "^9.3.0",
     "passport": "^0.7.0",
+    "pg": "^8.11.0",
     "react": "19.2.6",
     "react-apexcharts": "^2.1.0",
     "react-day-picker": "^10.0.1",
@@ -125,8 +130,7 @@
     "wouter": "^3.10.0",
     "ws": "^8.20.1",
     "yahoo-finance2": "^3.14.1",
-    "zod": "^4.4.3",
-    "pg": "^8.11.0"
+    "zod": "^4.4.3"
   },
   "engines": {
     "node": ">=22"
