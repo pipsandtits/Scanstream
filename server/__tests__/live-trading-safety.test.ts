@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { LiveTradingEngine } from '../live-trading-engine';
 import { systemKillSwitch } from '../services/system-kill-switch';
 import { liveCircuitBreaker } from '../services/live-circuit-breaker';
+import { durabilityGate } from '../services/execution/durability-gate';
 
 interface FakePosition {
   id: string;
@@ -43,7 +44,7 @@ describe('live trading engine safety controls', () => {
   });
 
   afterEach(() => {
-    engine.pause();
+    engine.dispose();
     vi.restoreAllMocks();
   });
 
@@ -71,7 +72,7 @@ describe('live trading engine safety controls', () => {
   });
 
   it('does not re-enable trading when the circuit breaker clears', () => {
-    engine.pause();
+    engine.dispose();
     liveCircuitBreaker.emit('cleared', { prev: { active: true }, now: { active: false } });
     expect(engine.getStatus().config.enabled).toBe(false);
   });
@@ -141,7 +142,7 @@ describe('flattenAll', () => {
   });
 
   afterEach(() => {
-    engine.pause();
+    engine.dispose();
     vi.restoreAllMocks();
   });
 
@@ -227,5 +228,95 @@ describe('flattenAll', () => {
 
     const result = await engine.flattenAll('outage');
     expect(result.closed).toEqual(['p1']);
+  });
+});
+
+describe('live trading requires durable persistence', () => {
+  const ORIGINAL_DATABASE_URL = process.env.DATABASE_URL;
+  let engine: LiveTradingEngine;
+
+  function liveSignal(id: string) {
+    return {
+      id,
+      symbol: 'BTC/USDT',
+      type: 'BUY',
+      price: 67_000,
+      confidence: 0.95,
+      timestamp: Date.now(),
+    } as never;
+  }
+
+  beforeEach(() => {
+    durabilityGate.reset();
+    delete process.env.DATABASE_URL;
+    // testMode false = real capital, so durable persistence is mandatory.
+    engine = new LiveTradingEngine({ enabled: true, testMode: false });
+    vi.spyOn(systemKillSwitch, 'isKilled').mockReturnValue(false);
+    vi.spyOn(liveCircuitBreaker, 'isActive').mockReturnValue(false);
+  });
+
+  afterEach(() => {
+    engine.dispose();
+    durabilityGate.reset();
+    if (ORIGINAL_DATABASE_URL === undefined) delete process.env.DATABASE_URL;
+    else process.env.DATABASE_URL = ORIGINAL_DATABASE_URL;
+    vi.restoreAllMocks();
+  });
+
+  it('refuses to start live trading when storage is not durable', async () => {
+    const refused = vi.fn();
+    engine.on('startRefused', refused);
+
+    await expect(engine.start()).rejects.toThrow(/durable persistence unavailable/);
+    expect(refused).toHaveBeenCalledOnce();
+    expect(engine.getStatus().isRunning).toBe(false);
+  });
+
+  it('refuses to place a live order when storage is not durable', async () => {
+    const createOrder = vi.fn();
+    attachExchange(engine, { createOrder });
+    const blocked = vi.fn();
+    engine.on('executionBlocked', blocked);
+
+    const order = await engine.executeSignal(liveSignal('sig-durability'));
+
+    expect(order).toBeNull();
+    expect(createOrder).not.toHaveBeenCalled();
+    expect(blocked).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'durability', reason: 'durable_state_unavailable' })
+    );
+  });
+
+  it('blocks live execution when the database is lost after a healthy start', async () => {
+    process.env.DATABASE_URL = 'postgresql://user:pw@localhost:5432/scanstream';
+    let healthy = true;
+    durabilityGate.setProbe(async () => healthy);
+    attachExchange(engine, { createOrder: vi.fn(), loadMarkets: vi.fn() });
+
+    expect((await durabilityGate.check()).durable).toBe(true);
+
+    healthy = false;
+    durabilityGate.invalidate('write failed');
+
+    const order = await engine.executeSignal(liveSignal('sig-lost-db'));
+    expect(order).toBeNull();
+  });
+
+  it('resume cannot bypass the durability requirement', async () => {
+    const refused = vi.fn();
+    engine.on('startRefused', refused);
+
+    expect(engine.resume()).toBe(true); // kill switch/breaker are clear
+    await vi.waitFor(() => expect(refused).toHaveBeenCalled());
+    expect(engine.getStatus().isRunning).toBe(false);
+  });
+
+  it('allows paper/test mode to run without durable storage', async () => {
+    const paper = new LiveTradingEngine({ enabled: true, testMode: true });
+    attachExchange(paper, { createOrder: vi.fn(), loadMarkets: vi.fn() });
+
+    await expect(paper.start()).resolves.toBeUndefined();
+    expect(paper.getStatus().isRunning).toBe(true);
+    paper.dispose();
   });
 });

@@ -5,8 +5,28 @@ import { liveTradingEngine } from '../live-trading-engine';
 import { requireTradingOperator } from '../middleware/require-trading-operator';
 import { systemKillSwitch } from '../services/system-kill-switch';
 import { liveCircuitBreaker } from '../services/live-circuit-breaker';
+import { auditOperatorAction } from '../middleware/audit-operator-action';
+import { safetyEventLog } from '../services/observability/safety-event-log';
 
 const router = Router();
+
+/** State snapshot recorded before and after each operator action. */
+function engineSnapshot() {
+  const status = liveTradingEngine.getStatus();
+  return {
+    isRunning: status.isRunning,
+    config: status.config,
+    openPositions: status.positions.length,
+    totalExposure: status.totalExposure,
+    killSwitch: systemKillSwitch.getState(),
+    circuitBreaker: liveCircuitBreaker.getState(),
+  };
+}
+
+const audit = (
+  action: Parameters<typeof auditOperatorAction>[0],
+  target?: (req: Request) => string | undefined
+) => auditOperatorAction(action, { snapshot: engineSnapshot, target });
 
 /**
  * GET /api/live-trading/status
@@ -25,7 +45,7 @@ router.get('/status', (_req: Request, res: Response) => {
  * POST /api/live-trading/start
  * Start live trading engine (TESTNET ONLY by default)
  */
-router.post('/start', requireTradingOperator, async (_req: Request, res: Response) => {
+router.post('/start', requireTradingOperator, audit('start'), async (_req: Request, res: Response) => {
   try {
     await liveTradingEngine.start();
     res.json({ 
@@ -42,7 +62,7 @@ router.post('/start', requireTradingOperator, async (_req: Request, res: Respons
  * POST /api/live-trading/stop
  * Stop live trading engine
  */
-router.post('/stop', requireTradingOperator, (_req: Request, res: Response) => {
+router.post('/stop', requireTradingOperator, audit('stop'), (_req: Request, res: Response) => {
   try {
     liveTradingEngine.stop();
     res.json({ success: true, message: 'Live trading engine stopped' });
@@ -55,7 +75,7 @@ router.post('/stop', requireTradingOperator, (_req: Request, res: Response) => {
  * POST /api/live-trading/config
  * Update configuration (DANGEROUS - requires validation)
  */
-router.post('/config', requireTradingOperator, (req: Request, res: Response) => {
+router.post('/config', requireTradingOperator, audit('config', (req) => Object.keys(req.body ?? {}).join(',')), (req: Request, res: Response) => {
   try {
     const updates = req.body;
 
@@ -106,7 +126,7 @@ router.get('/positions', (_req: Request, res: Response) => {
  * POST /api/live-trading/close/:positionId
  * Close a specific position
  */
-router.post('/close/:positionId', requireTradingOperator, async (req: Request, res: Response) => {
+router.post('/close/:positionId', requireTradingOperator, audit('close', (req) => String(req.params.positionId)), async (req: Request, res: Response) => {
   try {
     const { positionId } = req.params;
     const success = await liveTradingEngine.closePosition(positionId);
@@ -125,7 +145,7 @@ router.post('/close/:positionId', requireTradingOperator, async (req: Request, r
  * POST /api/live-trading/execute
  * Execute a signal (CAUTION: Real money in live mode)
  */
-router.post('/execute', requireTradingOperator, async (req: Request, res: Response) => {
+router.post('/execute', requireTradingOperator, audit('execute', (req) => (typeof req.body?.symbol === 'string' ? req.body.symbol : undefined)), async (req: Request, res: Response) => {
   try {
     const signal = req.body;
 
@@ -174,7 +194,7 @@ router.post('/execute', requireTradingOperator, async (req: Request, res: Respon
  * POST /api/live-trading/flatten-all
  * Emergency flatten: close every open position and halt new placements.
  */
-router.post('/flatten-all', requireTradingOperator, async (req: Request, res: Response) => {
+router.post('/flatten-all', requireTradingOperator, audit('flatten_all'), async (req: Request, res: Response) => {
   try {
     const reason = typeof req.body?.reason === 'string' ? req.body.reason.slice(0, 120) : 'manual';
     const result = await liveTradingEngine.flattenAll(reason);
@@ -195,6 +215,22 @@ router.get('/safety', (_req: Request, res: Response) => {
     killSwitch: systemKillSwitch.getState(),
     circuitBreaker: liveCircuitBreaker.getState(),
     engine: liveTradingEngine.getStatus().config,
+    reconciliation: liveTradingEngine.getReconciliation(),
+  });
+});
+
+/**
+ * GET /api/live-trading/safety-events
+ * Durable safety + operator audit trail, including events written before the
+ * last restart. Operator-only: it describes control actions and positions.
+ */
+router.get('/safety-events', requireTradingOperator, (req: Request, res: Response) => {
+  const limit = Math.min(Math.max(Number(req.query.limit) || 100, 1), 500);
+  res.json({
+    success: true,
+    writeFailures: safetyEventLog.getWriteFailures(),
+    events: safetyEventLog.readPersisted(limit),
+    inProcess: safetyEventLog.tail(limit),
   });
 });
 

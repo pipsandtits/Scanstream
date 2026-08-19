@@ -280,8 +280,21 @@ console.log('[express] Missing API endpoints registered at /api');
 app.use('/api/paper-trading', paperTradingRouter);
 console.log('[express] Paper Trading API registered at /api/paper-trading');
 
+// Health / readiness / live-readiness router. Restored from the disabled block
+// below: without it there is no readiness endpoint at all, so an operator cannot
+// tell whether storage is durable before enabling live trading. Read-only.
+import healthRouter from './routes/health';
+app.use('/api/health', healthRouter);
+console.log('[express] Health Check API registered at /api/health');
+
 // ============================================================================
-// BINARY SEARCH: TEMPORARILY DISABLE ALL ROUTERS AFTER THIS POINT
+// DISABLED ROUTERS (see PRODUCTION_READINESS.md "Disabled route groups").
+//
+// These were commented out by a binary search for an import-time crash. The
+// crash was `Cannot access 'RLConfig' before initialization` in rl-guard, now
+// fixed; every router below imports and mounts cleanly again. They stay
+// disabled until each group has route-level coverage, and /api/execution needs
+// operator auth before it is exposed at all.
 // ============================================================================
 /*
 // Register Physics Agents (VFMD and Flow) routes
@@ -346,10 +359,7 @@ import userSettingsRouter from './routes/user-settings';
 app.use('/api/user', userSettingsRouter);
 console.log('[express] User Settings API registered at /api/user');
 
-  // Register Health Check route
-  import healthRouter from './routes/health';
-  app.use('/api/health', healthRouter);
-  console.log('[express] Health Check API registered at /api/health');
+  // Health Check route: RESTORED above, outside this disabled block.
 
   // Register Cache Monitoring routes
   app.get('/api/monitoring/cache-stats', (req, res) => {

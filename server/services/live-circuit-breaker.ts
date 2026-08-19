@@ -2,6 +2,7 @@ import { EventEmitter } from 'events';
 import fs from 'fs';
 import path from 'path';
 import { storage } from '../storage';
+import { safetyEventLog } from './observability/safety-event-log';
 
 export interface CircuitState {
   active: boolean;
@@ -66,6 +67,11 @@ class LiveCircuitBreaker extends EventEmitter {
     this.persist();
     // persist event
     try { await storage.createDecisionEvent({ correlationId: null, phase: 'CIRCUIT_BREAKER_ACTIVATED', domain: 'SYSTEM', actionPayload: { reason, setBy }, metrics: {}, timestamp: Date.now() }); } catch (e) {}
+    safetyEventLog.record({
+      type: 'circuit_breaker',
+      detail: `activated: ${reason}`,
+      data: { setBy: this.state.setBy },
+    });
     this.emit('activated', this.getState());
   }
 
@@ -81,6 +87,11 @@ class LiveCircuitBreaker extends EventEmitter {
       throw new Error('Cannot clear live circuit breaker: failed to persist cleared state');
     }
     try { await storage.createDecisionEvent({ correlationId: null, phase: 'CIRCUIT_BREAKER_CLEARED', domain: 'SYSTEM', actionPayload: { clearedBy: setBy }, metrics: {}, timestamp: Date.now() }); } catch (e) {}
+    safetyEventLog.record({
+      type: 'circuit_breaker',
+      detail: 'cleared',
+      data: { clearedBy: this.state.setBy, previousReason: prev.reason },
+    });
     this.emit('cleared', { prev, now: this.getState() });
   }
 }
