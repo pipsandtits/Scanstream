@@ -89,6 +89,10 @@ describe('strategies compatibility routes', () => {
       expect(signals.body).toMatchObject({ success: true });
       expect(signals.body.signals).toHaveLength(1);
 
+      const results = await request(started.base, '/backtest/results');
+      expect(results.status).toBe(200);
+      expect(results.body).toEqual({ results: [] });
+
       const feature = await request(started.base, '/feature-enabled');
       expect(feature.status).toBe(200);
 
