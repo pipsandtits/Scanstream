@@ -554,6 +554,41 @@ describe('Pass 5 batch 1 read-mostly routes', () => {
         }),
       });
       expect(invalid.status).toBe(400);
+
+      const historyBefore = await request(base, '/api/learning/history?limit=1000');
+      const invalidHistoryInput = await request(base, '/api/learning/trade-outcome', {
+        method: 'POST',
+        headers: { 'x-test-user': 'learner' },
+        body: JSON.stringify({
+          strategy_id: 'fixture',
+          entry_price: 100,
+          exit_price: 105,
+          direction: 'LONG',
+          signal_confidence: 2,
+          entry_quality: 0.5,
+          entry_time: 'not-a-timestamp',
+          exit_reason: { arbitrary: true },
+        }),
+      });
+      expect(invalidHistoryInput.status).toBe(400);
+      const historyAfter = await request(base, '/api/learning/history?limit=1000');
+      expect(record(historyAfter.body).count).toBe(record(historyBefore.body).count);
+    });
+
+    it('rejects malformed metrics payloads before replacing shared state', async () => {
+      const malformed = await request(base, '/api/learning/update-metrics', {
+        method: 'POST',
+        headers: { 'x-test-user': 'learner' },
+        body: JSON.stringify({
+          strategy_beliefs: { fixture: { confidence: 'not-a-number' } },
+        }),
+      });
+      expect(malformed.status).toBe(400);
+      expect(record(malformed.body).success).toBe(false);
+
+      const metrics = await request(base, '/api/learning/metrics');
+      expect(metrics.status).toBe(200);
+      expect(record(record(metrics.body).metrics).market_regime).toBe('NEUTRAL');
     });
   });
 });

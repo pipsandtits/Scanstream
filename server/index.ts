@@ -31,6 +31,8 @@ import phase5Routes from './routes/phase5-api';
 import multiTimeframeRouter from './routes/multi-timeframe-analysis';
 import symbolsRouter from './routes/symbols';
 import learningMetricsRouter from './routes/learning-metrics';
+import exitAgentsRouter from './routes/exit-agents';
+import agentInteractionsRouter from './routes/agent-interactions';
 import { getSharedService, setSharedService } from './services/shared-service-registry';
 // Removed fastScanner service import
 
@@ -309,6 +311,12 @@ app.use(learningMetricsRouter);
 console.log('[express] Learning Metrics API registered at /api/learning');
 app.use('/api/physics', physicsValidationRouter);
 console.log('[express] Physics Validation API registered at /api/physics');
+app.use('/api/agents/physics', physicsAgentsRouter);
+console.log('[express] Physics Agents API registered at /api/agents/physics');
+app.use('/api/agents/exit', exitAgentsRouter);
+console.log('[express] Exit Agents API registered at /api/agents/exit');
+app.use('/api/agents/interactions', agentInteractionsRouter);
+console.log('[express] Agent Interactions API registered at /api/agents/interactions');
 
 // Remaining disabled routers (see PRODUCTION_READINESS.md "Disabled route groups").
 // Import-time probing is not route-level safety evidence. Each group below
@@ -317,21 +325,6 @@ console.log('[express] Physics Validation API registered at /api/physics');
 // guard.
 // ============================================================================
 /*
-// Register Physics Agents (VFMD and Flow) routes
-// DISABLED FOR DEBUG
-// app.use('/api/agents/physics', physicsAgentsRouter);
-// console.log('[express] Physics Agents API registered at /api/agents/physics');
-
-// Register Exit Agents routes (Orchestrator, Opposition, Microstructure)
-import exitAgentsRouter from './routes/exit-agents';
-app.use('/api/agents/exit', exitAgentsRouter);
-console.log('[express] Exit Agents API registered at /api/agents/exit');
-
-// Register Agent Interactions & Visualization routes
-import agentInteractionsRouter from './routes/agent-interactions';
-app.use('/api/agents/interactions', agentInteractionsRouter);
-console.log('[express] Agent Interactions API registered at /api/agents/interactions');
-
 // Register Agent Signal Insights routes
 import agentSignalInsightsRouter from './routes/agent-signal-insights';
 app.use('/api/agents/signals', agentSignalInsightsRouter);

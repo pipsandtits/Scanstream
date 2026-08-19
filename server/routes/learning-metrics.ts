@@ -17,12 +17,104 @@ let lastLearningMetrics: any = null;
 let learningHistoryBuffer: any[] = [];
 const MAX_HISTORY = 1000;
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value);
+}
+
+function isOptionalBoundedString(value: unknown, maxLength: number): value is string | undefined {
+  return value === undefined ||
+    (typeof value === 'string' && value.trim().length > 0 && value.length <= maxLength);
+}
+
+function isOptionalTimestamp(value: unknown): value is string | undefined {
+  return value === undefined ||
+    (typeof value === 'string' &&
+      value.length <= 64 &&
+      Number.isFinite(Date.parse(value)));
+}
+
+function isDirection(value: unknown): value is 'LONG' | 'SHORT' {
+  return value === 'LONG' || value === 'SHORT';
+}
+
+function isLearningMetricsPayload(value: unknown): boolean {
+  if (!isRecord(value) || Object.keys(value).length === 0) return false;
+
+  const allowedKeys = new Set([
+    'strategy_beliefs',
+    'adaptive_weights',
+    'market_regime',
+    'regime_adjusted_weights',
+    'regime_beliefs',
+    'calibration',
+  ]);
+  if (Object.keys(value).some((key) => !allowedKeys.has(key))) return false;
+
+  if (
+    value.market_regime !== undefined &&
+    (typeof value.market_regime !== 'string' ||
+      value.market_regime.length === 0 ||
+      value.market_regime.length > 64)
+  ) {
+    return false;
+  }
+
+  for (const key of ['strategy_beliefs', 'regime_beliefs', 'calibration']) {
+    const section = value[key];
+    if (section !== undefined && !isRecord(section)) return false;
+  }
+
+  for (const key of ['adaptive_weights', 'regime_adjusted_weights']) {
+    const section = value[key];
+    if (
+      section !== undefined &&
+      (!isRecord(section) ||
+        Object.values(section).some((weight) => !isFiniteNumber(weight)))
+    ) {
+      return false;
+    }
+  }
+
+  if (value.strategy_beliefs) {
+    for (const belief of Object.values(value.strategy_beliefs)) {
+      if (!isRecord(belief)) return false;
+      const numericFields = [
+        'posterior_accuracy',
+        'confidence',
+        'samples',
+        'win_rate',
+        'avg_roi',
+        'current_weight',
+        'accuracy_improvement',
+        'max_drawdown',
+        'prior_accuracy',
+      ];
+      if (numericFields.some((field) => belief[field] !== undefined && !isFiniteNumber(belief[field]))) {
+        return false;
+      }
+    }
+  }
+
+  return true;
+}
+
 /**
  * POST /api/learning/trade-outcome
  * Process a closed trade through the learning system
  */
 router.post('/api/learning/trade-outcome', requireAuth, async (req, res) => {
   try {
+    if (!isRecord(req.body)) {
+      return res.status(400).json({
+        success: false,
+        error: 'trade outcome must be a JSON object',
+      });
+    }
+
     const { 
       strategy_id, 
       entry_price, 
@@ -37,18 +129,28 @@ router.post('/api/learning/trade-outcome', requireAuth, async (req, res) => {
 
     // Validate required fields
     if (
-      !strategy_id ||
+      typeof strategy_id !== 'string' ||
+      strategy_id.trim().length === 0 ||
+      strategy_id.length > 128 ||
       typeof entry_price !== 'number' ||
       !Number.isFinite(entry_price) ||
       entry_price <= 0 ||
       typeof exit_price !== 'number' ||
       !Number.isFinite(exit_price) ||
       exit_price <= 0 ||
-      !['LONG', 'SHORT'].includes(direction)
+      !isDirection(direction) ||
+      !isOptionalTimestamp(entry_time) ||
+      !isOptionalTimestamp(exit_time) ||
+      (signal_confidence !== undefined &&
+        (!isFiniteNumber(signal_confidence) || signal_confidence < 0 || signal_confidence > 1)) ||
+      !isFiniteNumber(entry_quality) ||
+      entry_quality < 0 ||
+      entry_quality > 1 ||
+      !isOptionalBoundedString(exit_reason, 128)
     ) {
       return res.status(400).json({
         success: false,
-        error: 'strategy_id, positive entry_price and exit_price, and LONG or SHORT direction are required'
+        error: 'trade outcome contains invalid strategy, price, direction, confidence, quality, reason, or timestamp values'
       });
     }
 
@@ -339,6 +441,12 @@ router.post('/api/learning/reset', requireAuth, async (req, res) => {
 router.post('/api/learning/update-metrics', requireAuth, async (req, res) => {
   try {
     const metrics = req.body;
+    if (!isLearningMetricsPayload(metrics)) {
+      return res.status(400).json({
+        success: false,
+        error: 'metrics must contain only valid learning metric sections',
+      });
+    }
     lastLearningMetrics = metrics;
 
     res.json({
