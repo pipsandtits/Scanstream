@@ -19,6 +19,13 @@ export default defineConfig({
     // Some pre-existing suites were written against Jest globals.
     globals: true,
     testTimeout: 20_000,
+    // Module-level singletons in this codebase log heavily on import. Streaming
+    // that over the worker RPC races with worker teardown, which surfaces as
+    // `EnvironmentTeardownError: Closing rpc while "onUserConsoleLog" was
+    // pending` and fails the run even though every test passed. Forks isolate
+    // teardown, and output from passing tests is not worth the RPC traffic.
+    pool: 'forks',
+    silent: 'passed-only',
   },
   resolve: {
     alias: {
