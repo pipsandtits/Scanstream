@@ -33,6 +33,10 @@ import {
 } from './services/execution/fill-accounting';
 import { reconcileAtStartup, type ReconciliationReport } from './services/execution/startup-reconciler';
 import { safetyEventLog } from './services/observability/safety-event-log';
+import {
+  DurableLocalStateStore,
+  type LocalStateLoadResult,
+} from './services/execution/durable-local-state';
 
 // Small helper to bound a promise with a timeout. Returns null on timeout or error.
 async function promiseWithTimeout<T>(p: Promise<T>, ms: number): Promise<T | null> {
@@ -64,6 +68,7 @@ async function promiseWithTimeout<T>(p: Promise<T>, ms: number): Promise<T | nul
 interface LiveOrder {
   id: string;
   exchangeOrderId: string;
+  clientOrderId?: string | null;
   symbol: string;
   side: 'buy' | 'sell';
   type: 'market' | 'limit' | 'stop' | 'stop_limit';
@@ -128,6 +133,12 @@ interface ExecutionConfig {
   minConfidence: number;
 }
 
+export interface LiveTradingEngineDependencies {
+  localStateStore?: DurableLocalStateStore;
+  localStatePath?: string;
+  clock?: () => number;
+}
+
 export class LiveTradingEngine extends EventEmitter {
   private exchange: ccxt.Exchange | null = null;
   private positions: Map<string, LivePosition> = new Map();
@@ -152,8 +163,12 @@ export class LiveTradingEngine extends EventEmitter {
   private flattening: boolean = false;
   private flattenInFlight: Promise<FlattenResult> | null = null;
   private hardLimitOverrides: Partial<HardLimits> = {};
+  private readonly localStateStore: DurableLocalStateStore;
+  private localStateStatus: LocalStateLoadResult['status'] = 'absent';
+  private localStateLoaded = false;
+  private localStatePersistenceHealthy = true;
 
-  constructor(config?: Partial<ExecutionConfig>) {
+  constructor(config?: Partial<ExecutionConfig>, dependencies: LiveTradingEngineDependencies = {}) {
     super();
     this.config = {
       enabled: false,
@@ -166,6 +181,10 @@ export class LiveTradingEngine extends EventEmitter {
       minConfidence: 0.7,
       ...config
     };
+    this.localStateStore = dependencies.localStateStore ?? new DurableLocalStateStore({
+      filePath: dependencies.localStatePath,
+      clock: dependencies.clock,
+    });
 
     // Listen for global kill-switch events. Handlers are retained so they can
     // be detached in dispose() — the switch and breaker are process-wide
@@ -241,7 +260,6 @@ export class LiveTradingEngine extends EventEmitter {
    */
   async initialize(): Promise<void> {
     try {
-      
       const exchangeName = this.config.exchange;
       const ExchangeClass = ccxt[exchangeName as keyof typeof ccxt] as any;
       
@@ -269,12 +287,13 @@ export class LiveTradingEngine extends EventEmitter {
 
       this.emit('initialized', { exchange: exchangeName, testMode: this.config.testMode });
 
-      // Immediately sync positions on startup to avoid missing open positions
-      try {
-        await this.updatePositions();
-      } catch (err) {
-        const logger = new ModuleLogger('LiveTrading');
-        logger.warn('initial position sync failed', err);
+      if (this.config.testMode) {
+        try {
+          await this.updatePositions();
+        } catch (err) {
+          const logger = new ModuleLogger('LiveTrading');
+          logger.warn('initial position sync failed', err);
+        }
       }
     } catch (error: any) {
       const logger = new ModuleLogger('LiveTrading');
@@ -313,6 +332,109 @@ export class LiveTradingEngine extends EventEmitter {
     }
   }
 
+  private loadLocalState(): boolean {
+    const result = this.localStateStore.load();
+    this.localStateStatus = result.status;
+
+    if (result.status === 'absent') {
+      this.orders.clear();
+      this.positions.clear();
+      this.localStateLoaded = true;
+      this.localStatePersistenceHealthy = true;
+      return true;
+    }
+
+    if (result.status === 'unreadable') {
+      this.localStatePersistenceHealthy = false;
+      recordExecutionBlocked('local_state_unreadable');
+      safetyEventLog.record({
+        type: 'durability_failure',
+        detail: `local execution state unreadable: ${result.reason}`,
+        data: { stateFile: this.localStateStore.getPath() },
+      });
+      this.emit('executionBlocked', {
+        type: 'local_state',
+        reason: 'local_state_unreadable',
+        detail: result.reason,
+        timestamp: Date.now(),
+      });
+      this.emit('startRefused', {
+        reason: 'local_state_unreadable',
+        detail: result.reason,
+      });
+      return false;
+    }
+
+    try {
+      const orders = result.state.orders as LiveOrder[];
+      const positions = result.state.positions as LivePosition[];
+      if (
+        orders.some((order) => !order || typeof order.id !== 'string' || typeof order.symbol !== 'string') ||
+        positions.some((position) => !position || typeof position.symbol !== 'string')
+      ) {
+        throw new Error('local execution state contains an invalid order or position record');
+      }
+      this.orders.clear();
+      for (const order of orders) this.orders.set(order.id, order);
+      this.positions.clear();
+      for (const position of positions) {
+        this.positions.set(position.symbol, { ...position, id: position.symbol });
+      }
+      this.localStatePersistenceHealthy = true;
+      this.localStateLoaded = true;
+      return true;
+    } catch (error: any) {
+      const reason = error?.message ? String(error.message) : 'local execution state record is invalid';
+      this.localStateStatus = 'unreadable';
+      this.localStatePersistenceHealthy = false;
+      recordExecutionBlocked('local_state_unreadable');
+      safetyEventLog.record({
+        type: 'durability_failure',
+        detail: `local execution state unreadable: ${reason}`,
+        data: { stateFile: this.localStateStore.getPath() },
+      });
+      this.emit('executionBlocked', {
+        type: 'local_state',
+        reason: 'local_state_unreadable',
+        detail: reason,
+        timestamp: Date.now(),
+      });
+      this.emit('startRefused', { reason: 'local_state_unreadable', detail: reason });
+      return false;
+    }
+  }
+
+  private persistLocalState(): boolean {
+    if (this.config.testMode) return true;
+    try {
+      this.localStateStore.persist(
+        Array.from(this.orders.values()),
+        Array.from(this.positions.values()),
+      );
+      this.localStateStatus = 'ok';
+      this.localStateLoaded = true;
+      this.localStatePersistenceHealthy = true;
+      return true;
+    } catch (error: any) {
+      const detail = error?.message ? String(error.message) : 'local execution state write failed';
+      this.localStatePersistenceHealthy = false;
+      durabilityGate.invalidate(detail);
+      recordExecutionBlocked('local_state_persistence_failed');
+      safetyEventLog.record({
+        type: 'durability_failure',
+        detail,
+        data: { stateFile: this.localStateStore.getPath() },
+      });
+      this.emit('executionBlocked', {
+        type: 'local_state',
+        reason: 'local_state_persistence_failed',
+        detail,
+        timestamp: Date.now(),
+      });
+      return false;
+    }
+  }
+
   /**
    * Start live trading engine
    */
@@ -322,6 +444,10 @@ export class LiveTradingEngine extends EventEmitter {
       new ModuleLogger('LiveTrading').error('Start refused: system kill-switch active', state);
       this.emit('startRefused', { reason: 'kill_switch_active', state });
       throw new Error(`Cannot start live trading: kill-switch active (${state.reason || 'unspecified'})`);
+    }
+
+    if (!this.config.testMode && !this.loadLocalState()) {
+      throw new Error('Cannot start live trading: local execution state is unreadable');
     }
 
     // Live trading without durable persistence would leave real exchange
@@ -351,6 +477,15 @@ export class LiveTradingEngine extends EventEmitter {
           `Cannot start live trading: startup reconciliation incomplete (${report.blockedReason})`
         );
       }
+    }
+
+    if (!this.config.testMode && !this.localStatePersistenceHealthy) {
+      recordExecutionBlocked('local_state_persistence_failed');
+      this.emit('startRefused', {
+        reason: 'local_state_persistence_failed',
+        stateFile: this.localStateStore.getPath(),
+      });
+      throw new Error('Cannot start live trading: local execution state could not be persisted');
     }
 
     this.isRunning = true;
@@ -386,6 +521,28 @@ export class LiveTradingEngine extends EventEmitter {
    */
   async executeSignal(signal: Signal): Promise<LiveOrder | null> {
     const logger = new ModuleLogger('LiveTrading');
+
+    if (!this.config.testMode && (!this.localStatePersistenceHealthy || this.localStateStatus === 'unreadable')) {
+      const reason = this.localStateStatus === 'unreadable'
+        ? 'local_state_unreadable'
+        : 'local_state_persistence_failed';
+      logger.error(`Execution blocked: ${reason}`);
+      recordExecutionBlocked(reason);
+      safetyEventLog.record({
+        type: 'execution_blocked',
+        detail: reason,
+        data: { symbol: signal.symbol, signalId: signal.id },
+      });
+      this.emit('executionBlocked', {
+        type: 'local_state',
+        reason,
+        symbol: signal.symbol,
+        signalId: signal.id,
+        timestamp: Date.now(),
+      });
+      return null;
+    }
+    if (!this.config.testMode && !this.localStateLoaded && !this.loadLocalState()) return null;
 
     if (!this.exchange) {
       logger.info('Engine not initialized');
@@ -904,6 +1061,7 @@ export class LiveTradingEngine extends EventEmitter {
       const liveOrder: LiveOrder = {
         id: typeof randomUUID === 'function' ? randomUUID() : `order-${Date.now()}`,
         exchangeOrderId: order.id,
+        clientOrderId,
         symbol: signal.symbol,
         side: signal.type.toLowerCase() as 'buy' | 'sell',
         type: 'market',
@@ -1011,6 +1169,7 @@ export class LiveTradingEngine extends EventEmitter {
         logger.warn('Failed to add position to PortfolioRiskManager', pmErr);
       }
       this.orders.set(liveOrder.id, liveOrder);
+      if (!this.persistLocalState()) return null;
       this.emit('orderPlaced', liveOrder);
 
       // Detect potential self-influencing trades (feedback loop) and tag audit
@@ -1360,6 +1519,7 @@ export class LiveTradingEngine extends EventEmitter {
       // poll (the old `${symbol}-${timestamp}` id multiplied one real position
       // into dozens, inflating open-position and exposure counts).
       const seenSymbols = new Set<string>();
+      let stateMutated = false;
 
       for (const pos of positions) {
         if (Math.abs(pos.contracts || 0) > 0) {
@@ -1386,6 +1546,7 @@ export class LiveTradingEngine extends EventEmitter {
           livePos.takeProfit = existing?.takeProfit;
 
           this.positions.set(livePos.id, livePos);
+          stateMutated = true;
 
           // Update portfolio risk manager with latest price
           try {
@@ -1424,6 +1585,7 @@ export class LiveTradingEngine extends EventEmitter {
         }
         if (!stillOpen) {
           this.positions.delete(id);
+          stateMutated = true;
           this.emit('positionClosedExternally', {
             positionId: id,
             symbol: position.symbol,
@@ -1438,6 +1600,7 @@ export class LiveTradingEngine extends EventEmitter {
       }
 
       this.emit('positionsUpdated', Array.from(this.positions.values()));
+      if (stateMutated) this.persistLocalState();
     } catch (error) {
       // Fail closed on unknown position state: keep the local view (which is
       // never smaller than what we know about) rather than assuming flat.
@@ -1486,7 +1649,7 @@ export class LiveTradingEngine extends EventEmitter {
       localOrders: Array.from(this.orders.values()).map((o) => ({
         id: o.id,
         exchangeOrderId: o.exchangeOrderId,
-        clientOrderId: null,
+        clientOrderId: o.clientOrderId ?? null,
         symbol: o.symbol,
         amount: o.amount,
         filled: o.filled,
@@ -1498,6 +1661,28 @@ export class LiveTradingEngine extends EventEmitter {
         quantity: p.quantity,
       })),
     });
+
+    let stateMutated = false;
+    const localByExchangeId = new Map(
+      Array.from(this.orders.values()).map((order) => [String(order.exchangeOrderId), order])
+    );
+    const localByClientId = new Map(
+      Array.from(this.orders.values())
+        .filter((order) => order.clientOrderId)
+        .map((order) => [String(order.clientOrderId), order])
+    );
+    for (const exchangeOrder of report.orders) {
+      const local = localByExchangeId.get(String(exchangeOrder.exchangeOrderId))
+        ?? (exchangeOrder.clientOrderId
+          ? localByClientId.get(String(exchangeOrder.clientOrderId))
+          : undefined);
+      if (!local) continue;
+      local.exchangeOrderId = exchangeOrder.exchangeOrderId;
+      local.status = exchangeOrder.status as LiveOrder['status'];
+      local.filled = exchangeOrder.filled;
+      local.remaining = exchangeOrder.remaining;
+      stateMutated = true;
+    }
 
     // Adopting exchange positions is idempotent: keyed by symbol, replacing
     // rather than appending, so repeated reconciliation cannot duplicate them.
@@ -1520,9 +1705,11 @@ export class LiveTradingEngine extends EventEmitter {
         liquidationPrice: existing?.liquidationPrice,
         orders: existing?.orders ?? [],
       });
+      stateMutated = true;
     }
 
     this.reconciliation = report;
+    if (stateMutated || report.complete) this.persistLocalState();
 
     safetyEventLog.record({
       type: 'startup_reconciliation',
@@ -1668,7 +1855,10 @@ export class LiveTradingEngine extends EventEmitter {
     order.status = (typeof snapshot?.status === 'string' ? snapshot.status : order.status) as LiveOrder['status'];
 
     const filledDelta = order.filled - previousFilled;
-    if (filledDelta === 0 && order.status === previousStatus) return;
+    if (filledDelta === 0 && order.status === previousStatus) {
+      this.persistLocalState();
+      return;
+    }
 
     if (filledDelta > 0) {
       try { executionMetrics.recordFill(order.symbol, filledDelta); } catch { /* metrics are best-effort */ }
@@ -1727,6 +1917,7 @@ export class LiveTradingEngine extends EventEmitter {
       durabilityGate.invalidate('updateOrderAudit failed');
       logger.warn('Failed to persist order audit after fill', e);
     }
+    this.persistLocalState();
   }
 
   /**
@@ -1746,6 +1937,7 @@ export class LiveTradingEngine extends EventEmitter {
       );
 
       this.positions.delete(positionId);
+      if (!this.persistLocalState()) return false;
       this.emit('positionClosed', position);
 
       // Remove from portfolio risk manager
@@ -1870,7 +2062,7 @@ export class LiveTradingEngine extends EventEmitter {
     this.onBreakerCleared = undefined;
   }
 
-  resume() {
+  async resume(): Promise<boolean> {
     // Resuming must respect the global safety controls.
     if (systemKillSwitch.isKilled()) {
       new ModuleLogger('LiveTrading').warn('Resume refused: system kill-switch active');
@@ -1885,9 +2077,12 @@ export class LiveTradingEngine extends EventEmitter {
     // start() re-checks durability; resume must not bypass it by flipping the
     // flags directly.
     if (!this.isRunning) {
-      this.start().catch((err) => {
+      try {
+        await this.start();
+      } catch (err) {
         new ModuleLogger('LiveTrading').error('Resume failed to start engine', formatError(err));
-      });
+        return false;
+      }
     }
     this.emit('resumed');
     return true;

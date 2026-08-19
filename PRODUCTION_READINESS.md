@@ -155,7 +155,13 @@ that no longer exist and are not wired into the runner.
 ## 5. Deployment checklist
 
 1. Node 22, pnpm 10.15.0, `pnpm install --frozen-lockfile`.
-2. `DATABASE_URL` set; `pnpm run db:generate && pnpm run db:migrate:deploy`.
+2. `DATABASE_URL` set; generate the client and apply the committed migration
+   history to a fresh database:
+   `pnpm run db:generate && pnpm run db:migrate:deploy`.
+   If the database already contains the schema from `prisma db push` (or an
+   equivalent pre-migration deployment), baseline that existing schema once
+   instead of replaying the initial DDL:
+   `pnpm exec prisma migrate resolve --applied 0_init`.
 3. Confirm `GET /api/health/readiness` returns `ready: true` with
    `database.ok === true` **before** enabling live trading.
 4. Set `TRADING_OPERATOR_TOKEN` (32+ random bytes). Without it all trading
@@ -294,12 +300,12 @@ distinctions are unchanged.
 
 | Priority | Item |
 | --- | --- |
-| P0 | Reconciled positions/orders are held in engine memory: durable local state is not yet loaded *before* the exchange queries, nor persisted after them, so restart recovery still leans on the exchange being answerable |
+| P0 | **Closed in Hardening Pass 3 Phase A:** local positions/orders are atomically persisted under `data/`, loaded before live exchange queries, and included in the startup reconciliation barrier |
 | P0 | Realized PnL/daily-loss do not yet consume the new fill+fee accounting end to end; `closePosition` does not record actual fills |
 | P0 | Funding is not accounted for at all — do not run funding-sensitive strategies |
-| P1 | `resume()` is synchronous and returns `true` before async durable startup work finishes |
+| P1 | **Closed in Hardening Pass 3 Phase A:** `resume()` awaits startup and reports failure when durability, local state, initialization or reconciliation refuses the start |
 | P1 | Phase 2J/2K untouched: cache key uniqueness, TTL, invalidation, stampede and restart/corruption behaviour; replay/paper/live parity fixtures |
-| P1 | Phase 2Q failure-injection matrix only partially covered (durability, reconciliation, fills). Crash/restart-with-open-order, stale cache, operator stop mid-execution and concurrent flatten remain untested |
+| P1 | Phase 2Q failure-injection matrix only partially covered (durability, reconciliation, fills). Stale cache, operator stop mid-execution and concurrent flatten remain untested |
 | P1 | Route groups classified above still need per-group tests, and `/api/execution` needs operator auth |
 | P2 | Legacy `tests/` suites and the 362-error typecheck baseline are still unclassified; `(global as any)` handoffs and indicator cost remain unmeasured |
 
