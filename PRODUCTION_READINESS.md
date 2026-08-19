@@ -356,7 +356,7 @@ safety evidence:
 | `/api/agents/exit` | **Covered — restored with operator guard** — all six decision, coordination, and outcome mutations are treated as capital-adjacent and require `requireTradingOperator` plus audit; read-only status remains public |
 | `/api/agents/interactions` | **Covered — restored with authentication** — the three process-global recording mutations require authentication and bounded payloads; visualization/history reads remain public |
 | `/api/agents/signals` | **Covered but still disabled** — all six routes have isolated contract coverage and the recording mutation is authenticated, but five read routes fan out to multiple external/analytical pipelines without a uniform request deadline; keep disabled until that latency boundary is explicit |
-| `/api/symbol-universe` | **Covered — restored with authenticated UI-config mutation** — all 13 routes have isolated contract coverage; the read-only state, lookup, formatting, group, stats, and change-stream routes remain open, pure normalization routes validate bounded inputs, and `POST /ui-config` requires authentication and validates the payload |
+| `/api/symbol-universe` | **Covered — restored with authenticated UI-config mutation** — all 13 routes have isolated contract coverage; the read-only state, lookup, formatting, group, stats, and change-stream routes are intentionally public because they expose bounded symbol metadata without secrets, pure normalization routes validate bounded inputs, and `POST /ui-config` requires authentication and validates the payload |
 | `/api/optimize` | **Covered — restored with authentication and bounded cost** — `POST /run` is authenticated and caps iterations (1-50), market data (100-1000 candles), symbol length, timeframe, and boolean options; the four routes have isolated success, validation, and handled-failure coverage. The optimizer is process-local and no live/paper consumer of its report was found. |
 | `/api/backtest` signal routes | **Covered — restored with authentication and bounded cost** — `POST /signal` and `POST /signals` require authentication and cap candles (5-5000), signals (100), and timeout (1-240 minutes); `POST /prune` requires authentication and caps retention (1-3650 days). Read-only stats/history/export routes have bounded query/input handling and isolated coverage. The signal backtester writes only its process-local result buffer; no live/paper consumer was found. |
 | `/api/backtest/historical` | **Covered — restored with authentication and bounded cost** — the POST route requires authentication, caps assets at 20 and the date range at 730 days, and has isolated success, validation, and handled-failure coverage; the summary read is public. No live/paper consumer of the result was found. |
@@ -371,7 +371,7 @@ safety evidence:
 | `/api/strategies` legacy router | **Partially restored through `strategies-compat.ts`** — safe reads and bounded authenticated analysis are mounted separately; the original router remains unmounted so its signal-injecting and destructive routes cannot become active accidentally. The route's static strategy metadata is not consumed by live/paper engines: `server/routes/strategies.ts` owns `STRATEGIES`, while `server/strategy-integration.ts` uses separate in-process weights. |
 | `/api/user` user settings | **Covered — restored with authenticated ownership and operator guards where execution-adjacent** — all 20 routes derive the owner from `req.user.id`; session revocation and API-key deletion verify persisted ownership. Trading-settings and API-key mutations require `requireTradingOperator` plus audit; other mutations require authentication and bounded payloads. API-key responses expose only masked public-key metadata and never `apiSecret`. |
 | `/api/gateway` | **Still disabled** — all 35 original routes remain behind the disabled registration. The router initializes exchange aggregators, scanner/liquidity/security services, cache warming, and recurring refresh intervals at import time; it also mixes signal persistence, venue resets, cache invalidation, unbounded external fan-out, and raw-error paths. A safe subset cannot be restored without splitting the router and adding uniform service deadlines. |
-| Gateway read-only compatibility surfaces | **Covered — restored without importing `gateway.ts`** — `/api/gateway/dataframe/:symbol`, `/api/gateway/price/:symbol`, `/api/gateway/signals/performance/stats`, `/api/gateway/signals/performance/recent`, and `/api/exchange/status` use bounded cache/tracker reads only. Symbols are capped at 64 characters, timeframes use an allowlist, dataframe limits cap at 500 candles, and performance limits cap at 100 records. No signal persistence, venue reset, or external provider call occurs on these paths. |
+| Gateway read-only compatibility surfaces | **Covered — restored without importing `gateway.ts`** — `/api/gateway/dataframe/:symbol`, `/api/gateway/price/:symbol`, `/api/gateway/signals/performance/stats`, `/api/gateway/signals/performance/recent`, and `/api/exchange/status` use bounded cache/tracker reads only. Symbols are capped at 64 characters, timeframes use an allowlist, dataframe limits cap at 500 candles, and performance limits cap at 100 records. No signal persistence, venue reset, or external provider call occurs on these paths. `/api/exchange/status` matches the terminal contract, but `trading_pairs` and `api_latency_ms` are currently hardcoded zero values. |
 | `/api/strategies` read/analysis compatibility | **Covered — restored** — `GET /`, `/signals`, `/:id`, `/backtest/results`, `/feature-enabled`, and `/compare-durations` are mounted from `strategies-compat.ts`; static routes precede `/:id`, query/identifier inputs are bounded, and handled failures are generic. Authenticated `POST /consensus`, `/backtest/run`, `/bounce/backtest`, `/:id/backtest`, `/predict-duration`, and `/pyramid-decision` are restored with bounded inputs. The subprocess-backed backtests/consensus use a 15-second timeout and 1 MB output cap. |
 | `/api/strategies` signal-injecting and unbounded mutation routes | **Still disabled and actually unmounted** — `POST /enhanced-bounce/execute`, `POST /:id/execute`, and `POST /execute-all` remain unmounted because they call `storage.createSignal()` without established downstream execution ownership; `/execute-all` also permits unbounded symbol fan-out. `DELETE /backtest/:id` remains unmounted because it mutates stored results and has no authenticated, owner-scoped deletion contract. |
 
@@ -832,13 +832,13 @@ disabled groups are:
 | `/api/physics`, `/api/learning`, `/api/agents/physics` | Restored | Public status/read routes remain open; heavy or state-changing operations require authentication and bounded inputs |
 | `/api/agents/exit` | Restored | Status is public; decision, coordination, and outcome mutations require the trading-operator guard and audit |
 | `/api/agents/interactions` | Restored | Reads are public; process-global recording mutations require authentication and bounded payloads |
-| `/api/symbol-universe` | Restored | Read-only lookups are public; the UI-configuration mutation requires authentication |
+| `/api/symbol-universe` | Restored | Read-only lookups are intentionally public: they are bounded metadata reads with no secrets; the UI-configuration mutation requires authentication |
 | `/api/optimize`, `/api/backtest/signal`, `/api/backtest/historical` | Restored | Compute mutations require authentication and enforce explicit symbol, date, candle, signal, iteration, and timeout bounds; reads are bounded and covered |
 | `/api/signal-generation` | Restored | Generation routes require the trading-operator guard and audit because their output is an execution input, even though the route itself does not persist a signal |
 | `/api/user` settings | Restored | Authenticated user-self access; trading settings and venue-credential mutations require operator authentication and audit, with persisted ownership checks |
 | `/api/strategies` compatibility reads and analysis | Restored | Read-only strategy metadata, signals, feature state, duration comparison, and result reads are public; consensus, backtest, duration, and pyramid analysis require authentication and bounded inputs |
 | `POST /api/strategies/synthesize` | Restored | `requireAuth` rather than operator authentication; the route only synthesizes and returns analytical output, does not call `storage.createSignal()`, does not mutate engine state, and no engine consumer of its returned value was found. Audit remains attached |
-| Read-only gateway compatibility (`/api/gateway/signals/performance/*`, `/api/gateway/dataframe/*`, `/api/gateway/price/*`, `/api/exchange/status`) | Restored | Public, bounded read-only compatibility router; it does not import `gateway.ts`, initialize the gateway, persist signals, mutate venues, or fetch through unbounded provider paths |
+| Read-only gateway compatibility (`/api/gateway/signals/performance/*`, `/api/gateway/dataframe/*`, `/api/gateway/price/*`, `/api/exchange/status`) | Restored | Intentionally public, bounded read-only compatibility router; it does not import `gateway.ts`, initialize the gateway, persist signals, mutate venues, or fetch through unbounded provider paths. The exchange-status shape is compatible, but `trading_pairs` and `api_latency_ms` remain known-degraded zero values |
 | `/api/agents/signals` | Disabled/unmounted | Although isolated contract tests exist and recording is authenticated, the read paths fan out into multiple external/analytical pipelines without one enforceable request deadline |
 | Main `/api/gateway` router | Disabled/unmounted | Its routes remain coupled to import-time `initializeGateway()` and recurring refresh intervals, cache/venue mutations, external fan-out, signal persistence, and incomplete cost/error contracts |
 | `/api/backtest` phase 6 unified | Disabled/unmounted | Stored-result writes and request-controlled asset, agent, strategy, timeframe, and gap-healing fan-out lack a complete enforceable cost and consumer contract |
@@ -846,6 +846,15 @@ disabled groups are:
 | `/api/backtest` velocity profile, adaptive holding, and clustering | Disabled/unmounted | Heavy analytical work lacks the required explicit latency/cost boundaries and complete route contracts |
 | `POST /api/strategies/enhanced-bounce/execute`, `POST /api/strategies/:id/execute`, `POST /api/strategies/execute-all` | Disabled/unmounted | These inject signals; `execute-all` also permits unbounded caller fan-out, and downstream ownership is not established |
 | `DELETE /api/strategies/backtest/:id` | Disabled/unmounted | Destructive stored-state mutation has no owner-scoped deletion contract |
+
+The restored `requireAuth` routes use a shared-token stopgap rather than
+sessions: when `API_ACCESS_TOKEN` is configured, the app-wide
+`x-api-access-token` middleware attaches the fixed non-privileged identity
+`shared-api-token`; missing or incorrect tokens remain unauthenticated. This
+identity is not per-user authentication, cannot satisfy the separate trading
+operator token, and is not sufficient for a multi-user deployment. Ownership
+scopes therefore remain isolated to that one shared identity until session
+authentication exists.
 
 Four routers were found to be disabled in appearance only and were fixed as
 registration findings, not treated as documentation footnotes:
@@ -986,7 +995,14 @@ The follow-up review fixes preserve the same fail-closed boundaries:
 `world_tick`, `tick`, `ui_tick`, `orderbook_update`, `market_frame`, and
 `positions_update`. The client type did not admit these event names, and a
 server-wide search found no server emission, so these were stale unreachable
-branches rather than an omitted active event contract.
+branches rather than an omitted active event contract. Separately, the
+`useWorldTicks` React Query v5 migration was reviewed and dismissed as a
+regression: `trading-terminal.tsx` still populates the cache through its MDL
+subscription.
+
+The Python-helper hardening in `server/routes/strategies.ts` remains inert:
+that router is still unmounted, so its subprocess bounds are not an active
+mitigation for a live route.
 
 #### What Pass 5 does not close
 

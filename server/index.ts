@@ -29,7 +29,6 @@ import modelPerformanceRouter from './routes/model-performance';
 import scoutReportRouter from './routes/scout-report-routes';
 import phase5Routes from './routes/phase5-api';
 import multiTimeframeRouter from './routes/multi-timeframe-analysis';
-import symbolsRouter from './routes/symbols';
 import learningMetricsRouter from './routes/learning-metrics';
 import exitAgentsRouter from './routes/exit-agents';
 import agentInteractionsRouter from './routes/agent-interactions';
@@ -48,6 +47,7 @@ import { getSharedService, setSharedService } from './services/shared-service-re
 import { apiRegistry } from './services/api-registry';
 import { setupAPITracking } from './middleware/api-tracker';
 import apiDocsRouter from './routes/api-docs';
+import { attachApiIdentity } from './middleware/api-access-auth';
 
 // Commander System imports
 import { setupCommanderRoutes } from './routes/commander';
@@ -152,6 +152,7 @@ app.use((req, res, next) => {
 });
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
+app.use(attachApiIdentity);
 
 // Enable trust proxy for Replit's proxied environment (required for rate limiter)
 app.set('trust proxy', 1);
@@ -315,8 +316,7 @@ app.use('/api/phase5', phase5Routes);
 console.log('[express] Phase 5 API registered at /api/phase5');
 app.use('/api/analysis/multi-timeframe', multiTimeframeRouter);
 console.log('[express] Multi-Timeframe Analysis API registered at /api/analysis/multi-timeframe');
-app.use('/api/symbols', symbolsRouter);
-console.log('[express] Symbols API registered at /api/symbols');
+// Symbols are mounted centrally in registerRoutes().
 app.use(learningMetricsRouter);
 console.log('[express] Learning Metrics API registered at /api/learning');
 app.use('/api/physics', physicsValidationRouter);
