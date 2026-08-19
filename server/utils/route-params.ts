@@ -25,6 +25,15 @@ export function routeParam(
   return value;
 }
 
+export function routeParamWildcard(
+  value: string | string[] | undefined,
+  name: string,
+  maxLength = 128,
+): string {
+  const normalized = Array.isArray(value) ? value.join('/') : value;
+  return routeParam(normalized, name, maxLength);
+}
+
 export function routeParamEnum<const T extends string>(
   value: string | string[] | undefined,
   name: string,

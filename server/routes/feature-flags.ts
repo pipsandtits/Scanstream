@@ -10,7 +10,7 @@
  */
 
 import { Router, Request, Response } from 'express';
-import { routeParam, routeParamEnum } from '../utils/route-params';
+import { routeParam } from '../utils/route-params';
 import {
   isFeatureEnabled,
   getAllFlags,
@@ -21,6 +21,11 @@ import {
 } from '../config/featureFlags';
 
 const router = Router();
+const validCategories = ['strategy', 'service', 'analysis', 'experimental', 'admin'] as const;
+
+function isFeatureCategory(value: string): value is typeof validCategories[number] {
+  return (validCategories as readonly string[]).includes(value);
+}
 
 /**
  * Middleware: Check if running in dev mode (for toggle endpoints)
@@ -79,10 +84,9 @@ router.get('/:flag', (req: Request, res: Response) => {
 router.get(
   '/category/:category',
   (req: Request, res: Response) => {
-    const category = routeParamEnum(req.params.category, 'category', ['strategy', 'service', 'analysis', 'experimental', 'admin'] as const);
-    const validCategories = ['strategy', 'service', 'analysis', 'experimental', 'admin'];
+    const category = routeParam(req.params.category, 'category', 32);
 
-    if (!validCategories.includes(category)) {
+    if (!isFeatureCategory(category)) {
       return res.status(400).json({
         error: `Invalid category: ${category}`,
         valid_categories: validCategories,

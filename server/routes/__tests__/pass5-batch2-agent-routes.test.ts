@@ -117,7 +117,7 @@ vi.mock('axios', () => ({
 
 import exitAgentsRouter from '../exit-agents';
 import physicsAgentsRouter from '../physics-agents';
-import agentInteractionsRouter from '../agent-interactions';
+import agentInteractionsRouter, { getActivityLogSize } from '../agent-interactions';
 import agentSignalInsightsRouter from '../agent-signal-insights';
 import { ExitOrchestratorAgent } from '../../services/rpg-agents/SpecializedExitAgents';
 import VFMDPhysicsAgent from '../../services/rpg-agents/VFMDPhysicsAgent';
@@ -414,6 +414,23 @@ describe('Pass 5 batch 2 agent routes', () => {
       }));
       expect(invalidVote.status).toBe(400);
       expect(invalidActivity.status).toBe(400);
+    });
+
+    it('bounds activity history when recording votes repeatedly', async () => {
+      for (let index = 0; index < 1005; index += 1) {
+        const response = await request(base, '/record-vote', withUser({
+          method: 'POST',
+          body: JSON.stringify({
+            symbol: `BTC/USDT-${index}`,
+            votes: [],
+            consensus: 'HOLD',
+            confidence: 0.5,
+          }),
+        }));
+        expect(response.status).toBe(200);
+      }
+
+      expect(getActivityLogSize()).toBeLessThanOrEqual(1000);
     });
   });
 

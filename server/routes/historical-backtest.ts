@@ -16,16 +16,20 @@ const router = express.Router();
  * POST /api/backtest/historical
  * 
  * Run backtest on historical data (2+ years)
+ * Omitting assets runs a bounded default slice of the tracked universe, which
+ * is echoed in the response as the effective asset list.
  * Returns: Sharpe/Sortino ratios, max drawdown, pattern analysis
  */
 router.post('/historical', requireAuth, async (req: Request, res: Response) => {
   try {
+    const defaultAssets = ALL_TRACKED_ASSETS.slice(0, 20).map(a => a.symbol);
     const {
       startDate = new Date(Date.now() - 2 * 365 * 24 * 60 * 60 * 1000), // 2 years ago
       endDate = new Date(),
-      assets = ALL_TRACKED_ASSETS.map(a => a.symbol),
+      assets: requestedAssets,
       riskFreeRate = 0.05
     } = req.body;
+    const assets = requestedAssets === undefined ? defaultAssets : requestedAssets;
 
     if (
       !Array.isArray(assets) ||
@@ -67,6 +71,7 @@ router.post('/historical', requireAuth, async (req: Request, res: Response) => {
 
     res.json({
       success: true,
+      assets,
       data: result,
       summary: {
         algorithmScore: calculateAlgorithmScore(result.metrics),

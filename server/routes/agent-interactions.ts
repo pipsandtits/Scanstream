@@ -34,6 +34,10 @@ const consensusHistory: ConsensusVote[] = [];
 const activityLog: ActivityItem[] = [];
 const MAX_ACTIVITY_ITEMS = 1000;
 
+export function getActivityLogSize(): number {
+  return activityLog.length;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
@@ -179,6 +183,9 @@ router.post('/record-vote', requireAuth, (req: Request, res: Response) => {
       message: `Consensus reached for ${symbol}`,
       details: `${consensus === 'EXIT' ? 'Exit' : 'Hold'} decision with ${(confidence * 100).toFixed(0)}% confidence`
     });
+    if (activityLog.length > MAX_ACTIVITY_ITEMS) {
+      activityLog.shift();
+    }
 
     res.json({
       success: true,

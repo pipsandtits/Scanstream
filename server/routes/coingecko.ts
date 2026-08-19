@@ -147,8 +147,9 @@ router.get('/global', async (req: Request, res: Response) => {
  * Get sentiment score for a specific symbol
  */
 router.get('/sentiment/:symbol', async (req: Request, res: Response) => {
+  const rawSymbol = req.params.symbol;
   try {
-    const symbol = routeParam(req.params.symbol, 'symbol', 64).toUpperCase();
+    const symbol = routeParam(rawSymbol, 'symbol', 64).toUpperCase();
     const score = await coinGeckoService.getSentimentScore(symbol);
 
     res.json({
@@ -160,7 +161,7 @@ router.get('/sentiment/:symbol', async (req: Request, res: Response) => {
       attribution: 'Data provided by CoinGecko (coingecko.com)'
     });
   } catch (error: any) {
-    console.error(`[CoinGecko] Sentiment error for ${routeParam(req.params.symbol, 'symbol', 64)}:`, error);
+    console.error(`[CoinGecko] Sentiment error for ${rawSymbol}:`, error);
     res.status(500).json({
       success: false,
       error: error.message || 'Failed to fetch sentiment data'

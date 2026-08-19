@@ -260,6 +260,20 @@ describe('Pass 5 batch 3 backtest routes', () => {
       body: JSON.stringify({ startDate: '2020-01-01', endDate: '2024-01-01' }),
     }))).status).toBe(400);
 
+    const defaultAssets = await request(historicalBase, '/historical', withUser({
+      method: 'POST',
+      body: JSON.stringify({
+        startDate: '2024-01-01',
+        endDate: '2024-06-01',
+      }),
+    }));
+    expect(defaultAssets.status).toBe(200);
+    expect(defaultAssets.body.assets).toEqual(expect.any(Array));
+    expect((defaultAssets.body.assets as unknown[]).length).toBeLessThanOrEqual(20);
+    expect(historicalRunMock).toHaveBeenCalledWith(expect.objectContaining({
+      assets: defaultAssets.body.assets,
+    }));
+
     const response = await request(historicalBase, '/historical', withUser({
       method: 'POST',
       body: JSON.stringify({

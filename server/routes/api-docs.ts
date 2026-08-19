@@ -10,7 +10,7 @@
  */
 
 import { Router, Request, Response } from 'express';
-import { routeParamEnum, routeParam } from '../utils/route-params';
+import { respondToInvalidRouteParam, routeParamEnum, routeParamWildcard } from '../utils/route-params';
 import { apiRegistry } from '../services/api-registry';
 
 const router = Router();
@@ -75,7 +75,7 @@ router.get('/endpoints', (req: Request, res: Response) => {
 router.get('/endpoints/:method/*path', (req: Request, res: Response) => {
   try {
     const method = routeParamEnum(String(req.params.method ?? '').toUpperCase(), 'method', ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'] as const);
-    const path = `/${routeParam(req.params.path, 'path', 256)}`;
+    const path = `/${routeParamWildcard(req.params.path, 'path', 256)}`;
 
     const endpoint = apiRegistry.getEndpoint(method, path);
 
@@ -92,6 +92,7 @@ router.get('/endpoints/:method/*path', (req: Request, res: Response) => {
       requestHistory: apiRegistry.getRequestHistory(method, path, 50),
     });
   } catch (error) {
+    if (respondToInvalidRouteParam(error, res)) return;
     res.status(500).json({
       error: 'Failed to retrieve endpoint details',
       details: error instanceof Error ? error.message : String(error),
@@ -138,7 +139,7 @@ router.get('/health', (req: Request, res: Response) => {
 router.get('/health/:method/*path', (req: Request, res: Response) => {
   try {
     const method = routeParamEnum(String(req.params.method ?? '').toUpperCase(), 'method', ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'] as const);
-    const path = `/${routeParam(req.params.path, 'path', 256)}`;
+    const path = `/${routeParamWildcard(req.params.path, 'path', 256)}`;
 
     const endpoint = apiRegistry.getEndpoint(method, path);
 
@@ -161,6 +162,7 @@ router.get('/health/:method/*path', (req: Request, res: Response) => {
       overallAPIHealth: health.overallHealth,
     });
   } catch (error) {
+    if (respondToInvalidRouteParam(error, res)) return;
     res.status(500).json({
       error: 'Failed to retrieve endpoint health',
       details: error instanceof Error ? error.message : String(error),
