@@ -40,6 +40,7 @@ import signalGenerationRouter from './routes/api/signal-generation';
 import symbolUniverseRouter from './routes/api/symbol-universe';
 import userSettingsRouter from './routes/user-settings';
 import gatewayReadonlyRouter, { createGatewayStatusRouter } from './routes/gateway-readonly';
+import strategiesCompatRouter from './routes/strategies-compat';
 import { getSharedService, setSharedService } from './services/shared-service-registry';
 // Removed fastScanner service import
 
@@ -330,6 +331,8 @@ app.use('/api/backtest', historicalBacktestRouter);
 console.log('[express] Signal and Historical Backtesting APIs registered at /api/backtest');
 app.use('/api/user', userSettingsRouter);
 console.log('[express] User Settings API registered at /api/user');
+app.use('/api/strategies', strategiesCompatRouter);
+console.log('[express] Strategies read/analysis compatibility API registered at /api/strategies');
 app.use('/api/gateway', gatewayReadonlyRouter);
 console.log('[express] Gateway read-only compatibility API registered at /api/gateway');
 app.use('/api/exchange', createGatewayStatusRouter());

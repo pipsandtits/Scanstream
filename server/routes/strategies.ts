@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { spawn } from 'child_process';
 import path from 'path';
 import fs from 'fs/promises';
-import { Request, Response } from 'express'; // Ensure Request and Response are imported
+import { NextFunction, Request, Response } from 'express'; // Ensure Request and Response are imported
 import { storage } from '../storage';
 import { formatError } from '../utils/logger';
 
@@ -35,7 +35,7 @@ interface StrategyMetadata {
 }
 
 // Strategy definitions
-const STRATEGIES: StrategyMetadata[] = [
+export const STRATEGIES: StrategyMetadata[] = [
   {
     id: 'gradient_trend_filter',
     name: 'Gradient Trend Filter',
@@ -536,9 +536,12 @@ router.delete('/backtest/:id', async (req: Request, res: Response) => {
 });
 
 // GET /api/strategies/:id - Get strategy details
-router.get('/:id', async (req: Request, res: Response) => {
+router.get('/:id', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { id } = req.params;
+    if (id === 'feature-enabled' || id === 'compare-durations') {
+      return next();
+    }
     const strategy = STRATEGIES.find(s => s.id === id);
 
     if (!strategy) {
@@ -746,6 +749,61 @@ router.post('/:id/backtest', async (req: Request, res: Response) => {
   }
 });
 
+const PYTHON_TIMEOUT_MS = 15_000;
+const PYTHON_OUTPUT_LIMIT = 1_000_000;
+
+function runPythonJson(args: string[]): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    const python = spawn('python', args);
+    let output = '';
+    let outputSize = 0;
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      python.kill('SIGKILL');
+      reject(new Error('Python helper timed out'));
+    }, PYTHON_TIMEOUT_MS);
+
+    const fail = (error: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      python.kill('SIGKILL');
+      reject(error);
+    };
+
+    python.stdout.on('data', (data: Buffer) => {
+      outputSize += data.length;
+      output += data.toString();
+      if (outputSize > PYTHON_OUTPUT_LIMIT) {
+        fail(new Error('Python helper output exceeded limit'));
+      }
+    });
+    python.stderr.on('data', (data: Buffer) => {
+      outputSize += data.length;
+      if (outputSize > PYTHON_OUTPUT_LIMIT) {
+        fail(new Error('Python helper output exceeded limit'));
+      }
+    });
+    python.on('error', () => fail(new Error('Python helper failed')));
+    python.on('close', (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (code !== 0) {
+        reject(new Error('Python helper failed'));
+        return;
+      }
+      try {
+        resolve(JSON.parse(output));
+      } catch {
+        reject(new Error('Python helper returned invalid output'));
+      }
+    });
+  });
+}
+
 // Helper: Execute strategy via Python
 async function executeStrategy(
   strategyId: string,
@@ -753,91 +811,33 @@ async function executeStrategy(
   timeframe: string,
   parameters: any
 ): Promise<any> {
-  return new Promise((resolve, reject) => {
-    const pythonScript = path.join(process.cwd(), 'strategies', 'executor.py');
-
-    const args = [
-      pythonScript,
-      '--strategy', strategyId,
-      '--symbol', symbol,
-      '--timeframe', timeframe,
-      '--params', JSON.stringify(parameters || {})
-    ];
-
-    const python = spawn('python', args);
-
-    let output = '';
-    let errorOutput = '';
-
-    python.stdout.on('data', (data) => {
-      output += data.toString();
-    });
-
-    python.stderr.on('data', (data) => {
-      errorOutput += data.toString();
-    });
-
-    python.on('close', (code) => {
-      if (code !== 0) {
-        reject(new Error(`Python script failed: ${errorOutput}`));
-      } else {
-        try {
-          const result = JSON.parse(output);
-          resolve(result);
-        } catch (error) {
-          reject(new Error(`Failed to parse Python output: ${output}`));
-        }
-      }
-    });
-  });
+  const pythonScript = path.join(process.cwd(), 'strategies', 'executor.py');
+  return runPythonJson([
+    pythonScript,
+    '--strategy', strategyId,
+    '--symbol', symbol,
+    '--timeframe', timeframe,
+    '--params', JSON.stringify(parameters || {})
+  ]);
 }
 
 // Helper: Execute consensus via strategy_coop.py
-async function executeConsensus(
+export async function executeConsensus(
   symbol: string,
   timeframes: string[],
   equity: number
 ): Promise<any> {
-  return new Promise((resolve, reject) => {
-    const pythonScript = path.join(process.cwd(), 'strategies', 'consensus_executor.py');
-
-    const args = [
-      pythonScript,
-      '--symbol', symbol,
-      '--timeframes', JSON.stringify(timeframes),
-      '--equity', equity.toString()
-    ];
-
-    const python = spawn('python', args);
-
-    let output = '';
-    let errorOutput = '';
-
-    python.stdout.on('data', (data) => {
-      output += data.toString();
-    });
-
-    python.stderr.on('data', (data) => {
-      errorOutput += data.toString();
-    });
-
-    python.on('close', (code) => {
-      if (code !== 0) {
-        reject(new Error(`Consensus script failed: ${errorOutput}`));
-      } else {
-        try {
-          const result = JSON.parse(output);
-          resolve(result);
-        } catch (error) {
-          reject(new Error(`Failed to parse consensus output: ${output}`));
-        }
-      }
-    });
-  });
+  const pythonScript = path.join(process.cwd(), 'strategies', 'consensus_executor.py');
+  return runPythonJson([
+    pythonScript,
+    '--symbol', symbol,
+    '--timeframes', JSON.stringify(timeframes),
+    '--equity', equity.toString()
+  ]);
 }
 
 // Helper: Backtest strategy
-async function backtestStrategy(
+export async function backtestStrategy(
   strategyId: string,
   symbol: string,
   timeframe: string,
@@ -845,45 +845,16 @@ async function backtestStrategy(
   endDate: string,
   parameters: any
 ): Promise<any> {
-  return new Promise((resolve, reject) => {
-    const pythonScript = path.join(process.cwd(), 'strategies', 'backtest_executor.py');
-
-    const args = [
-      pythonScript,
-      '--strategy', strategyId,
-      '--symbol', symbol,
-      '--timeframe', timeframe,
-      '--start', startDate,
-      '--end', endDate,
-      '--params', JSON.stringify(parameters || {})
-    ];
-
-    const python = spawn('python', args);
-
-    let output = '';
-    let errorOutput = '';
-
-    python.stdout.on('data', (data) => {
-      output += data.toString();
-    });
-
-    python.stderr.on('data', (data) => {
-      errorOutput += data.toString();
-    });
-
-    python.on('close', (code) => {
-      if (code !== 0) {
-        reject(new Error(`Backtest script failed: ${errorOutput}`));
-      } else {
-        try {
-          const result = JSON.parse(output);
-          resolve(result);
-        } catch (error) {
-          reject(new Error(`Failed to parse backtest output: ${output}`));
-        }
-      }
-    });
-  });
+  const pythonScript = path.join(process.cwd(), 'strategies', 'backtest_executor.py');
+  return runPythonJson([
+    pythonScript,
+    '--strategy', strategyId,
+    '--symbol', symbol,
+    '--timeframe', timeframe,
+    '--start', startDate,
+    '--end', endDate,
+    '--params', JSON.stringify(parameters || {})
+  ]);
 }
 
 // POST /api/strategies/execute-all - Execute all active strategies

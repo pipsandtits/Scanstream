@@ -42,6 +42,7 @@ import compositeQualityRouter from './routes/composite-quality';
 // Import Live Trading routes
 import liveTradingRouter from './routes/live-trading';
 import { requireTradingOperator } from './middleware/require-trading-operator';
+import { requireAuth } from './middleware/auth';
 import { auditOperatorAction } from './middleware/audit-operator-action';
 
 // Import Portfolio Risk and Source Analytics routes
@@ -1230,7 +1231,9 @@ app.get('/api/assets/performance', async (req: Request, res: Response) => {
   // Synthesize signals endpoint
   app.post(
     '/api/strategies/synthesize',
-    requireTradingOperator,
+    // Analytical only: this returns synthesized output without persisting a signal
+    // or mutating/feeding live or paper engine state.
+    requireAuth,
     auditOperatorAction('signal_generate', {
       target: (req) => typeof req.body?.symbol === 'string' ? req.body.symbol.slice(0, 32) : undefined,
     }),
