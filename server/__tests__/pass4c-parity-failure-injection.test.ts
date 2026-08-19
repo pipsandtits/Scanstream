@@ -1,12 +1,14 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { EventEmitter } from 'events';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { LiveTradingEngine } from '../live-trading-engine';
 import { durabilityGate } from '../services/execution/durability-gate';
+import { FundingAccounting } from '../services/execution/funding-accounting';
+import { getConfidenceScorer } from '../services/market-data/confidence-scorer';
 import { getModeDetector } from '../services/market-data/mode-detector';
-import { systemKillSwitch } from '../services/system-kill-switch';
-import { TickerSnapshotCache } from '../services/ticker-snapshot-cache';
+import { TruthEngine } from '../services/aggregator/truth-engine';
 
 const FIXTURE = {
   symbol: 'BTC/USDT',
@@ -65,18 +67,28 @@ function prepareEngine(testMode: boolean, createOrder: (...args: any[]) => Promi
       fundingAccountingPath: statePath('scanstream-parity-funding-'),
     },
   );
+  // The engine has no public exchange injection seam; this is the only cast in
+  // the harness, and it replaces the venue adapter without bypassing engine
+  // startup, durable loaders, reconciliation or funding accounting.
   (engine as unknown as { exchange: unknown }).exchange = fakeExchange(createOrder);
-  if (!testMode) {
-    (engine as unknown as { localStateLoaded: boolean }).localStateLoaded = true;
-    (engine as unknown as { realizedPnlLoaded: boolean }).realizedPnlLoaded = true;
-    (engine as unknown as { fundingLoaded: boolean }).fundingLoaded = true;
-    (engine as unknown as { reconciliation: { complete: boolean } }).reconciliation = { complete: true };
-    (engine as unknown as { localStatePersistenceHealthy: boolean }).localStatePersistenceHealthy = true;
-    (engine as unknown as { realizedPnlHealthy: boolean }).realizedPnlHealthy = true;
-    (engine as unknown as { fundingHealthy: boolean }).fundingHealthy = true;
-    vi.spyOn(engine as any, 'ensureFundingAccounted').mockResolvedValue(true);
-  }
   return engine;
+}
+
+function freshTruthEngine(symbol: string): TruthEngine {
+  const gate = new EventEmitter();
+  const sources = Object.fromEntries(
+    ['venue-a', 'venue-b', 'venue-c', 'venue-d', 'venue-e'].map((venue) => [
+      venue,
+      { close: 101, ts: Date.now(), volume: 1 },
+    ]),
+  );
+  const aggregator = {
+    getPerExchange: () => sources,
+    getAggregated: () => ({ venueHealthScores: {} }),
+  };
+  const truth = new TruthEngine(gate, aggregator as any);
+  gate.emit('world.tick', { symbol });
+  return truth;
 }
 
 function normalizeIntent(call: any[]): Record<string, unknown> {
@@ -95,19 +107,6 @@ function normalizeIntent(call: any[]): Record<string, unknown> {
   };
 }
 
-function decisionSnapshot(engine: LiveTradingEngine, signal: any, mode: 'paper' | 'live') {
-  const hardLimit = engine.checkHardLimits(signal, 1_000);
-  return {
-    hardLimit,
-    staleness: hardLimit.code === 'stale_signal' ? 'blocked' : 'fresh',
-    exposure: (engine as any).getTotalExposure(),
-    dailyLoss: (engine as any).realizedPnlInput(),
-    funding: mode === 'paper' ? 'bypassed' : 'passed',
-    durability: mode === 'paper' ? 'bypassed' : 'passed',
-    conversion: mode === 'paper' ? 'bypassed' : 'not-needed',
-  };
-}
-
 describe('Pass 4C paper/live parity fixtures', () => {
   afterEach(() => {
     durabilityGate.reset();
@@ -119,6 +118,35 @@ describe('Pass 4C paper/live parity fixtures', () => {
       'postgresql://scanstream:scanstream_dev_password@localhost:5432/scanstream?schema=public';
     durabilityGate.setProbe(async () => true);
     setLiveMode();
+    const previousTruth = (globalThis as any).truthEngine;
+    (globalThis as any).truthEngine = freshTruthEngine(FIXTURE.symbol);
+    const durabilityObservations: Array<{ testMode: boolean; durable: boolean; detail?: string }> = [];
+    const gateSequences: Record<'paper' | 'live', string[]> = { paper: [], live: [] };
+    const originalRequireForLive = durabilityGate.requireForLive.bind(durabilityGate);
+    vi.spyOn(durabilityGate, 'requireForLive').mockImplementation(async (testMode) => {
+      const result = await originalRequireForLive(testMode);
+      durabilityObservations.push({ testMode, durable: result.durable, detail: result.detail });
+      gateSequences[testMode ? 'paper' : 'live'].push('durability');
+      return result;
+    });
+    const fundingObservations: Array<{ symbol: string; status: string; reason?: string }> = [];
+    const originalFundingReconcile = FundingAccounting.prototype.reconcile;
+    vi.spyOn(FundingAccounting.prototype, 'reconcile').mockImplementation(async function (exchange, symbol) {
+      const result = await originalFundingReconcile.call(this, exchange, symbol);
+      fundingObservations.push({ symbol, status: result.status, reason: 'reason' in result ? result.reason : undefined });
+      gateSequences.live.push('funding');
+      return result;
+    });
+    const hardLimitObservations: Record<'paper' | 'live', any[]> = { paper: [], live: [] };
+    const observeHardLimits = (engine: LiveTradingEngine, mode: 'paper' | 'live') => {
+      const original = engine.checkHardLimits.bind(engine);
+      vi.spyOn(engine, 'checkHardLimits').mockImplementation((...args) => {
+        const result = original(...args);
+        gateSequences[mode].push('hard_limit');
+        hardLimitObservations[mode].push(result);
+        return result;
+      });
+    };
 
     const paperCalls: any[] = [];
     const liveCalls: any[] = [];
@@ -139,38 +167,58 @@ describe('Pass 4C paper/live parity fixtures', () => {
     };
     const paper = prepareEngine(true, (...args) => response(paperCalls, ...args));
     const live = prepareEngine(false, (...args) => response(liveCalls, ...args));
+    const paperShadow = vi.spyOn((paper as any).slippageModel, 'applySlippage');
+    const liveShadow = vi.spyOn((live as any).slippageModel, 'applySlippage');
+    observeHardLimits(paper, 'paper');
+    observeHardLimits(live, 'live');
 
     const signal = fixtureSignal();
-    const paperDecision = decisionSnapshot(paper, signal, 'paper');
-    const liveDecision = decisionSnapshot(live, signal, 'live');
-    expect(paperDecision.hardLimit).toEqual(liveDecision.hardLimit);
-    expect(paperDecision.staleness).toBe(liveDecision.staleness);
-    expect(paperDecision.exposure).toBe(liveDecision.exposure);
-    expect(paperDecision.dailyLoss).toEqual(liveDecision.dailyLoss);
-    expect(paperDecision.funding).not.toBe(liveDecision.funding);
-    expect(paperDecision.durability).not.toBe(liveDecision.durability);
-    expect(paperDecision.conversion).not.toBe(liveDecision.conversion);
-    const [paperOrder, liveOrder] = await Promise.all([
-      paper.executeSignal({ ...signal } as any),
-      live.executeSignal({ ...signal } as any),
-    ]);
+    const blocked: Record<'paper' | 'live', any[]> = { paper: [], live: [] };
+    paper.on('executionBlocked', (event) => blocked.paper.push({ type: event.type, reason: event.reason }));
+    live.on('executionBlocked', (event) => blocked.live.push({ type: event.type, reason: event.reason }));
+    try {
+      await paper.start();
+      await live.start();
+      gateSequences.paper.length = 0;
+      gateSequences.live.length = 0;
+      hardLimitObservations.paper.length = 0;
+      hardLimitObservations.live.length = 0;
 
-    expect(paperOrder).not.toBeNull();
-    expect(liveOrder).not.toBeNull();
-    expect(normalizeIntent(paperCalls[0])).toEqual(normalizeIntent(liveCalls[0]));
-    expect(paperOrder?.symbol).toBe(liveOrder?.symbol);
-    expect(paperOrder?.side).toBe(liveOrder?.side);
-    expect(paperOrder?.amount).toBe(liveOrder?.amount);
-    expect(paperOrder?.type).toBe(liveOrder?.type);
+      const [paperOrder, liveOrder] = await Promise.all([
+        paper.executeSignal({ ...signal } as any),
+        live.executeSignal({ ...signal } as any),
+      ]);
 
-    // Legitimate divergences: paper shadow fills versus live exchange fills,
-    // live-only durability/funding/reconciliation gates, random order IDs and
-    // wall-clock timestamps. No other decision or intent divergence is allowed.
-    expect(paperOrder?.exchangeOrderId).toBe(liveOrder?.exchangeOrderId);
-    expect(typeof paperOrder?.clientOrderId).toBe('string');
-    expect(typeof liveOrder?.clientOrderId).toBe('string');
-    paper.dispose();
-    live.dispose();
+      expect(paperOrder).not.toBeNull();
+      expect(liveOrder).not.toBeNull();
+      expect(blocked.paper).toEqual([]);
+      expect(blocked.live).toEqual([]);
+      expect(hardLimitObservations.paper).toEqual(hardLimitObservations.live);
+      expect(gateSequences.paper).toEqual(['durability', 'hard_limit', 'hard_limit']);
+      expect(gateSequences.live).toEqual(['durability', 'funding', 'hard_limit', 'hard_limit']);
+      expect(normalizeIntent(paperCalls[0])).toEqual(normalizeIntent(liveCalls[0]));
+      expect(paperOrder?.symbol).toBe(liveOrder?.symbol);
+      expect(paperOrder?.side).toBe(liveOrder?.side);
+      expect(paperOrder?.amount).toBe(liveOrder?.amount);
+      expect(paperOrder?.type).toBe(liveOrder?.type);
+      expect(durabilityObservations).toEqual(expect.arrayContaining([
+        expect.objectContaining({ testMode: true, durable: true, detail: 'test/paper mode' }),
+        expect.objectContaining({ testMode: false, durable: true }),
+      ]));
+      expect(fundingObservations).toEqual([
+        expect.objectContaining({ symbol: FIXTURE.symbol, status: 'not_required' }),
+      ]);
+      // The paper path invokes the same fake venue and then applies its
+      // shadow-fidelity fill adjustment; it is not an internal no-order path.
+      expect(paperCalls).toHaveLength(1);
+      expect(liveCalls).toHaveLength(1);
+      expect(paperShadow).toHaveBeenCalled();
+      expect(liveShadow).not.toHaveBeenCalled();
+    } finally {
+      paper.dispose();
+      live.dispose();
+      (globalThis as any).truthEngine = previousTruth;
+    }
   });
 
   it('uses the mode detector honestly for replay fixtures', async () => {
@@ -179,15 +227,26 @@ describe('Pass 4C paper/live parity fixtures', () => {
     modeDetector.recordTick('rest');
     modeDetector.recordEmitLag(120_000);
     expect(modeDetector.detectMode()).toBe('REPLAY');
-    const paper = prepareEngine(true, async () => ({ id: 'replay-order' }));
-    const live = prepareEngine(false, async () => ({ id: 'replay-order' }));
-    await expect(paper.executeSignal(fixtureSignal() as any)).resolves.toBeNull();
-    await expect(live.executeSignal(fixtureSignal() as any)).resolves.toBeNull();
-    paper.dispose();
-    live.dispose();
-    // The engine consumes the resulting signal, not WorldTick itself. Replay
-    // therefore exercises the honest no-trade confidence decision rather than
-    // pretending that executeSignal is a market-data replay driver.
+    const previousTruth = (globalThis as any).truthEngine;
+    (globalThis as any).truthEngine = freshTruthEngine(FIXTURE.symbol);
+    const createOrder = vi.fn(async () => ({ id: 'replay-order' }));
+    const paper = prepareEngine(true, createOrder);
+    const blocked: any[] = [];
+    paper.on('executionBlocked', (event) => blocked.push(event));
+    try {
+      const score = getConfidenceScorer().scoreWithCurrentMode(FIXTURE.signal.confidence, 'fixture-replay');
+      expect(score.mode).toBe('REPLAY');
+      expect(score.canTrade).toBe(false);
+      expect(score.reason).toContain('REPLAY mode');
+      await expect(paper.executeSignal(fixtureSignal() as any)).resolves.toBeNull();
+      expect(createOrder).not.toHaveBeenCalled();
+      // The scorer's refusal is observable, but executeSignal currently
+      // returns without emitting executionBlocked for this branch.
+      expect(blocked).toEqual([]);
+    } finally {
+      paper.dispose();
+      (globalThis as any).truthEngine = previousTruth;
+    }
   });
 });
 
@@ -238,53 +297,60 @@ describe('Pass 4C failure injection', () => {
       return { id: 'stop-order', status: 'closed', filled: 1, price: 101, cost: 101 };
     });
     const engine = prepareEngine(false, createOrder);
-    const execution = engine.executeSignal({ ...fixtureSignal(), id: 'stop-signal' } as any);
-    await startedSignal;
-    engine.stop();
-    release();
-    const order = await execution;
-    expect(createOrder).toHaveBeenCalledOnce();
-    expect(order).not.toBeNull();
-    expect((engine as any).orders.size).toBe(1);
-    expect(engine.getStatus().config.enabled).toBe(false);
-    expect(fs.existsSync((engine as any).localStateStore.getPath())).toBe(true);
-    vi.spyOn(systemKillSwitch, 'isKilled').mockReturnValue(true);
-    await expect(engine.resume()).resolves.toBe(false);
-    engine.dispose();
+    try {
+      await engine.start();
+      const execution = engine.executeSignal({ ...fixtureSignal(), id: 'stop-signal' } as any);
+      await startedSignal;
+      engine.stop();
+      release();
+      const order = await execution;
+      expect(createOrder).toHaveBeenCalledOnce();
+      expect(order).not.toBeNull();
+      expect((engine as any).orders.size).toBe(1);
+      expect(engine.getStatus().config.enabled).toBe(false);
+      const stateFile = (engine as any).localStateStore.getPath();
+      expect(fs.existsSync(stateFile)).toBe(true);
+
+      const persistedState = fs.readFileSync(stateFile, 'utf8');
+      fs.writeFileSync(stateFile, '{corrupt', 'utf8');
+      await expect(engine.resume()).resolves.toBe(false);
+      expect(engine.getStatus().isRunning).toBe(false);
+
+      fs.writeFileSync(stateFile, persistedState, 'utf8');
+      await expect(engine.resume()).resolves.toBe(true);
+      expect(engine.getStatus().isRunning).toBe(true);
+    } finally {
+      engine.dispose();
+    }
   });
 
-  it('refuses a stale ticker at a capital-adjacent gate', async () => {
-    let now = FIXTURE.ticker.timestamp;
-    let calls = 0;
-    const venue = {
-      id: 'fixture-venue',
-      fetchTicker: async () => {
-        calls += 1;
-        if (calls > 1) throw new Error('stale refresh unavailable');
-        return { ...FIXTURE.ticker };
-      },
-    };
-    const cache = new TickerSnapshotCache(new Map([['fixture-venue', venue]]), 5_000, {
-      clock: () => now,
-    });
-    await cache.getTicker(FIXTURE.symbol, venue);
-    now += 10_000;
-    const staleTicker = await cache.getTicker(FIXTURE.symbol, venue, 1_000);
-    expect(staleTicker).toBeNull();
+  it('refuses stale TruthEngine consensus at a capital-adjacent gate', async () => {
     const truth = (globalThis as any).truthEngine;
-    (globalThis as any).truthEngine = {
-      isTradeable: () => staleTicker
-        ? { ok: true }
-        : { ok: false, reason: 'ticker_unknown_stale' },
-    };
-    const engine = new LiveTradingEngine({ enabled: true, testMode: true });
-    (engine as any).exchange = fakeExchange(vi.fn());
+    const actualTruth = freshTruthEngine(FIXTURE.symbol);
+    // Use the real TruthEngine store and gate; only the consensus timestamp is
+    // aged here to inject the stale condition without replacing isTradeable.
+    const consensus = (actualTruth as any).store.get(FIXTURE.symbol);
+    consensus.timestamp = Date.now() - 120_000;
+    (globalThis as any).truthEngine = actualTruth;
+    const createOrder = vi.fn(async () => ({ id: 'stale-order' }));
+    const engine = prepareEngine(true, createOrder);
     setLiveMode();
     const blocked = vi.fn();
     engine.on('executionBlocked', blocked);
-    await engine.executeSignal({ ...fixtureSignal(), id: 'stale-signal' } as any);
-    expect(blocked).toHaveBeenCalledWith(expect.objectContaining({ reason: 'ticker_unknown_stale' }));
-    (globalThis as any).truthEngine = truth;
-    engine.dispose();
+    try {
+      expect(actualTruth.isTradeable(FIXTURE.symbol, { maxAgeMs: 1_000 })).toEqual({
+        ok: false,
+        reason: expect.stringMatching(/^stale:/),
+      });
+      await engine.executeSignal({ ...fixtureSignal(), id: 'stale-signal' } as any);
+      expect(createOrder).not.toHaveBeenCalled();
+      expect(blocked).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'truth',
+        reason: expect.stringMatching(/^stale:/),
+      }));
+    } finally {
+      (globalThis as any).truthEngine = truth;
+      engine.dispose();
+    }
   });
 });

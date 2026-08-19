@@ -147,7 +147,7 @@ that no longer exist and are not wired into the runner.
 | P1 | Safety metrics are process-local and reset on restart; no Prometheus/OTel exporter, no correlation IDs end-to-end |
 | P1 | `typecheck` reports 362 pre-existing errors (mostly legacy `tests/` and Express 5 `req.params` typing). CI does not gate on it; the number was unchanged by this pass and none of the new files error |
 | P2 | 36 `(global as any)` service handoffs; no DI |
-| P2 | Indicator recomputation cost unmeasured; replay/paper/live parity unverified |
+| P2 | Indicator recomputation cost unmeasured; full market-data replay/MIXED parity remains unverified |
 | P2 | Rich `/api/health` still contains hard-coded exchange counts and placeholder freshness values |
 
 ---
@@ -365,8 +365,8 @@ distinctions are unchanged.
 | P0 | **Closed in Hardening Pass 3 Phase B:** funding accounting and the unknown-funding gate are covered in §9.3; venue support remains a Pass 4 item |
 | P1 | **Closed in Hardening Pass 3 Phase A:** `resume()` awaits startup and reports failure when durability, local state, initialization or reconciliation refuses the start |
 | P1 | **Closed in Pass 4B:** cache key uniqueness, TTL, invalidation, stampede and memory-only restart semantics; no persisted live cache was found, so persisted-cache corruption is not applicable |
-| P1 | **Closed in Pass 4C:** fixture-driven paper/live decision and order-intent parity, with explicit divergence assertions and replay-mode no-trade coverage |
-| P1 | **Closed in Pass 4C:** concurrent flatten, operator stop during an in-flight order, and stale-cache refusal failure-injection cases |
+| P1 | **Partially closed in Pass 4C:** fixture-driven paper/live gate observations and order-intent parity; full market-data replay and MIXED-mode parity remain unexercised |
+| P1 | **Partially closed in Pass 4C:** concurrent flatten, operator stop during an in-flight order, and stale TruthEngine refusal are covered; the ticker cache has no capital-adjacent consumer, so cache-specific gate wiring remains unproven |
 | P1 | Route groups classified above still need per-group tests, and `/api/execution` needs operator auth |
 | P2 | Legacy `tests/` suites and the 362-error typecheck baseline are still unclassified; `(global as any)` handoffs and indicator cost remain unmeasured |
 
@@ -499,19 +499,32 @@ work is tracked below rather than hidden by this pass.
 | P0 | **Closed in Pass 4A:** same-venue direct/inverse conversion for non-quote fees and funding; stale or unavailable prices remain unknown |
 | P0 | **Closed in Pass 4A:** funding source fallback through declared `fetchLedger` funding entries; venues declaring neither source refuse explicitly |
 | P1 | **Closed in Pass 4B:** venue-scoped keys, explicit age bounds, invalidation, concurrency limits, single-flight, failure backoff and memory-only restart semantics. No persisted live cache was found, so persisted-cache corruption is not applicable |
-| P1 | **Closed in Pass 4C:** fixture-driven replay/paper/live decision and order-intent parity plus the named failure-injection cases |
+| P1 | **Partially closed in Pass 4C:** fixture-driven paper/live gate observations and order-intent parity, plus a REPLAY confidence-scorer oracle; the full historical pipeline and MIXED mode are not reproducible in-process |
 | P1 | Per-route tests for the classified disabled groups and operator authentication for `/api/execution` |
 | P2 | Legacy 362-error typecheck baseline classification, `(global as any)` handoffs and indicator cost measurement |
 
 The parity fixture intentionally records the legitimate paper/live differences:
 live-only durability, funding and conversion gates; generated client-order IDs;
-paper shadow-fill behavior versus venue fills; and wall-clock timestamps. Any
-other intent-field or gate divergence fails the fixture. The mode detector's
-`REPLAY` path is exercised as a no-trade decision oracle; the engine consumes
-signals rather than `WorldTick` directly, so this is not a claim that the
-full historical market-data pipeline is an in-process replay driver. `MIXED`
-mode (REST backfill plus live WebSocket updates) is not reproducibly generated
-by this fixture and remains an operational validation item.
+paper shadow-fidelity post-processing versus live exchange-reported fills; and
+wall-clock timestamps. Any other observed gate or intent-field divergence fails
+the fixture. Funding and durability observations come from the real engine
+calls; this spot fixture observes funding as `not_required`, and conversion is
+not exercised because there is no non-quote fee or funding payment. The
+successful reconciliation, exposure, daily-loss and final sizing gates do not
+emit individual success events; the fixture observes their non-blocking path
+and the resulting order amount rather than fabricating per-gate "passed"
+labels.
+mode-detector `REPLAY` path is verified through the confidence scorer's
+explicit no-trade result, but `executeSignal` currently returns without an
+`executionBlocked` event for that branch. The engine consumes signals rather
+than `WorldTick` directly, so the full historical market-data pipeline and
+`MIXED` mode (REST backfill plus live WebSocket updates) remain operational
+validation items.
+
+The stale-data failure fixture uses the production `TruthEngine.isTradeable`
+path and observes its `stale:<age>` refusal. `TickerSnapshotCache` remains a
+memory-only optimization with no capital-adjacent consumer in the current
+engine, so no test claims that the cache itself gates execution.
 
 Scanstream remains **not production-ready for live capital**. The hardening
 direction is fail-closed, but route coverage, legacy typecheck classification,
