@@ -2,6 +2,7 @@ import { EventEmitter } from 'events';
 import * as fs from 'fs';
 import * as path from 'path';
 import { fileURLToPath } from 'url';
+import { safetyEventLog } from './observability/safety-event-log';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -74,6 +75,11 @@ class SystemKillSwitch extends EventEmitter {
       timestamp: new Date().toISOString()
     };
     this.persist();
+    safetyEventLog.record({
+      type: 'kill_switch',
+      detail: `activated: ${this.state.reason}`,
+      data: { setBy: this.state.setBy },
+    });
     this.emit('kill', this.getState());
     console.warn('[SystemKillSwitch] system killed:', this.state);
   }
@@ -94,6 +100,11 @@ class SystemKillSwitch extends EventEmitter {
       throw new Error('Cannot clear kill switch: failed to persist cleared state');
     }
 
+    safetyEventLog.record({
+      type: 'kill_switch',
+      detail: 'cleared',
+      data: { clearedBy: this.state.setBy, previousReason: previous.reason },
+    });
     this.emit('clear', this.getState());
     console.info('[SystemKillSwitch] kill cleared');
   }

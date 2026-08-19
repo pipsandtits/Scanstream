@@ -8,6 +8,7 @@ import { type IStorage } from './storage';
 import { type MarketFrame, type Signal, type Trade, type Strategy, type BacktestResult, type InsertMarketFrame, type InsertSignal, type InsertTrade, type InsertStrategy, type InsertBacktestResult, type MarketSentiment, type PortfolioSummary, type ModelMetric, type InsertModelMetric } from "@shared/schema";
 import { v4 as uuidv4 } from 'uuid';
 import { randomUUID } from 'crypto';
+import { durabilityGate } from './services/execution/durability-gate';
 
 // Simple in-memory fallback to avoid circular dependency
 class SimpleFallbackStorage implements IStorage {
@@ -334,6 +335,16 @@ export class DbStorage implements IStorage {
     return this.isReady();
   }
 
+  /**
+   * Actively verify the connection instead of trusting the cached flag, which
+   * can be stale if the database disappeared since the last periodic check.
+   */
+  async verifyDatabaseConnection(): Promise<boolean> {
+    if (!this.prisma) return false;
+    await this.testConnection();
+    return this.isReady();
+  }
+
   private async tryPrismaCreate(modelNames: string[], data: any) {
     for (const name of modelNames) {
       try {
@@ -377,6 +388,8 @@ export class DbStorage implements IStorage {
     try { this.eventBridge = require('./services/phase5-event-bridge').phase5EventBridge; } catch (e) { this.eventBridge = null; }
     // start connection check and expose readiness promise
     this.ready = this.testConnection();
+    // Live execution asks the gate, not this class, whether state is durable.
+    durabilityGate.setProbe(() => this.verifyDatabaseConnection());
     // Ensure fallback queue directory exists
     try {
       const dir = path.join(process.cwd(), 'data');

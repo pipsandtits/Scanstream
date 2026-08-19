@@ -20,6 +20,19 @@ import OrderRetryPolicy from './services/order-retry-policy';
 import { evaluatePreTrade, type HardLimits } from './services/risk/hard-limit-gate';
 import { reconcileByClientOrderId, isAmbiguousError, buildClientOrderId } from './services/execution/order-reconciler';
 import { recordExecutionBlocked, recordOrderReconciliation, recordFlattenAll } from './services/observability/safety-metrics';
+import { durabilityGate } from './services/execution/durability-gate';
+import {
+  applyFills,
+  classifyOutcome,
+  computeSlippagePct,
+  createFillAccount,
+  type ExchangeFill,
+  type FeeTotal,
+  type FillAccount,
+  type OrderOutcome,
+} from './services/execution/fill-accounting';
+import { reconcileAtStartup, type ReconciliationReport } from './services/execution/startup-reconciler';
+import { safetyEventLog } from './services/observability/safety-event-log';
 
 // Small helper to bound a promise with a timeout. Returns null on timeout or error.
 async function promiseWithTimeout<T>(p: Promise<T>, ms: number): Promise<T | null> {
@@ -64,6 +77,17 @@ interface LiveOrder {
     cost: number;
     currency: string;
   };
+  /** Fees per currency, never collapsed into one number. */
+  fees?: FeeTotal[];
+  /** Volume-weighted average execution price, null until something fills. */
+  avgPrice?: number | null;
+  /** Price the sizing decision was made on, for real slippage measurement. */
+  requestedPrice?: number | null;
+  /** Signed slippage vs requestedPrice in percent; null when unknown. */
+  slippagePct?: number | null;
+  outcome?: OrderOutcome;
+  /** Idempotent fill ledger; the authoritative source of filled/cost. */
+  account?: FillAccount;
   timestamp: number;
   signalId?: string;
 }
@@ -119,6 +143,12 @@ export class LiveTradingEngine extends EventEmitter {
   private retryPolicy: OrderRetryPolicy;
   private consecutiveFailures: number = 0;
   private circuitBreakerThreshold: number = 5; // pause after N consecutive failures
+  private onKill?: (state: any) => void;
+  private onKillCleared?: (state: any) => void;
+  private onBreakerActivated?: (state: any) => void;
+  private onBreakerCleared?: (state: any) => void;
+  /** Null until startup reconciliation has run in this process. */
+  private reconciliation: ReconciliationReport | null = null;
   private flattening: boolean = false;
   private flattenInFlight: Promise<FlattenResult> | null = null;
   private hardLimitOverrides: Partial<HardLimits> = {};
@@ -137,9 +167,11 @@ export class LiveTradingEngine extends EventEmitter {
       ...config
     };
 
-    // Listen for global kill-switch events
+    // Listen for global kill-switch events. Handlers are retained so they can
+    // be detached in dispose() — the switch and breaker are process-wide
+    // singletons, so leaked handlers accumulate for the life of the process.
     try {
-      systemKillSwitch.on('kill', async (state) => {
+      this.onKill = async (state: any) => {
         const logger = new ModuleLogger('LiveTrading');
         logger.warn('Global kill-switch activated, pausing trading', state);
         // Pause engine immediately
@@ -155,11 +187,12 @@ export class LiveTradingEngine extends EventEmitter {
             logger.error('Error while attempting force-close after kill', e);
           }
         }
-      });
+      };
+      systemKillSwitch.on('kill', this.onKill);
 
       // Listen for global circuit breaker activation
       try {
-        liveCircuitBreaker.on('activated', async (s: any) => {
+        this.onBreakerActivated = async (s: any) => {
           const logger = new ModuleLogger('LiveTrading');
           logger.warn('Global circuit breaker activated, halting new placements', s);
           // Prevent new placements
@@ -175,20 +208,23 @@ export class LiveTradingEngine extends EventEmitter {
               }
             }
           }
-        });
-        liveCircuitBreaker.on('cleared', (s: any) => {
+        };
+        liveCircuitBreaker.on('activated', this.onBreakerActivated);
+        this.onBreakerCleared = (s: any) => {
           const logger = new ModuleLogger('LiveTrading');
           logger.info('Global circuit breaker cleared', s);
           // Clearing the breaker never re-enables trading on its own: the kill
           // switch may still be set and the operator may have stopped the
           // engine deliberately. Resuming is an explicit operator action.
           this.emit('circuitBreakerCleared', s);
-        });
+        };
+        liveCircuitBreaker.on('cleared', this.onBreakerCleared);
       } catch (e) {}
-      systemKillSwitch.on('clear', (state) => {
+      this.onKillCleared = (state: any) => {
         const logger = new ModuleLogger('LiveTrading');
         logger.info('Global kill-switch cleared', state);
-      });
+      };
+      systemKillSwitch.on('clear', this.onKillCleared);
     } catch (e) {
       // ignore if kill-switch unavailable
     }
@@ -288,8 +324,33 @@ export class LiveTradingEngine extends EventEmitter {
       throw new Error(`Cannot start live trading: kill-switch active (${state.reason || 'unspecified'})`);
     }
 
+    // Live trading without durable persistence would leave real exchange
+    // exposure that no local state can reconstruct after a restart.
+    const durability = await durabilityGate.requireForLive(this.config.testMode);
+    if (!durability.durable) {
+      new ModuleLogger('LiveTrading').error('Start refused: durable persistence unavailable', durability);
+      recordExecutionBlocked('durable_state_unavailable');
+      this.emit('startRefused', { reason: 'durable_state_unavailable', durability });
+      throw new Error(
+        `Cannot start live trading: durable persistence unavailable (${durability.reason}: ${durability.detail})`
+      );
+    }
+
     if (!this.exchange) {
       await this.initialize();
+    }
+
+    // Barrier: we must know what the exchange thinks is true before we add to
+    // it. Paper/test mode has no real exchange state to reconcile against.
+    if (!this.config.testMode) {
+      const report = await this.reconcileWithExchange();
+      if (!report.complete) {
+        recordExecutionBlocked('reconciliation_incomplete');
+        this.emit('startRefused', { reason: 'reconciliation_incomplete', report });
+        throw new Error(
+          `Cannot start live trading: startup reconciliation incomplete (${report.blockedReason})`
+        );
+      }
     }
 
     this.isRunning = true;
@@ -334,6 +395,47 @@ export class LiveTradingEngine extends EventEmitter {
     if (this.flattening) {
       logger.warn('Execution blocked: flatten-all in progress');
       this.emit('executionBlocked', { type: 'flattening', reason: 'flatten_in_progress', symbol: signal.symbol });
+      return null;
+    }
+
+    // Re-checked per order (cheaply, behind a short probe cache) so a database
+    // that disappears mid-session stops live execution rather than accumulating
+    // untracked orders.
+    const durability = await durabilityGate.requireForLive(this.config.testMode);
+    if (!durability.durable) {
+      logger.error(`Execution blocked: durable persistence unavailable (${durability.reason})`, durability);
+      recordExecutionBlocked('durable_state_unavailable');
+      safetyEventLog.record({
+        type: 'durability_failure',
+        detail: `execution blocked: ${durability.reason}`,
+        data: { symbol: signal.symbol, signalId: signal.id },
+      });
+      this.emit('executionBlocked', {
+        type: 'durability',
+        reason: 'durable_state_unavailable',
+        detail: durability.detail,
+        symbol: signal.symbol,
+        signalId: signal.id,
+        timestamp: Date.now(),
+      });
+      return null;
+    }
+
+    // Nothing may be placed until we have established what the exchange
+    // already holds. Re-checked per order because a mid-session reconciliation
+    // failure must also stop execution.
+    if (!this.config.testMode && !this.reconciliation?.complete) {
+      const reason = this.reconciliation?.blockedReason ?? 'reconciliation_not_run';
+      logger.error(`Execution blocked: startup reconciliation not complete (${reason})`);
+      recordExecutionBlocked('reconciliation_incomplete');
+      this.emit('executionBlocked', {
+        type: 'reconciliation',
+        reason: 'reconciliation_incomplete',
+        detail: reason,
+        symbol: signal.symbol,
+        signalId: signal.id,
+        timestamp: Date.now(),
+      });
       return null;
     }
 
@@ -798,6 +900,7 @@ export class LiveTradingEngine extends EventEmitter {
         }
       }
 
+      const account = this.buildInitialFillAccount(order, currentAmount);
       const liveOrder: LiveOrder = {
         id: typeof randomUUID === 'function' ? randomUUID() : `order-${Date.now()}`,
         exchangeOrderId: order.id,
@@ -806,13 +909,25 @@ export class LiveTradingEngine extends EventEmitter {
         type: 'market',
         amount: currentAmount,
         status: order.status as any,
-        filled: order.filled || 0,
-        remaining: order.remaining || currentAmount,
-        cost: order.cost || 0,
-        fee: order.fee ? {
-          cost: typeof order.fee.cost === 'number' ? order.fee.cost : Number(order.fee.cost) || 0,
-          currency: String(order.fee.currency || 'USDT')
-        } : undefined,
+        filled: account.filled,
+        remaining: account.remaining,
+        cost: account.cost,
+        fee: account.fees[0]
+          ? { ...account.fees[0] }
+          : (order.fee
+              ? {
+                  cost: typeof order.fee.cost === 'number' ? order.fee.cost : Number(order.fee.cost) || 0,
+                  currency: String(order.fee.currency || 'USDT'),
+                }
+              : undefined),
+        fees: account.fees,
+        avgPrice: account.avgPrice,
+        // Recorded so slippage is measured against the price the decision used,
+        // not against the execution itself.
+        requestedPrice: signal.price ?? null,
+        slippagePct: computeSlippagePct(signal.price ?? null, account.avgPrice, signal.type.toLowerCase() as 'buy' | 'sell'),
+        outcome: classifyOutcome(order.status, account, currentAmount),
+        account,
         timestamp: order.timestamp || Date.now(),
         signalId: signal.id
       };
@@ -878,9 +993,11 @@ export class LiveTradingEngine extends EventEmitter {
       if (reservationToken) reservationTokens.push(reservationToken);
       // Register position with portfolio manager (best-effort)
       try {
+        // Size the registered position on what actually executed; fall back to
+        // the requested amount only while nothing has filled yet.
         const filledQty = liveOrder.filled > 0 ? liveOrder.filled : amount;
-        const avgPrice = filledQty > 0 && liveOrder.cost > 0 ? liveOrder.cost / filledQty : (signal.price || 0);
-        const sizeUsd = (avgPrice || signal.price || 0) * amount;
+        const avgPrice = liveOrder.avgPrice ?? (signal.price || 0);
+        const sizeUsd = (avgPrice || signal.price || 0) * filledQty;
         portfolioRiskManager.addPosition({
           symbol: liveOrder.symbol,
           side: liveOrder.side === 'buy' ? 'BUY' : 'SELL',
@@ -918,8 +1035,14 @@ export class LiveTradingEngine extends EventEmitter {
         }
       } catch (e) { logger.warn('Feedback detection error', e); }
 
-      // record a fill placeholder (actual fill recorded in checkOrders when closed)
-      try { executionMetrics.recordFill(signal.symbol, liveOrder.filled); } catch (e) {}
+      // Only the quantity that actually executed at placement; subsequent
+      // fills are recorded once, as deltas, by applyOrderSnapshot.
+      if (liveOrder.filled > 0) {
+        try { executionMetrics.recordFill(signal.symbol, liveOrder.filled); } catch (e) {}
+      }
+      if (liveOrder.slippagePct !== null && liveOrder.slippagePct !== undefined) {
+        try { executionMetrics.recordSlippage(signal.symbol, liveOrder.slippagePct); } catch (e) {}
+      }
 
       // success -> reset circuit breaker
       this.consecutiveFailures = 0;
@@ -964,7 +1087,7 @@ export class LiveTradingEngine extends EventEmitter {
           tradeId: liveOrder.id,
           symbol: signal.symbol,
           side: signal.type === 'BUY' ? 'BUY' : 'SELL',
-          entryPrice: (liveOrder.cost || 0) / (liveOrder.filled || 1),
+          entryPrice: liveOrder.avgPrice ?? signal.price ?? 0,
           entryTime: new Date(),
           quantity: liveOrder.filled,
           frames: frames as any,
@@ -1226,11 +1349,24 @@ export class LiveTradingEngine extends EventEmitter {
 
     try {
       const positions = await this.exchange.fetchPositions();
-      
+      if (!Array.isArray(positions)) {
+        // An unparseable answer is not evidence that we are flat.
+        new ModuleLogger('LiveTrading').warn('Position refresh returned no usable array; keeping local view');
+        return;
+      }
+
+      // The exchange is authoritative. Positions are keyed by symbol so a
+      // refresh updates the existing entry instead of appending a new one per
+      // poll (the old `${symbol}-${timestamp}` id multiplied one real position
+      // into dozens, inflating open-position and exposure counts).
+      const seenSymbols = new Set<string>();
+
       for (const pos of positions) {
         if (Math.abs(pos.contracts || 0) > 0) {
+          const existing = this.positions.get(pos.symbol);
+          seenSymbols.add(pos.symbol);
           const livePos: LivePosition = {
-            id: `${pos.symbol}-${pos.timestamp}`,
+            id: pos.symbol,
             symbol: pos.symbol,
             side: (pos.side as 'long' | 'short') || 'long',
             entryPrice: pos.entryPrice || 0,
@@ -1241,11 +1377,13 @@ export class LiveTradingEngine extends EventEmitter {
             pnlPercent: pos.percentage || 0,
             stopLoss: undefined,
             takeProfit: undefined,
-            openTime: pos.timestamp || Date.now(),
+            openTime: existing?.openTime ?? pos.timestamp ?? Date.now(),
             marginUsed: pos.initialMargin || 0,
             liquidationPrice: pos.liquidationPrice,
-            orders: []
+            orders: existing?.orders ?? []
           };
+          livePos.stopLoss = existing?.stopLoss;
+          livePos.takeProfit = existing?.takeProfit;
 
           this.positions.set(livePos.id, livePos);
 
@@ -1261,12 +1399,50 @@ export class LiveTradingEngine extends EventEmitter {
           } catch (rlError) {
             new ModuleLogger('LiveTrading').warn(`RL onTradeTick callback error: ${rlError}`);
           }
+        } else if (pos?.symbol) {
+          // Explicitly reported flat.
+          seenSymbols.add(pos.symbol);
+        }
+      }
+
+      // A position the exchange explicitly reports as flat is closed and is
+      // dropped. A position merely *absent* from the response is NOT treated as
+      // closed — the response may be filtered or truncated, and turning unknown
+      // into absent would silently shrink measured exposure. Those are surfaced
+      // for reconciliation instead, and keep counting toward risk limits.
+      for (const [id, position] of Array.from(this.positions.entries())) {
+        const stillOpen = positions.some(
+          (p: any) => p?.symbol === position.symbol && Math.abs(p?.contracts || 0) > 0
+        );
+        if (!stillOpen && !seenSymbols.has(position.symbol)) {
+          this.emit('positionUnconfirmed', {
+            positionId: id,
+            symbol: position.symbol,
+            timestamp: Date.now(),
+          });
+          continue;
+        }
+        if (!stillOpen) {
+          this.positions.delete(id);
+          this.emit('positionClosedExternally', {
+            positionId: id,
+            symbol: position.symbol,
+            timestamp: Date.now(),
+          });
+          try {
+            portfolioRiskManager.removePosition(position.symbol);
+          } catch (pmErr) {
+            new ModuleLogger('LiveTrading').warn('Failed to remove externally closed position', pmErr);
+          }
         }
       }
 
       this.emit('positionsUpdated', Array.from(this.positions.values()));
     } catch (error) {
+      // Fail closed on unknown position state: keep the local view (which is
+      // never smaller than what we know about) rather than assuming flat.
       new ModuleLogger('LiveTrading').error('Failed to update positions', error);
+      this.emit('positionRefreshFailed', { timestamp: Date.now() });
     }
   }
 
@@ -1276,50 +1452,280 @@ export class LiveTradingEngine extends EventEmitter {
   private async checkOrders(): Promise<void> {
     if (!this.exchange) return;
 
-    for (const [orderId, order] of this.orders.entries()) {
-      if (order.status === 'open' || order.status === 'pending') {
-        try {
-          const updated = await this.exchange.fetchOrder(order.exchangeOrderId, order.symbol);
-          
-          if (updated.status !== order.status) {
-            order.status = updated.status as any;
-            order.filled = updated.filled || 0;
-            order.remaining = updated.remaining || 0;
-            order.cost = updated.cost || 0;
+    for (const order of this.orders.values()) {
+      if (order.status !== 'open' && order.status !== 'pending') continue;
+      try {
+        const updated = await this.exchange.fetchOrder(order.exchangeOrderId, order.symbol);
+        // Applied on every poll, not only on status transitions: an order can
+        // accumulate partial fills while staying 'open'.
+        await this.applyOrderSnapshot(order, updated);
+      } catch (error) {
+        // An order we cannot query is in an UNKNOWN state, not a finished one.
+        new ModuleLogger('LiveTrading').warn(
+          `Order state unknown: fetchOrder failed for ${order.exchangeOrderId} (${order.symbol})`
+        );
+        recordOrderReconciliation('unknown');
+        this.emit('orderStateUnknown', {
+          orderId: order.id,
+          exchangeOrderId: order.exchangeOrderId,
+          symbol: order.symbol,
+          timestamp: Date.now(),
+        });
+      }
+    }
+  }
 
-            this.emit('orderUpdated', order);
-            
-            if (order.status === 'closed') {
-              const info = `${order.side} ${order.filled.toFixed(4)} ${order.symbol} @ $${(order.cost / order.filled).toFixed(2)}`;
-              new ModuleLogger('LiveTrading').info(`Order filled: ${info}`);
-              // record execution metrics
-              try {
-                const avgPrice = (order.cost || 0) / Math.max(1, order.filled || 1);
-                // slippage is unknown here; record 0 as placeholder
-                executionMetrics.recordFill(order.symbol, order.filled || 0);
-                executionMetrics.recordSlippage(order.symbol, 0);
-                // Update portfolio risk manager price for this symbol
-                try {
-                  portfolioRiskManager.updatePositionPrice(order.symbol, avgPrice);
-                } catch (pmErr) {
-                  new ModuleLogger('LiveTrading').warn('Failed to update PortfolioRiskManager after order fill', pmErr);
-                }
-                // Update order audit with fills and realized pnl if available
-                try {
-                  const fills = [{ filled: order.filled, cost: order.cost, avgPrice }];
-                  const realizedPnl = null; // compute later with position info
-                  await db.updateOrderAudit(order.exchangeOrderId || order.id, { fills, realSlippage: 0, realizedPnl });
-                } catch (e) {
-                  new ModuleLogger('LiveTrading').warn('Failed to update order audit after fill', e);
-                }
-              } catch (e) {}
-            }
-          }
-        } catch (error) {
-          // Order might be cancelled or expired
-          console.warn(`[Live Trading] Could not fetch order ${order.exchangeOrderId}`);
+  /**
+   * Compare local state with the exchange and adopt the exchange's view of
+   * positions. Discrepancies we cannot resolve leave the barrier closed.
+   */
+  async reconcileWithExchange(): Promise<ReconciliationReport> {
+    const logger = new ModuleLogger('LiveTrading');
+    const report = await reconcileAtStartup({
+      exchange: this.exchange as any,
+      localOrders: Array.from(this.orders.values()).map((o) => ({
+        id: o.id,
+        exchangeOrderId: o.exchangeOrderId,
+        clientOrderId: null,
+        symbol: o.symbol,
+        amount: o.amount,
+        filled: o.filled,
+        status: o.status,
+      })),
+      localPositions: Array.from(this.positions.values()).map((p) => ({
+        id: p.id,
+        symbol: p.symbol,
+        quantity: p.quantity,
+      })),
+    });
+
+    // Adopting exchange positions is idempotent: keyed by symbol, replacing
+    // rather than appending, so repeated reconciliation cannot duplicate them.
+    for (const pos of report.positions) {
+      const existing = this.positions.get(pos.symbol);
+      this.positions.set(pos.symbol, {
+        id: pos.symbol,
+        symbol: pos.symbol,
+        side: pos.side,
+        entryPrice: pos.entryPrice,
+        currentPrice: pos.markPrice,
+        quantity: pos.quantity,
+        leverage: pos.leverage,
+        pnl: pos.unrealizedPnl,
+        pnlPercent: existing?.pnlPercent ?? 0,
+        stopLoss: existing?.stopLoss,
+        takeProfit: existing?.takeProfit,
+        openTime: existing?.openTime ?? Date.now(),
+        marginUsed: pos.marginUsed,
+        liquidationPrice: existing?.liquidationPrice,
+        orders: existing?.orders ?? [],
+      });
+    }
+
+    this.reconciliation = report;
+
+    safetyEventLog.record({
+      type: 'startup_reconciliation',
+      detail: report.complete ? 'complete' : `incomplete: ${report.blockedReason}`,
+      data: {
+        positions: report.positions.length,
+        openOrders: report.orders.length,
+        discrepancies: report.discrepancies,
+      },
+    });
+
+    if (report.complete) {
+      logger.info(
+        `Startup reconciliation complete: ${report.positions.length} position(s), ${report.orders.length} open order(s)`
+      );
+    } else {
+      logger.error(`Startup reconciliation INCOMPLETE: ${report.blockedReason}`, {
+        discrepancies: report.discrepancies,
+      });
+    }
+    this.emit('reconciliation', report);
+    return report;
+  }
+
+  /** Last reconciliation result, for operator/health reporting. */
+  getReconciliation(): ReconciliationReport | null {
+    return this.reconciliation;
+  }
+
+  /**
+   * Seed a fill ledger from the placement response.
+   */
+  private buildInitialFillAccount(snapshot: any, requestedAmount: number): FillAccount {
+    const empty = createFillAccount();
+    const trades: any[] = Array.isArray(snapshot?.trades) ? snapshot.trades : [];
+    if (trades.length > 0) {
+      return applyFills(
+        empty,
+        trades.map((t) => ({
+          id: String(t?.id ?? ''),
+          amount: t?.amount,
+          price: t?.price,
+          cost: t?.cost,
+          fee: t?.fee ?? null,
+          takerOrMaker: t?.takerOrMaker ?? null,
+          timestamp: t?.timestamp ?? null,
+        })),
+        requestedAmount
+      ).account;
+    }
+
+    const filled = Number(snapshot?.filled);
+    const cost = Number(snapshot?.cost);
+    const average = Number(snapshot?.average ?? snapshot?.price);
+    const resolvedFilled = Number.isFinite(filled) && filled > 0 ? filled : 0;
+    const resolvedCost = Number.isFinite(cost) && cost > 0
+      ? cost
+      : (resolvedFilled > 0 && Number.isFinite(average) && average > 0 ? resolvedFilled * average : 0);
+
+    const fees: FeeTotal[] = [];
+    const feeCost = Number(snapshot?.fee?.cost);
+    if (Number.isFinite(feeCost) && feeCost !== 0) {
+      fees.push({ currency: String(snapshot?.fee?.currency || 'UNKNOWN').toUpperCase(), cost: feeCost });
+    }
+
+    return {
+      ...empty,
+      filled: resolvedFilled,
+      cost: resolvedCost,
+      avgPrice: resolvedFilled > 0 && resolvedCost > 0 ? resolvedCost / resolvedFilled : null,
+      remaining: Math.max(0, requestedAmount - resolvedFilled),
+      fees,
+    };
+  }
+
+  /**
+   * Fold an exchange order snapshot into local state through the fill ledger.
+   *
+   * Two modes, because exchanges differ: when the snapshot carries individual
+   * trades we accumulate them idempotently by trade id; otherwise we adopt the
+   * snapshot's absolute filled/cost, which is also idempotent because it is a
+   * replacement rather than an addition.
+   */
+  private async applyOrderSnapshot(order: LiveOrder, snapshot: any): Promise<void> {
+    const logger = new ModuleLogger('LiveTrading');
+    const previousFilled = order.filled;
+    const previousStatus = order.status;
+
+    if (!order.account) order.account = createFillAccount();
+
+    const trades: any[] = Array.isArray(snapshot?.trades) ? snapshot.trades : [];
+    if (trades.length > 0) {
+      const fills: ExchangeFill[] = trades.map((t) => ({
+        id: String(t?.id ?? ''),
+        amount: t?.amount,
+        price: t?.price,
+        cost: t?.cost,
+        fee: t?.fee ?? null,
+        takerOrMaker: t?.takerOrMaker ?? null,
+        timestamp: t?.timestamp ?? null,
+      }));
+      const result = applyFills(order.account, fills, order.amount);
+      order.account = result.account;
+      const unusable = result.rejected.filter((r) => r.reason !== 'duplicate');
+      if (unusable.length > 0) {
+        logger.warn(`Discarded ${unusable.length} unusable fill record(s) for ${order.exchangeOrderId}`);
+      }
+    } else {
+      // Snapshot mode: absolute values reported by the exchange.
+      const filled = Number(snapshot?.filled);
+      const cost = Number(snapshot?.cost);
+      if (Number.isFinite(filled) && filled >= 0) {
+        const resolvedCost = Number.isFinite(cost) && cost > 0
+          ? cost
+          : (Number.isFinite(Number(snapshot?.average)) && Number(snapshot?.average) > 0
+              ? filled * Number(snapshot.average)
+              : order.account.cost);
+        order.account = {
+          ...order.account,
+          filled,
+          cost: resolvedCost,
+          avgPrice: filled > 0 && resolvedCost > 0 ? resolvedCost / filled : null,
+          remaining: Math.max(0, order.amount - filled),
+        };
+      }
+      const snapshotFee = snapshot?.fee;
+      const feeCost = Number(snapshotFee?.cost);
+      if (Number.isFinite(feeCost) && feeCost !== 0) {
+        order.account.fees = [{ currency: String(snapshotFee?.currency || 'UNKNOWN').toUpperCase(), cost: feeCost }];
+      }
+    }
+
+    order.filled = order.account.filled;
+    order.cost = order.account.cost;
+    order.remaining = order.account.remaining;
+    order.avgPrice = order.account.avgPrice;
+    order.fees = order.account.fees;
+    order.fee = order.account.fees[0] ? { ...order.account.fees[0] } : order.fee;
+    order.slippagePct = computeSlippagePct(order.requestedPrice ?? order.price ?? null, order.avgPrice, order.side);
+
+    const outcome = classifyOutcome(snapshot?.status, order.account, order.amount);
+    order.outcome = outcome;
+    order.status = (typeof snapshot?.status === 'string' ? snapshot.status : order.status) as LiveOrder['status'];
+
+    const filledDelta = order.filled - previousFilled;
+    if (filledDelta === 0 && order.status === previousStatus) return;
+
+    if (filledDelta > 0) {
+      try { executionMetrics.recordFill(order.symbol, filledDelta); } catch { /* metrics are best-effort */ }
+      if (order.slippagePct !== null && order.slippagePct !== undefined) {
+        try { executionMetrics.recordSlippage(order.symbol, order.slippagePct); } catch { /* best-effort */ }
+      }
+      if (order.avgPrice) {
+        try {
+          portfolioRiskManager.updatePositionPrice(order.symbol, order.avgPrice);
+        } catch (pmErr) {
+          logger.warn('Failed to update PortfolioRiskManager after fill', pmErr);
         }
       }
+    }
+
+    this.emit('orderUpdated', order);
+
+    if (outcome === 'filled' || outcome === 'canceled_partially_filled' || outcome === 'canceled_unfilled') {
+      logger.info(
+        `Order ${outcome}: ${order.side} ${order.filled} ${order.symbol}` +
+          (order.avgPrice ? ` @ ${order.avgPrice}` : '') +
+          (order.slippagePct !== null && order.slippagePct !== undefined
+            ? ` (slippage ${order.slippagePct.toFixed(4)}%)`
+            : ' (slippage unknown)')
+      );
+      if (outcome === 'canceled_partially_filled') {
+        // A cancel that left exposure behind is not a no-op.
+        this.emit('orderCanceledWithFills', {
+          orderId: order.id,
+          exchangeOrderId: order.exchangeOrderId,
+          symbol: order.symbol,
+          filled: order.filled,
+          avgPrice: order.avgPrice,
+        });
+      }
+      this.emit('orderSettled', order);
+    }
+
+    try {
+      await db.updateOrderAudit(order.exchangeOrderId || order.id, {
+        fills: order.account.fillIds.map((id) => ({ id })),
+        realSlippage: order.slippagePct,
+        extra: {
+          outcome,
+          filled: order.filled,
+          remaining: order.remaining,
+          avgPrice: order.avgPrice,
+          fees: order.fees,
+          makerFilled: order.account.makerFilled,
+          takerFilled: order.account.takerFilled,
+        },
+      });
+    } catch (e) {
+      // A durable write we cannot complete means local state is no longer
+      // provably recoverable; stop trusting the cached durability answer.
+      durabilityGate.invalidate('updateOrderAudit failed');
+      logger.warn('Failed to persist order audit after fill', e);
     }
   }
 
@@ -1373,12 +1779,27 @@ export class LiveTradingEngine extends EventEmitter {
   }
 
   /**
+   * Exposure of a single position in USD.
+   *
+   * Margin alone understates exposure by the leverage factor, which would let
+   * a 10x position consume a tenth of the configured exposure budget. Notional
+   * is the risk-relevant figure; margin is only a floor for the case where we
+   * have no usable price.
+   */
+  private positionExposureUsd(position: LivePosition): number {
+    const price = position.currentPrice || position.entryPrice || 0;
+    const notional = Math.abs(position.quantity || 0) * price;
+    const margin = Math.abs(position.marginUsed || 0);
+    return Math.max(Number.isFinite(notional) ? notional : 0, Number.isFinite(margin) ? margin : 0);
+  }
+
+  /**
    * Get total exposure across all positions
    */
   private getTotalExposure(): number {
     let total = 0;
     for (const position of this.positions.values()) {
-      total += position.marginUsed;
+      total += this.positionExposureUsd(position);
     }
     return total;
   }
@@ -1387,7 +1808,7 @@ export class LiveTradingEngine extends EventEmitter {
   private getSymbolExposure(symbol: string): number {
     let total = 0;
     for (const position of this.positions.values()) {
-      if (position.symbol === symbol) total += position.marginUsed;
+      if (position.symbol === symbol) total += this.positionExposureUsd(position);
     }
     return total;
   }
@@ -1432,6 +1853,23 @@ export class LiveTradingEngine extends EventEmitter {
     this.emit('paused');
   }
 
+  /**
+   * Stop trading and detach from the process-wide safety singletons. Without
+   * this, every engine ever constructed keeps receiving kill-switch and
+   * circuit-breaker events for the life of the process.
+   */
+  dispose(): void {
+    this.pause();
+    if (this.onKill) systemKillSwitch.off('kill', this.onKill);
+    if (this.onKillCleared) systemKillSwitch.off('clear', this.onKillCleared);
+    if (this.onBreakerActivated) liveCircuitBreaker.off('activated', this.onBreakerActivated);
+    if (this.onBreakerCleared) liveCircuitBreaker.off('cleared', this.onBreakerCleared);
+    this.onKill = undefined;
+    this.onKillCleared = undefined;
+    this.onBreakerActivated = undefined;
+    this.onBreakerCleared = undefined;
+  }
+
   resume() {
     // Resuming must respect the global safety controls.
     if (systemKillSwitch.isKilled()) {
@@ -1444,7 +1882,13 @@ export class LiveTradingEngine extends EventEmitter {
       this.emit('resumeRefused', { reason: 'circuit_breaker_active', state: liveCircuitBreaker.getState() });
       return false;
     }
-    if (!this.isRunning) this.start().catch(() => {});
+    // start() re-checks durability; resume must not bypass it by flipping the
+    // flags directly.
+    if (!this.isRunning) {
+      this.start().catch((err) => {
+        new ModuleLogger('LiveTrading').error('Resume failed to start engine', formatError(err));
+      });
+    }
     this.emit('resumed');
     return true;
   }

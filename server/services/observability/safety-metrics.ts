@@ -3,7 +3,13 @@
  *
  * Deliberately dependency-free so the health endpoint can report subsystem
  * degradation even when the Prometheus client is unavailable.
+ *
+ * Counters are lost on restart, which is exactly when they matter most, so the
+ * safety-critical events behind them are also appended to the durable safety
+ * event log.
  */
+
+import { safetyEventLog } from './safety-event-log';
 
 export interface SafetyMetricsSnapshot {
   integrityBypassBlocked: number;
@@ -39,26 +45,47 @@ export function recordIntegrityBypassBlocked(symbol: string, timeframe: string, 
   state.integrityBypassBlocked += 1;
   state.lastIntegrityBypassAt = Date.now();
   bump(state.candleRejectReasons, `integrity_gate_failure:${timeframe}`, frameCount);
+  safetyEventLog.record({
+    type: 'integrity_bypass_blocked',
+    detail: `${symbol} ${timeframe}`,
+    data: { symbol, timeframe, frameCount },
+  });
 }
 
 export function recordCandlesRejected(reasons: string[]): void {
   state.candlesRejected += reasons.length;
   for (const reason of reasons) bump(state.candleRejectReasons, reason);
+  if (reasons.length > 0) {
+    safetyEventLog.record({
+      type: 'candle_rejected',
+      detail: `${reasons.length} candle(s) rejected`,
+      data: { reasons },
+    });
+  }
 }
 
 export function recordExecutionBlocked(code: string): void {
   state.executionsBlocked += 1;
   state.lastExecutionBlockAt = Date.now();
   bump(state.executionBlockReasons, code || 'unknown');
+  safetyEventLog.record({ type: 'execution_blocked', detail: code || 'unknown' });
 }
 
 export function recordOrderReconciliation(resultState: string): void {
   bump(state.orderReconciliations, resultState);
+  if (resultState === 'unknown') {
+    safetyEventLog.record({ type: 'order_state_unknown', detail: resultState });
+  }
 }
 
 export function recordFlattenAll(failed: number): void {
   state.flattenAllRuns += 1;
   if (failed > 0) state.flattenAllFailures += failed;
+  safetyEventLog.record({
+    type: failed > 0 ? 'flatten_failed' : 'flatten_all',
+    detail: failed > 0 ? `${failed} position(s) failed to close` : 'all positions closed',
+    data: { failed },
+  });
 }
 
 export function getSafetyMetrics(): SafetyMetricsSnapshot {
