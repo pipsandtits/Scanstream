@@ -209,6 +209,9 @@ that no longer exist and are not wired into the runner.
 - `conversion_unknown` → a fee or funding conversion could not be proven from
   a fresh same-venue ticker. Bounded retries may self-heal, but live execution
   remains stopped while daily PnL is unknown.
+- A ticker or market-data cache read that exceeds its caller-supplied age bound
+  is unknown and must not satisfy a capital-adjacent gate; investigate the
+  venue feed rather than widening the bound.
 - `funding_unaccounted`, `funding_state_unreadable` or `funding_unknown` →
   perpetual/swap funding is not provable; reconcile the venue history before
   clearing the block. If older coverage cannot be proven from the venue
@@ -247,6 +250,12 @@ that no longer exist and are not wired into the runner.
   memory-only. Restarting clears them; a cache read must never be used to
   reconstruct positions or exposure. Reinitialize the venue and reload
   markets before accepting new market-data reads.
+- **Operator stop during execution:** keep the stop/kill switch active until
+  the in-flight order appears in durable local state and exchange
+  reconciliation agrees. A stop blocks subsequent placements; it does not
+  cancel or hide an order already accepted by the venue. Resume is refused
+  while the kill switch is active and otherwise re-runs normal durability,
+  funding and reconciliation preconditions.
 - **After an incident:** compare exchange positions/orders against
   `/api/live-trading/status` before clearing the kill switch — there is no
   automatic startup reconciliation yet (see §4). Clear the breaker, then resume
@@ -355,14 +364,16 @@ distinctions are unchanged.
 | P0 | **Closed in Hardening Pass 3 Phase B:** fill-aware close orders and durable realized PnL/daily-loss accounting are covered in §9.2 |
 | P0 | **Closed in Hardening Pass 3 Phase B:** funding accounting and the unknown-funding gate are covered in §9.3; venue support remains a Pass 4 item |
 | P1 | **Closed in Hardening Pass 3 Phase A:** `resume()` awaits startup and reports failure when durability, local state, initialization or reconciliation refuses the start |
-| P1 | Phase 2J/2K untouched: cache key uniqueness, TTL, invalidation, stampede and restart/corruption behaviour; replay/paper/live parity fixtures |
-| P1 | Phase 2Q failure-injection matrix only partially covered (durability, reconciliation, fills). Stale cache, operator stop mid-execution and concurrent flatten remain untested |
+| P1 | **Closed in Pass 4B:** cache key uniqueness, TTL, invalidation, stampede and memory-only restart semantics; no persisted live cache was found, so persisted-cache corruption is not applicable |
+| P1 | **Closed in Pass 4C:** fixture-driven paper/live decision and order-intent parity, with explicit divergence assertions and replay-mode no-trade coverage |
+| P1 | **Closed in Pass 4C:** concurrent flatten, operator stop during an in-flight order, and stale-cache refusal failure-injection cases |
 | P1 | Route groups classified above still need per-group tests, and `/api/execution` needs operator auth |
 | P2 | Legacy `tests/` suites and the 362-error typecheck baseline are still unclassified; `(global as any)` handoffs and indicator cost remain unmeasured |
 
 Scanstream is **not** production-ready for live capital on this branch. The
 direction of failure is now defensive — it refuses to trade when it cannot prove
-state — but the Pass 4 items in §9.5 and venue-specific validation remain open.
+state — but route coverage, legacy typecheck classification, venue-specific
+validation and the remaining Pass 4 items in §9.5 remain open.
 
 ## 9. Hardening Pass 3
 
@@ -487,12 +498,22 @@ work is tracked below rather than hidden by this pass.
 | --- | --- |
 | P0 | **Closed in Pass 4A:** same-venue direct/inverse conversion for non-quote fees and funding; stale or unavailable prices remain unknown |
 | P0 | **Closed in Pass 4A:** funding source fallback through declared `fetchLedger` funding entries; venues declaring neither source refuse explicitly |
-| P1 | **Cache half closed in Pass 4B:** venue-scoped keys, explicit age bounds, invalidation, concurrency limits, single-flight, failure backoff and memory-only restart semantics. Replay/paper/live parity fixtures remain open |
-| P1 | Replay/paper/live parity fixtures and full failure-injection coverage |
+| P1 | **Closed in Pass 4B:** venue-scoped keys, explicit age bounds, invalidation, concurrency limits, single-flight, failure backoff and memory-only restart semantics. No persisted live cache was found, so persisted-cache corruption is not applicable |
+| P1 | **Closed in Pass 4C:** fixture-driven replay/paper/live decision and order-intent parity plus the named failure-injection cases |
 | P1 | Per-route tests for the classified disabled groups and operator authentication for `/api/execution` |
-| P1 | Concurrent flatten, operator stop mid-execution and stale-cache failure-injection cases |
 | P2 | Legacy 362-error typecheck baseline classification, `(global as any)` handoffs and indicator cost measurement |
 
+The parity fixture intentionally records the legitimate paper/live differences:
+live-only durability, funding and conversion gates; generated client-order IDs;
+paper shadow-fill behavior versus venue fills; and wall-clock timestamps. Any
+other intent-field or gate divergence fails the fixture. The mode detector's
+`REPLAY` path is exercised as a no-trade decision oracle; the engine consumes
+signals rather than `WorldTick` directly, so this is not a claim that the
+full historical market-data pipeline is an in-process replay driver. `MIXED`
+mode (REST backfill plus live WebSocket updates) is not reproducibly generated
+by this fixture and remains an operational validation item.
+
 Scanstream remains **not production-ready for live capital**. The hardening
-direction is fail-closed, but the Pass 4 items and venue-specific operational
-validation are still required.
+direction is fail-closed, but route coverage, legacy typecheck classification,
+venue-specific operational validation and the unexercised `MIXED` pipeline
+remain required.
