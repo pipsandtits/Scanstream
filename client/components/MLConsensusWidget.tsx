@@ -21,9 +21,12 @@ interface TimeframeConfidence {
   direction: string;
   confidence: number;
   strength: number;
-  probability: number;
+  price: number;
+  pricChangePct: number;
   riskScore: number;
-  volatility: number;
+  riskLevel: string;
+  volatility: string;
+  regimeDuration: string;
   weight: number;
 }
 
@@ -40,7 +43,7 @@ interface MLConsensusData {
   timeframes: TimeframeConfidence[];
   aggregatedMetrics: {
     avgRiskScore: number;
-    maxVolatility: number;
+    maxVolatility: string;
     shortestRegimeDuration: string;
     velocityConfidenceAvg: number;
   };
@@ -123,7 +126,7 @@ export const MLConsensusWidget: React.FC<MLConsensusWidgetProps> = ({
   const consensus = data.consensus;
   const metrics = data.aggregatedMetrics ?? {
     avgRiskScore: 0,
-    maxVolatility: 0,
+    maxVolatility: 'unknown',
     shortestRegimeDuration: 'unknown',
     velocityConfidenceAvg: 0,
   };
@@ -291,7 +294,7 @@ export const MLConsensusWidget: React.FC<MLConsensusWidgetProps> = ({
                     </span>
                   </td>
                   <td className="px-3 py-2 text-right text-gray-700">
-                    {(tf.volatility * 100).toFixed(1)}%
+                    {tf.volatility}
                   </td>
                   <td className="px-3 py-2 text-right text-gray-700 font-medium">
                     {(tf.weight * 100).toFixed(0)}%
@@ -307,7 +310,7 @@ export const MLConsensusWidget: React.FC<MLConsensusWidgetProps> = ({
       <div className="grid grid-cols-3 gap-4 p-4 bg-gray-50 rounded-lg border border-gray-200">
         <div>
           <p className="text-xs text-gray-600 font-semibold uppercase mb-1">Max Volatility</p>
-          <p className="text-lg font-bold text-gray-800">{(metrics.maxVolatility * 100).toFixed(1)}%</p>
+          <p className="text-lg font-bold text-gray-800">{metrics.maxVolatility}</p>
         </div>
         <div>
           <p className="text-xs text-gray-600 font-semibold uppercase mb-1">Regime Duration</p>
