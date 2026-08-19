@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { PortfolioRiskManager } from '../portfolio-risk-manager';
 
 describe('portfolio risk realized PnL input', () => {
@@ -16,5 +16,15 @@ describe('portfolio risk realized PnL input', () => {
     expect(metrics.realizedDailyPnl).toBeNull();
     expect(metrics.dailyPnlUnknown).toBe(true);
     expect(metrics.canOpenNewPosition).toBe(false);
+  });
+
+  it('resets the balance window at a UTC day boundary', () => {
+    vi.setSystemTime(new Date('2024-01-31T23:59:00.000Z'));
+    const manager = new PortfolioRiskManager(10_000);
+    vi.setSystemTime(new Date('2024-02-01T00:01:00.000Z'));
+
+    const metrics = manager.getPortfolioMetrics(9_000, { dailyPnl: 0 });
+    expect(metrics.dailyPnl).toBe(0);
+    vi.useRealTimers();
   });
 });

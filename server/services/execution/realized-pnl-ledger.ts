@@ -4,7 +4,7 @@ import { realizedPnl, type FeeTotal } from './fill-accounting';
 
 export const REALIZED_PNL_SCHEMA_VERSION = 1;
 
-export type RealizedPnlCategory = 'trade' | 'funding';
+export type RealizedPnlCategory = 'trade' | 'funding' | 'resolution';
 
 export interface RealizedPnlEntry {
   id: string;
@@ -21,7 +21,22 @@ export interface RealizedPnlEntry {
   exitPrice?: number | null;
   fundingAmount?: number | null;
   fundingCurrency?: string | null;
+  resolutionFor?: string;
+  resolution?: RealizedPnlResolution;
 }
+
+export type RealizedPnlResolution =
+  | {
+      kind: 'attested_value';
+      pnl: number;
+      reason: string;
+      attestedAt: string;
+    }
+  | {
+      kind: 'excluded_unknown';
+      reason: string;
+      attestedAt: string;
+    };
 
 export interface RealizedPnlState {
   schemaVersion: number;
@@ -166,6 +181,52 @@ export class RealizedPnlLedger {
     return true;
   }
 
+  resolveUnknown(
+    id: string,
+    resolution:
+      | { kind: 'attested_value'; pnl: number; reason: string }
+      | { kind: 'excluded_unknown'; reason: string }
+  ): RealizedPnlEntry {
+    const index = this.state.entries.findIndex((entry) => entry.id === id);
+    if (index < 0) throw new Error('realized PnL entry not found');
+    const current = this.state.entries[index];
+    if (current.pnl !== null || current.category === 'resolution' ||
+      this.state.entries.some((entry) => entry.resolutionFor === id)) {
+      throw new Error('realized PnL entry is already resolved');
+    }
+    if (resolution.kind === 'attested_value' && !finite(resolution.pnl)) {
+      throw new Error('attested realized PnL must be finite');
+    }
+    if (!resolution.reason.trim()) throw new Error('resolution reason is required');
+
+    const resolved: RealizedPnlEntry = {
+      id: `resolution:${id}:${this.clock()}`,
+      category: 'resolution',
+      at: new Date(this.clock()).toISOString(),
+      symbol: current.symbol,
+      quoteCurrency: current.quoteCurrency,
+      pnl: 0,
+      grossPnl: 0,
+      quoteFees: 0,
+      unconvertedFees: [],
+      resolutionFor: id,
+      resolution: {
+        ...resolution,
+        reason: resolution.reason.trim(),
+        attestedAt: new Date(this.clock()).toISOString(),
+      },
+    };
+    const entries = [...this.state.entries, resolved];
+    const next: RealizedPnlState = {
+      schemaVersion: REALIZED_PNL_SCHEMA_VERSION,
+      writtenAt: new Date(this.clock()).toISOString(),
+      entries,
+    };
+    this.write(next);
+    this.state = next;
+    return { ...current, resolution: resolved.resolution, unconvertedFees: current.unconvertedFees.map((fee) => ({ ...fee })) };
+  }
+
   summary(now: number = this.clock()): RealizedPnlSummary {
     const today = new Date(now).toISOString().slice(0, 10);
     const entries = this.state.entries.filter((entry) => {
@@ -175,18 +236,30 @@ export class RealizedPnlLedger {
         return false;
       }
     });
+    const resolutions = new Map(
+      entries
+        .filter((entry) => entry.category === 'resolution' && entry.resolutionFor)
+        .map((entry) => [entry.resolutionFor as string, entry.resolution])
+    );
+    const baseEntries = entries.filter((entry) => entry.category !== 'resolution');
     let pnl = 0;
     let tradePnl = 0;
     let fundingPnl = 0;
     let unknown = false;
     const unconvertedFees: FeeTotal[] = [];
 
-    for (const entry of entries) {
-      if (entry.pnl === null || !finite(entry.pnl)) unknown = true;
-      else {
-        pnl += entry.pnl;
-        if (entry.category === 'trade') tradePnl += entry.pnl;
-        else fundingPnl += entry.pnl;
+    for (const entry of baseEntries) {
+      const resolution = resolutions.get(entry.id);
+      const effectivePnl = resolution?.kind === 'attested_value' ? resolution.pnl : entry.pnl;
+      if (resolution?.kind === 'excluded_unknown') {
+        // Explicit exclusion removes the unknown from the daily gate, but the
+        // original entry and any non-quote fees remain visible for review.
+      } else if (effectivePnl === null || !finite(effectivePnl)) {
+        unknown = true;
+      } else {
+        pnl += effectivePnl;
+        if (entry.category === 'trade') tradePnl += effectivePnl;
+        else fundingPnl += effectivePnl;
       }
       for (const fee of entry.unconvertedFees) {
         const existing = unconvertedFees.find((candidate) => candidate.currency === fee.currency);
@@ -201,7 +274,7 @@ export class RealizedPnlLedger {
       unconvertedFees,
       tradePnl: unknown ? null : tradePnl,
       fundingPnl: unknown ? null : fundingPnl,
-      entries: entries.length,
+      entries: baseEntries.length,
     };
   }
 
@@ -257,7 +330,7 @@ export class RealizedPnlLedger {
     const entry = value as Partial<RealizedPnlEntry>;
     return (
       typeof entry.id === 'string' &&
-      (entry.category === 'trade' || entry.category === 'funding') &&
+      (entry.category === 'trade' || entry.category === 'funding' || entry.category === 'resolution') &&
       typeof entry.at === 'string' &&
       typeof entry.symbol === 'string' &&
       typeof entry.quoteCurrency === 'string' &&
@@ -265,7 +338,16 @@ export class RealizedPnlLedger {
       (entry.grossPnl === null || finite(entry.grossPnl)) &&
       (entry.quoteFees === null || finite(entry.quoteFees)) &&
       Array.isArray(entry.unconvertedFees) &&
-      entry.unconvertedFees.every((fee) => fee && typeof fee.currency === 'string' && finite(fee.cost))
+      entry.unconvertedFees.every((fee) => fee && typeof fee.currency === 'string' && finite(fee.cost)) &&
+      (
+        (entry.category !== 'resolution' && !entry.resolution) ||
+        (entry.category === 'resolution' && typeof entry.resolutionFor === 'string' &&
+          !!entry.resolution &&
+          ((entry.resolution.kind === 'attested_value' && finite(entry.resolution.pnl)) ||
+            (entry.resolution.kind === 'excluded_unknown' && entry.pnl === 0)) &&
+          typeof entry.resolution.reason === 'string' &&
+          typeof entry.resolution.attestedAt === 'string')
+      )
     );
   }
 }

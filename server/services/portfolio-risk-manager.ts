@@ -297,9 +297,9 @@ export class PortfolioRiskManager {
    * Get comprehensive portfolio risk metrics
    */
   getPortfolioMetrics(currentBalance: number, realizedPnlInput?: RealizedPnlRiskInput): PortfolioRiskMetrics {
-    // Reset daily tracking if new day
+    // The ledger is bucketed by UTC, so the balance baseline must use UTC too.
     const now = new Date();
-    if (now.getDate() !== this.lastResetTime.getDate()) {
+    if (now.toISOString().slice(0, 10) !== this.lastResetTime.toISOString().slice(0, 10)) {
       this.dailyStartValue = currentBalance;
       this.lastResetTime = now;
     }

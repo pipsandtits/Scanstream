@@ -127,6 +127,89 @@ interface LivePosition {
   orders: LiveOrder[];
 }
 
+interface LocalOrderState {
+  exchangeOrderId: string;
+  clientOrderId: string | null | undefined;
+  filled: number;
+  cost: number;
+  remaining: number;
+  avgPrice: number | null | undefined;
+  slippagePct: number | null | undefined;
+  outcome: OrderOutcome | undefined;
+  status: LiveOrder['status'];
+  fees: FeeTotal[];
+  fee?: LiveOrder['fee'];
+  account: {
+    fillIds: string[];
+    filled: number;
+    cost: number;
+    avgPrice: number | null;
+    remaining: number;
+    fees: FeeTotal[];
+    makerFilled: number;
+    takerFilled: number;
+    lastFillAt: number | null;
+  };
+}
+
+function captureOrderState(order: LiveOrder): LocalOrderState {
+  const account = order.account ?? createFillAccount();
+  return {
+    exchangeOrderId: order.exchangeOrderId,
+    clientOrderId: order.clientOrderId,
+    filled: order.filled,
+    cost: order.cost,
+    remaining: order.remaining,
+    avgPrice: order.avgPrice,
+    slippagePct: order.slippagePct,
+    outcome: order.outcome,
+    status: order.status,
+    fees: (order.fees ?? []).map((fee) => ({ ...fee })),
+    fee: order.fee ? { ...order.fee } : undefined,
+    account: {
+      fillIds: [...account.fillIds],
+      filled: account.filled,
+      cost: account.cost,
+      avgPrice: account.avgPrice,
+      remaining: account.remaining,
+      fees: account.fees.map((fee) => ({ ...fee })),
+      makerFilled: account.makerFilled,
+      takerFilled: account.takerFilled,
+      lastFillAt: account.lastFillAt,
+    },
+  };
+}
+
+function feeListsEqual(a: FeeTotal[], b: FeeTotal[]): boolean {
+  return a.length === b.length && a.every((fee, index) =>
+    fee.currency === b[index]?.currency && fee.cost === b[index]?.cost);
+}
+
+function orderStateChanged(before: LocalOrderState, after: LocalOrderState): boolean {
+  return before.exchangeOrderId !== after.exchangeOrderId ||
+    before.clientOrderId !== after.clientOrderId ||
+    before.filled !== after.filled ||
+    before.cost !== after.cost ||
+    before.remaining !== after.remaining ||
+    before.avgPrice !== after.avgPrice ||
+    before.slippagePct !== after.slippagePct ||
+    before.outcome !== after.outcome ||
+    before.status !== after.status ||
+    before.fee?.cost !== after.fee?.cost ||
+    before.fee?.currency !== after.fee?.currency ||
+    !feeListsEqual(before.fees, after.fees) ||
+    before.account.filled !== after.account.filled ||
+    before.account.cost !== after.account.cost ||
+    before.account.avgPrice !== after.account.avgPrice ||
+    before.account.remaining !== after.account.remaining ||
+    before.account.makerFilled !== after.account.makerFilled ||
+    before.account.takerFilled !== after.account.takerFilled ||
+    before.account.lastFillAt !== after.account.lastFillAt ||
+    before.account.fillIds.length !== after.account.fillIds.length ||
+    before.account.fillIds.some((id, index) => id !== after.account.fillIds[index]) ||
+    !feeListsEqual(before.account.fees, after.account.fees);
+}
+
 export interface FlattenResult {
   requested: number;
   closed: string[];
@@ -152,6 +235,8 @@ export interface LiveTradingEngineDependencies {
   realizedPnlLedgerPath?: string;
   fundingAccounting?: FundingAccounting;
   fundingAccountingPath?: string;
+  fundingInitialLookbackMs?: number;
+  fundingRecheckIntervalMs?: number;
   clock?: () => number;
 }
 
@@ -216,6 +301,8 @@ export class LiveTradingEngine extends EventEmitter {
     this.fundingAccounting = dependencies.fundingAccounting ?? new FundingAccounting({
       filePath: dependencies.fundingAccountingPath,
       clock: dependencies.clock,
+      initialLookbackMs: dependencies.fundingInitialLookbackMs,
+      recheckIntervalMs: dependencies.fundingRecheckIntervalMs,
     });
 
     // Listen for global kill-switch events. Handlers are retained so they can
@@ -621,6 +708,26 @@ export class LiveTradingEngine extends EventEmitter {
       data: { symbol },
     });
     return false;
+  }
+
+  resolveRealizedPnlEntry(
+    id: string,
+    resolution:
+      | { kind: 'attested_value'; pnl: number; reason: string }
+      | { kind: 'excluded_unknown'; reason: string }
+  ): RealizedPnlEntry {
+    const entry = this.realizedPnlLedger.resolveUnknown(id, resolution);
+    safetyEventLog.record({
+      type: 'realized_pnl_resolved',
+      detail: `realized PnL entry ${id} resolved by operator`,
+      data: {
+        entryId: id,
+        resolution: entry.resolution?.kind,
+        pnl: entry.pnl,
+        reason: entry.resolution?.reason,
+      },
+    });
+    return entry;
   }
 
   /**
@@ -1907,15 +2014,13 @@ export class LiveTradingEngine extends EventEmitter {
           ? localByClientId.get(String(exchangeOrder.clientOrderId))
           : undefined);
       if (!local) continue;
-      const before = JSON.stringify(local);
+      const before = captureOrderState(local);
       local.exchangeOrderId = exchangeOrder.exchangeOrderId;
       await this.applyOrderSnapshot(local, {
         status: exchangeOrder.status,
         filled: exchangeOrder.filled,
-        average: local.avgPrice,
-        cost: local.cost,
       });
-      stateMutated = stateMutated || before !== JSON.stringify(local);
+      stateMutated = stateMutated || orderStateChanged(before, captureOrderState(local));
     }
 
     // Adopting exchange positions is idempotent: keyed by symbol, replacing
@@ -2029,19 +2134,7 @@ export class LiveTradingEngine extends EventEmitter {
    */
   private async applyOrderSnapshot(order: LiveOrder, snapshot: any): Promise<void> {
     const logger = new ModuleLogger('LiveTrading');
-    const previousLocalState = JSON.stringify({
-      account: order.account,
-      filled: order.filled,
-      cost: order.cost,
-      remaining: order.remaining,
-      avgPrice: order.avgPrice,
-      fees: order.fees,
-      fee: order.fee,
-      slippagePct: order.slippagePct,
-      outcome: order.outcome,
-      status: order.status,
-      exchangeOrderId: order.exchangeOrderId,
-    });
+    const previousLocalState = captureOrderState(order);
     const previousFilled = order.filled;
 
     if (!order.account) order.account = createFillAccount();
@@ -2068,11 +2161,14 @@ export class LiveTradingEngine extends EventEmitter {
       const filled = Number(snapshot?.filled);
       const cost = Number(snapshot?.cost);
       if (Number.isFinite(filled) && filled >= 0) {
-        const resolvedCost = Number.isFinite(cost) && cost > 0
+        const snapshotAverage = Number(snapshot?.average);
+        const hasCost = Number.isFinite(cost) && cost > 0;
+        const hasAverage = Number.isFinite(snapshotAverage) && snapshotAverage > 0;
+        const resolvedCost = hasCost
           ? cost
-          : (Number.isFinite(Number(snapshot?.average)) && Number(snapshot?.average) > 0
-              ? filled * Number(snapshot.average)
-              : order.account.cost);
+          : (hasAverage
+              ? filled * snapshotAverage
+              : filled === order.account.filled ? order.account.cost : 0);
         order.account = {
           ...order.account,
           filled,
@@ -2101,20 +2197,7 @@ export class LiveTradingEngine extends EventEmitter {
     order.status = (typeof snapshot?.status === 'string' ? snapshot.status : order.status) as LiveOrder['status'];
 
     const filledDelta = order.filled - previousFilled;
-    const currentLocalState = JSON.stringify({
-      account: order.account,
-      filled: order.filled,
-      cost: order.cost,
-      remaining: order.remaining,
-      avgPrice: order.avgPrice,
-      fees: order.fees,
-      fee: order.fee,
-      slippagePct: order.slippagePct,
-      outcome: order.outcome,
-      status: order.status,
-      exchangeOrderId: order.exchangeOrderId,
-    });
-    if (previousLocalState === currentLocalState) {
+    if (!orderStateChanged(previousLocalState, captureOrderState(order))) {
       return;
     }
 

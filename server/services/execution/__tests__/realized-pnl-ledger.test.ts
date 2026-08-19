@@ -114,4 +114,61 @@ describe('realized PnL ledger', () => {
     expect(ledger.summary().pnl).toBeNull();
     expect(ledger.summary().unknown).toBe(true);
   });
+
+  it('requires an explicit durable resolution for an unknown entry', () => {
+    const filePath = ledgerPath();
+    const ledger = new RealizedPnlLedger({ filePath, clock: () => 1_700_000_000_000 });
+    ledger.load();
+    ledger.append({
+      id: 'unknown-close',
+      category: 'trade',
+      at: new Date(1_700_000_000_000).toISOString(),
+      symbol: 'BTC/USDT',
+      quoteCurrency: 'USDT',
+      pnl: null,
+      grossPnl: null,
+      quoteFees: null,
+      unconvertedFees: [],
+    });
+
+    const resolved = ledger.resolveUnknown('unknown-close', {
+      kind: 'attested_value',
+      pnl: -7,
+      reason: 'exchange trade export reviewed',
+    });
+    expect(resolved.pnl).toBeNull();
+    expect(ledger.summary()).toMatchObject({ pnl: -7, unknown: false });
+    expect(ledger.entries()).toHaveLength(2);
+
+    const reloaded = new RealizedPnlLedger({ filePath, clock: () => 1_700_000_000_000 });
+    expect(reloaded.load().status).toBe('ok');
+    expect(reloaded.summary()).toMatchObject({ pnl: -7, unknown: false });
+    expect(() => reloaded.resolveUnknown('unknown-close', {
+      kind: 'excluded_unknown',
+      reason: 'duplicate request',
+    })).toThrow(/already resolved/);
+  });
+
+  it('can explicitly exclude an unknown entry without treating it as zero', () => {
+    const filePath = ledgerPath();
+    const ledger = new RealizedPnlLedger({ filePath, clock: () => 1_700_000_000_000 });
+    ledger.load();
+    ledger.append({
+      id: 'unknown-funding',
+      category: 'funding',
+      at: new Date(1_700_000_000_000).toISOString(),
+      symbol: 'BTC/USDT:USDT',
+      quoteCurrency: 'USDT',
+      pnl: null,
+      grossPnl: null,
+      quoteFees: null,
+      unconvertedFees: [{ currency: 'BTC', cost: 0.01 }],
+    });
+    ledger.resolveUnknown('unknown-funding', {
+      kind: 'excluded_unknown',
+      reason: 'operator accepted non-quote funding exclusion',
+    });
+    expect(ledger.summary()).toMatchObject({ pnl: 0, unknown: false });
+    expect(ledger.summary().unconvertedFees).toEqual([{ currency: 'BTC', cost: 0.01 }]);
+  });
 });

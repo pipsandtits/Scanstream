@@ -166,6 +166,9 @@ that no longer exist and are not wired into the runner.
    `database.ok === true` **before** enabling live trading.
 4. Set `TRADING_OPERATOR_TOKEN` (32+ random bytes). Without it all trading
    control endpoints answer `503`.
+   Configure explicit funding lookback and recheck intervals in the engine
+   integration; the initial lookback is bounded and never proves older
+   funding was accounted for.
 5. Set risk limits explicitly — defaults are deliberately small:
    `RISK_MAX_POSITION_USD`, `RISK_MAX_TOTAL_EXPOSURE_USD`,
    `RISK_MAX_SYMBOL_EXPOSURE_USD`, `RISK_MAX_OPEN_POSITIONS`,
@@ -193,7 +196,8 @@ that no longer exist and are not wired into the runner.
   not know about; reconcile by hand.
 - `realized_pnl_unknown`, `realized_pnl_ledger_unreadable` or
   `realized_pnl_persistence_failed` → daily loss is not provable; keep live
-  execution stopped until the ledger is repaired and reviewed.
+  execution stopped and use the entry-specific operator resolution procedure
+  below only after exchange records are reviewed.
 - `funding_unaccounted`, `funding_state_unreadable` or `funding_unknown` →
   perpetual/swap funding is not provable; reconcile the venue history before
   clearing the block. Treat `ALLOW_UNACCOUNTED_FUNDING=1` as an incident-level
@@ -208,6 +212,15 @@ that no longer exist and are not wired into the runner.
 - **Rollback:** redeploy the previous image. The persisted kill switch/breaker
   files are forward-compatible; if `data/` state is unreadable the system starts
   killed, which is the intended direction of failure.
+- **Unknown realized PnL:** keep execution stopped, identify the exact entry
+  from the durable ledger, and call
+  `POST /api/live-trading/realized-pnl/{entryId}/resolve` with the shared
+  operator token. Use `{ "resolution": "attested_value", "pnl": <number>,
+  "reason": "<evidence>" }` only when exchange evidence supports the value.
+  Otherwise use `{ "resolution": "excluded_unknown", "reason": "<evidence>" }`.
+  Wildcards, bulk clearing, automatic expiry and editing the original ledger
+  record are forbidden. The request is audited as `shared-operator-token`, and
+  both durable records must show the resolution before execution resumes.
 - **After an incident:** compare exchange positions/orders against
   `/api/live-trading/status` before clearing the kill switch — there is no
   automatic startup reconciliation yet (see §4). Clear the breaker, then resume
@@ -373,6 +386,11 @@ The ledger is append-only by event ID, atomically persisted under
 as unknown if corrupt or unreadable. Daily loss uses ledger PnL and the more
 conservative of balance-derived and ledger-derived results; unknown daily PnL
 blocks live execution. The RL callback receives realized PnL or explicit null.
+Unknown entries can be resolved only one at a time through the authenticated,
+audited operator endpoint in §7. Numeric attestations and explicit
+unknown-and-excluded decisions are durable and immutable; unresolved entries
+continue to make the daily summary unknown. Both balance and ledger daily
+windows use UTC calendar dates.
 
 ### 9.3 Phase B — funding
 
@@ -384,7 +402,14 @@ queries, unusable responses and unknown market type are unknown, not zero, and
 block live execution for contract markets. Spot markets do not require funding
 accounting. `ALLOW_UNACCOUNTED_FUNDING=1` is the sole deliberate escape hatch;
 it is recorded as an operator-visible safety event and must not be treated as a
-normal operating mode.
+normal operating mode. The first reconciliation uses an explicit bounded
+initial lookback and records that funding older than that window remains
+unaccounted/unknown; subsequent funding checks do not silently clear that
+condition. The default initial window is 24 hours and is bounded to seven
+days; the default minimum recheck interval is one hour.
+Subsequent queries page until a short response, advance the cursor only after
+complete pagination, and reuse only a durable known answer within the minimum
+recheck interval; unknown answers are never cached.
 
 ### 9.4 Deliberately unimplemented
 

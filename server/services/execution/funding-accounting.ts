@@ -2,6 +2,10 @@ import fs from 'fs';
 import path from 'path';
 
 export const FUNDING_STATE_SCHEMA_VERSION = 1;
+export const DEFAULT_FUNDING_INITIAL_LOOKBACK_MS = 24 * 60 * 60 * 1000;
+export const DEFAULT_FUNDING_RECHECK_INTERVAL_MS = 60 * 60 * 1000;
+const MAX_FUNDING_INITIAL_LOOKBACK_MS = 7 * 24 * 60 * 60 * 1000;
+const FUNDING_PAGE_LIMIT = 200;
 
 export interface FundingPayment {
   id: string;
@@ -16,6 +20,8 @@ interface FundingState {
   writtenAt: string;
   payments: FundingPayment[];
   lastCheckedAt: Record<string, number>;
+  lastKnownAt: Record<string, number>;
+  initialLookbackUnknown: Record<string, boolean>;
 }
 
 export type FundingLoadResult =
@@ -31,6 +37,8 @@ export type FundingAccountingResult =
 export interface FundingAccountingOptions {
   filePath?: string;
   clock?: () => number;
+  initialLookbackMs?: number;
+  recheckIntervalMs?: number;
 }
 
 const DEFAULT_FILE_PATH = path.join(process.cwd(), 'data', 'funding-accounting.json');
@@ -66,16 +74,25 @@ function isSwapMarket(exchange: any, symbol: string): boolean {
 export class FundingAccounting {
   private readonly filePath: string;
   private readonly clock: () => number;
+  private readonly initialLookbackMs: number;
+  private readonly recheckIntervalMs: number;
   private state: FundingState = {
     schemaVersion: FUNDING_STATE_SCHEMA_VERSION,
     writtenAt: new Date(0).toISOString(),
     payments: [],
     lastCheckedAt: {},
+    lastKnownAt: {},
+    initialLookbackUnknown: {},
   };
 
   constructor(options: FundingAccountingOptions = {}) {
     this.filePath = options.filePath ?? DEFAULT_FILE_PATH;
     this.clock = options.clock ?? Date.now;
+    this.initialLookbackMs = Math.min(
+      Math.max(options.initialLookbackMs ?? DEFAULT_FUNDING_INITIAL_LOOKBACK_MS, 1),
+      MAX_FUNDING_INITIAL_LOOKBACK_MS,
+    );
+    this.recheckIntervalMs = Math.max(options.recheckIntervalMs ?? DEFAULT_FUNDING_RECHECK_INTERVAL_MS, 0);
   }
 
   getPath(): string {
@@ -89,6 +106,8 @@ export class FundingAccounting {
         writtenAt: new Date(0).toISOString(),
         payments: [],
         lastCheckedAt: {},
+        lastKnownAt: {},
+        initialLookbackUnknown: {},
       };
       return { status: 'absent' };
     }
@@ -114,19 +133,49 @@ export class FundingAccounting {
       return { status: 'unknown', reason: 'funding_history_unsupported', payments: [] };
     }
 
-    const since = this.state.lastCheckedAt[symbol] ?? this.clock() - 24 * 60 * 60 * 1000;
-    let rows: any[];
-    try {
-      const response = await exchange.fetchFundingHistory(symbol, since, 200);
-      if (!Array.isArray(response)) return { status: 'unknown', reason: 'funding_history_unusable', payments: [] };
-      rows = response;
-    } catch (error: any) {
-      return {
-        status: 'unknown',
-        reason: error?.message ? `funding_history_query_failed:${error.message}` : 'funding_history_query_failed',
-        payments: [],
-      };
+    const now = this.clock();
+    const lastKnownAt = this.state.lastKnownAt[symbol];
+    if (finite(lastKnownAt) && now - lastKnownAt < this.recheckIntervalMs) {
+      return { status: 'known', payments: [] };
     }
+
+    const initial = this.state.lastCheckedAt[symbol] === undefined;
+    const initialCoverageUnknown = this.state.initialLookbackUnknown[symbol] === true;
+    const since = this.state.lastCheckedAt[symbol] ?? now - this.initialLookbackMs;
+    const rows: any[] = [];
+    let pageSince = since;
+    let complete = false;
+    for (let page = 0; page < 1000; page += 1) {
+      let response: unknown;
+      try {
+        response = await exchange.fetchFundingHistory(symbol, pageSince, FUNDING_PAGE_LIMIT);
+      } catch (error: any) {
+        return {
+          status: 'unknown',
+          reason: error?.message ? `funding_history_query_failed:${error.message}` : 'funding_history_query_failed',
+          payments: [],
+        };
+      }
+      if (!Array.isArray(response)) return { status: 'unknown', reason: 'funding_history_unusable', payments: [] };
+      rows.push(...response);
+      if (response.length < FUNDING_PAGE_LIMIT) {
+        complete = true;
+        break;
+      }
+      const timestamps = response
+        .map((row: any) => row?.timestamp ?? (row?.datetime ? Date.parse(row.datetime) : null))
+        .map(Number)
+        .filter((timestamp: number) => finite(timestamp));
+      if (timestamps.length !== response.length) {
+        return { status: 'unknown', reason: 'funding_page_cursor_unknown', payments: [] };
+      }
+      const nextSince = Math.max(...timestamps) + 1;
+      if (nextSince <= pageSince) {
+        return { status: 'unknown', reason: 'funding_page_cursor_stalled', payments: [] };
+      }
+      pageSince = nextSince;
+    }
+    if (!complete) return { status: 'unknown', reason: 'funding_history_pagination_limit', payments: [] };
 
     const additions: FundingPayment[] = [];
     for (const row of rows) {
@@ -150,18 +199,32 @@ export class FundingAccounting {
       if (!this.state.payments.some((existing) => existing.id === payment.id)) additions.push(payment);
     }
 
-    const paymentState = [...this.state.payments, ...additions];
+    const nextLastCheckedAt = { ...this.state.lastCheckedAt };
+    const nextLastKnownAt = { ...this.state.lastKnownAt };
+    nextLastCheckedAt[symbol] = now;
+    if (!initial && !initialCoverageUnknown) nextLastKnownAt[symbol] = now;
+    const nextInitialLookbackUnknown = { ...this.state.initialLookbackUnknown };
+    if (initial) nextInitialLookbackUnknown[symbol] = true;
     const next: FundingState = {
       schemaVersion: FUNDING_STATE_SCHEMA_VERSION,
-      writtenAt: new Date(this.clock()).toISOString(),
-      payments: paymentState,
-      lastCheckedAt: { ...this.state.lastCheckedAt, [symbol]: this.clock() },
+      writtenAt: new Date(now).toISOString(),
+      payments: [...this.state.payments, ...additions],
+      lastCheckedAt: nextLastCheckedAt,
+      lastKnownAt: nextLastKnownAt,
+      initialLookbackUnknown: nextInitialLookbackUnknown,
     };
     try {
       this.write(next);
       this.state = next;
     } catch {
       return { status: 'unknown', reason: 'funding_state_persistence_failed', payments: additions };
+    }
+    if (initial || initialCoverageUnknown) {
+      return {
+        status: 'unknown',
+        reason: 'funding_history_older_than_initial_lookback',
+        payments: additions,
+      };
     }
     return { status: 'known', payments: additions };
   }
@@ -209,6 +272,12 @@ export class FundingAccounting {
       !!state.lastCheckedAt &&
       typeof state.lastCheckedAt === 'object' &&
       Object.values(state.lastCheckedAt).every((timestamp) => finite(timestamp)) &&
+      !!state.lastKnownAt &&
+      typeof state.lastKnownAt === 'object' &&
+      Object.values(state.lastKnownAt).every((timestamp) => finite(timestamp)) &&
+      !!state.initialLookbackUnknown &&
+      typeof state.initialLookbackUnknown === 'object' &&
+      Object.values(state.initialLookbackUnknown).every((unknown) => typeof unknown === 'boolean') &&
       state.payments.every((payment) =>
         payment &&
         typeof payment.id === 'string' &&
