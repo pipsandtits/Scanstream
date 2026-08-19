@@ -34,7 +34,7 @@ const computations: Record<string, () => unknown> = {
   macd: () => indicators.macd(closes),
   rsi: () => indicators.rsi(closes),
   slope: () => indicators.slope(closes),
-  vwap: () => indicators.vwap(highs, lows, closes, volumes),
+  vwap: () => indicators.vwap(closes, volumes),
   atr: () => indicators.atr(highs, lows, closes),
   bollingerBands: () => indicators.bollingerBands(closes),
   adx: () => indicators.adx(highs, lows, closes),
@@ -52,6 +52,22 @@ const computations: Record<string, () => unknown> = {
   fibLevels: () => indicators.fibLevels(highs, lows, closes),
   vwma: () => indicators.vwma(closes, volumes, 20),
 };
+
+function containsFiniteNumber(value: unknown): boolean {
+  if (typeof value === 'number') return Number.isFinite(value);
+  if (Array.isArray(value)) return value.some(containsFiniteNumber);
+  if (value !== null && typeof value === 'object') {
+    return Object.values(value).some(containsFiniteNumber);
+  }
+  return false;
+}
+
+for (const [name, compute] of Object.entries(computations)) {
+  const result = compute();
+  if (!containsFiniteNumber(result)) {
+    throw new Error(`${name} produced no finite numeric output for the fixed fixture`);
+  }
+}
 
 function median(values: number[]): number {
   const sorted = [...values].sort((a, b) => a - b);
@@ -81,6 +97,9 @@ const scanner = new OptimizedMomentumScanner(
   new IndicatorCache(),
 );
 const scannerResult = scanner.computeScore('FIXTURE/USDT', '1m', frames);
+if (!scannerResult.diagnostics) {
+  throw new Error('scanner path did not return diagnostics for the fixed fixture');
+}
 
 console.log(JSON.stringify({
   fixture: {

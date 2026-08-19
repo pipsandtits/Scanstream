@@ -589,36 +589,55 @@ indicator over a committed deterministic 256-frame `FIXTURE/USDT` 1-minute
 fixture. It uses five warmups and 40 samples, reporting the median per
 indicator. On this machine (Linux x86_64, two Intel Xeon Platinum 8559C
 vCPUs, Node v22.12.0), the scanner path computed 22 indicators in
-`0.8931 ms`; `ichimoku` and `volumeProfile` were explicitly deferred by the
+`1.0389 ms`; `ichimoku` and `volumeProfile` were explicitly deferred by the
 aggressive profile.
 
 | Indicator | Median ms | Relative |
 | --- | ---: | ---: |
-| `sma` | 0.0102 | 0.11% |
-| `ema` | 0.0075 | 0.08% |
-| `macd` | 0.0641 | 0.70% |
-| `rsi` | 0.0375 | 0.41% |
-| `slope` | 0.0067 | 0.07% |
-| `vwap` | 8.6752 | 94.22% |
-| `atr` | 0.0291 | 0.32% |
-| `bollingerBands` | 0.0066 | 0.07% |
-| `adx` | 0.1060 | 1.15% |
-| `stochastic` | 0.0078 | 0.08% |
-| `cci` | 0.0049 | 0.05% |
-| `williamsR` | 0.0062 | 0.07% |
-| `obv` | 0.0116 | 0.13% |
-| `mfi` | 0.0070 | 0.08% |
-| `cmf` | 0.0109 | 0.12% |
-| `aroon` | 0.0166 | 0.18% |
-| `tsi` | 0.1208 | 1.31% |
-| `elderRay` | 0.0169 | 0.19% |
-| `keltnerChannels` | 0.0248 | 0.27% |
-| `parabolicSAR` | 0.0300 | 0.33% |
-| `fibLevels` | 0.0023 | 0.03% |
-| `vwma` | 0.0050 | 0.05% |
-| **Summed per-indicator medians** | **9.2077** | **100%** |
+| `adx` | 0.0892 | 19.04% |
+| `vwap` | 0.0358 | 7.65% |
+| `tsi` | 0.0508 | 10.84% |
+| `macd` | 0.0503 | 10.72% |
+| `parabolicSAR` | 0.0305 | 6.52% |
+| `atr` | 0.0292 | 6.22% |
+| `keltnerChannels` | 0.0256 | 5.45% |
+| `elderRay` | 0.0176 | 3.75% |
+| `aroon` | 0.0166 | 3.54% |
+| `sma` | 0.0117 | 2.49% |
+| `obv` | 0.0117 | 2.50% |
+| `cmf` | 0.0109 | 2.33% |
+| `stochastic` | 0.0078 | 1.66% |
+| `slope` | 0.0079 | 1.68% |
+| `mfi` | 0.0070 | 1.50% |
+| `bollingerBands` | 0.0068 | 1.45% |
+| `williamsR` | 0.0063 | 1.35% |
+| `vwma` | 0.0050 | 1.06% |
+| `cci` | 0.0049 | 1.05% |
+| `fibLevels` | 0.0024 | 0.52% |
+| `ema` | 0.0012 | 0.25% |
+| **Summed per-indicator medians** | **0.4687** | **100%** |
 
-The benchmark is evidence for relative cost, not a CI performance gate.
+The summed per-indicator medians are below the `1.0389 ms` scanner-path
+measurement, so the table is consistent with the production path rather than
+claiming that one component costs more than the complete computation. The
+script also asserts that every measured indicator produces at least one finite
+numeric output on the fixture. Its `computations` calls were checked against
+the indicator signatures in `server/services/scanner/indicators.ts`; in
+particular, `vwap` uses `(close, volume)` and no longer receives the OHLC
+arrays. The benchmark is evidence for relative cost, not a CI performance
+gate.
+
+`pnpm run typecheck` does not include `scripts/`: `tsconfig.json` includes
+`client`, `shared`, `server`, `tests` and `tools`, while its exclusions omit
+the measurement script. A standalone script-inclusive check initially found
+three errors in the script's optional `diagnostics` access; those are now
+fixed with an explicit production-result guard. The corrected standalone
+check still finds six pre-existing errors outside the script:
+four missing symbols in `server/rl-metrics.ts` and one private
+`SignalClassifier.sharedInstance` access, plus the existing nullable
+`exchange.symbols` access in `server/services/live-velocity-calculator.ts`.
+The repository-wide baseline intentionally remains scoped by `tsconfig.json`
+and is unchanged by those unrelated errors.
 
 The parity fixture intentionally records the legitimate paper/live differences:
 live-only durability, funding and conversion gates; generated client-order IDs;
