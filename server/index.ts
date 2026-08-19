@@ -38,6 +38,7 @@ import signalBacktestingRouter from './routes/signal-backtesting';
 import historicalBacktestRouter from './routes/historical-backtest';
 import signalGenerationRouter from './routes/api/signal-generation';
 import symbolUniverseRouter from './routes/api/symbol-universe';
+import userSettingsRouter from './routes/user-settings';
 import { getSharedService, setSharedService } from './services/shared-service-registry';
 // Removed fastScanner service import
 
@@ -326,6 +327,8 @@ console.log('[express] Optimization API registered at /api/optimize');
 app.use('/api/backtest', signalBacktestingRouter);
 app.use('/api/backtest', historicalBacktestRouter);
 console.log('[express] Signal and Historical Backtesting APIs registered at /api/backtest');
+app.use('/api/user', userSettingsRouter);
+console.log('[express] User Settings API registered at /api/user');
 
 // Remaining disabled routers (see PRODUCTION_READINESS.md "Disabled route groups").
 // Import-time probing is not route-level safety evidence. Each group below
@@ -343,11 +346,6 @@ console.log('[express] Agent Signal Insights API registered at /api/agents/signa
 import strategiesRouter from './routes/strategies';
 app.use('/api/strategies', strategiesRouter);
 console.log('[express] Strategies API registered at /api/strategies');
-
-// Register User Settings routes
-import userSettingsRouter from './routes/user-settings';
-app.use('/api/user', userSettingsRouter);
-console.log('[express] User Settings API registered at /api/user');
 
   // Health Check route: RESTORED above, outside this disabled block.
 
