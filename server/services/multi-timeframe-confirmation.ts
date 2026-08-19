@@ -54,6 +54,9 @@ export class MultiTimeframeConfirmation {
   analyzeTimeframes(
     timeframeAnalyses: EnhancedTimeframeAnalysis[]
   ): TimeframeSignalAnalysis[] {
+    // Callers may hand over a signal without per-timeframe analysis; treat that
+    // as "no confirmation available" instead of throwing on the signal path.
+    if (!Array.isArray(timeframeAnalyses)) return [];
     return timeframeAnalyses.map(analysis => {
       const weight = this.timeframeWeights[analysis.timeframe]?.weight || 1.0;
       

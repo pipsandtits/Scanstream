@@ -325,6 +325,15 @@ export class DbStorage implements IStorage {
     return this.isConnected && !!this.prisma;
   }
 
+  /**
+   * Whether the real database is in use. When false, writes land in the
+   * in-memory fallback and are lost on restart — a critical condition for
+   * live trading, so readiness probes must surface it.
+   */
+  isDatabaseConnected(): boolean {
+    return this.isReady();
+  }
+
   private async tryPrismaCreate(modelNames: string[], data: any) {
     for (const name of modelNames) {
       try {

@@ -17,6 +17,9 @@ import PartialFillSimulator from './services/partial-fill-simulator';
 import MockNetwork from './services/mock-network';
 import VenueRouter from './services/venue-router';
 import OrderRetryPolicy from './services/order-retry-policy';
+import { evaluatePreTrade, type HardLimits } from './services/risk/hard-limit-gate';
+import { reconcileByClientOrderId, isAmbiguousError, buildClientOrderId } from './services/execution/order-reconciler';
+import { recordExecutionBlocked, recordOrderReconciliation, recordFlattenAll } from './services/observability/safety-metrics';
 
 // Small helper to bound a promise with a timeout. Returns null on timeout or error.
 async function promiseWithTimeout<T>(p: Promise<T>, ms: number): Promise<T | null> {
@@ -83,6 +86,13 @@ interface LivePosition {
   orders: LiveOrder[];
 }
 
+export interface FlattenResult {
+  requested: number;
+  closed: string[];
+  failed: Array<{ positionId: string; symbol: string; error: string }>;
+  reason: string;
+}
+
 interface ExecutionConfig {
   enabled: boolean;
   exchange: string;
@@ -109,6 +119,9 @@ export class LiveTradingEngine extends EventEmitter {
   private retryPolicy: OrderRetryPolicy;
   private consecutiveFailures: number = 0;
   private circuitBreakerThreshold: number = 5; // pause after N consecutive failures
+  private flattening: boolean = false;
+  private flattenInFlight: Promise<FlattenResult> | null = null;
+  private hardLimitOverrides: Partial<HardLimits> = {};
 
   constructor(config?: Partial<ExecutionConfig>) {
     super();
@@ -135,12 +148,9 @@ export class LiveTradingEngine extends EventEmitter {
         // If operator requested forced close, attempt safe closes if configured
         const forceClose = process.env.KILL_FORCE_CLOSE === '1';
         if (forceClose) {
-          logger.warn('Force-close on kill enabled: attempting to close open positions');
+          logger.warn('Force-close on kill enabled: flattening all positions');
           try {
-            const status = this.getStatus();
-            for (const pos of status.positions) {
-              try { await this.closePosition(pos.id); } catch (e) { logger.warn('Force close failed', e); }
-            }
+            await this.flattenAll('kill_switch');
           } catch (e) {
             logger.error('Error while attempting force-close after kill', e);
           }
@@ -169,8 +179,10 @@ export class LiveTradingEngine extends EventEmitter {
         liveCircuitBreaker.on('cleared', (s: any) => {
           const logger = new ModuleLogger('LiveTrading');
           logger.info('Global circuit breaker cleared', s);
-          // allow placements again
-          this.config.enabled = true;
+          // Clearing the breaker never re-enables trading on its own: the kill
+          // switch may still be set and the operator may have stopped the
+          // engine deliberately. Resuming is an explicit operator action.
+          this.emit('circuitBreakerCleared', s);
         });
       } catch (e) {}
       systemKillSwitch.on('clear', (state) => {
@@ -269,6 +281,13 @@ export class LiveTradingEngine extends EventEmitter {
    * Start live trading engine
    */
   async start(): Promise<void> {
+    if (systemKillSwitch.isKilled()) {
+      const state = systemKillSwitch.getState();
+      new ModuleLogger('LiveTrading').error('Start refused: system kill-switch active', state);
+      this.emit('startRefused', { reason: 'kill_switch_active', state });
+      throw new Error(`Cannot start live trading: kill-switch active (${state.reason || 'unspecified'})`);
+    }
+
     if (!this.exchange) {
       await this.initialize();
     }
@@ -306,13 +325,34 @@ export class LiveTradingEngine extends EventEmitter {
    */
   async executeSignal(signal: Signal): Promise<LiveOrder | null> {
     const logger = new ModuleLogger('LiveTrading');
-    if (liveCircuitBreaker.isActive()) {
-      logger.warn('Execution blocked: global circuit breaker active');
-      this.emit('executionBlocked', { type: 'circuit_breaker', reason: liveCircuitBreaker.getState() });
+
+    if (!this.exchange) {
+      logger.info('Engine not initialized');
       return null;
     }
-    if (!this.exchange || !this.config.enabled) {
-      logger.info('Engine not enabled');
+
+    if (this.flattening) {
+      logger.warn('Execution blocked: flatten-all in progress');
+      this.emit('executionBlocked', { type: 'flattening', reason: 'flatten_in_progress', symbol: signal.symbol });
+      return null;
+    }
+
+    // Hard limit gate: kill switch, circuit breaker, staleness, size, exposure,
+    // position count and leverage. Fails closed and cannot be bypassed by
+    // downstream sizing logic.
+    const preTrade = this.checkHardLimits(signal, Math.min(this.config.maxPositionSize, this.config.maxTotalExposure - this.getTotalExposure()));
+    if (!preTrade.allowed) {
+      logger.warn(`Execution blocked by hard limit gate: ${preTrade.code} — ${preTrade.reason}`);
+      recordExecutionBlocked(preTrade.code || 'unknown');
+      this.emit('executionBlocked', {
+        type: 'hard_limit',
+        code: preTrade.code,
+        reason: preTrade.reason,
+        timestamp: Date.now(),
+        signalId: signal.id,
+        symbol: signal.symbol,
+        limits: preTrade.limits,
+      });
       return null;
     }
 
@@ -384,8 +424,18 @@ export class LiveTradingEngine extends EventEmitter {
         return null;
       }
     } catch (pmErr) {
-      // non-fatal: continue if portfolio manager unavailable
-      logger.warn('PortfolioRiskManager check failed, continuing', pmErr);
+      // Portfolio risk state is a hard limit input: if it cannot be evaluated we
+      // do not know whether the daily loss / drawdown limits are breached, so we
+      // fail closed instead of trading blind.
+      logger.error('PortfolioRiskManager check failed — blocking execution', pmErr);
+      this.emit('executionBlocked', {
+        type: 'portfolio_limit',
+        reason: 'risk_state_unavailable',
+        timestamp: Date.now(),
+        signalId: signal.id,
+        symbol: signal.symbol,
+      });
+      return null;
     }
 
     const totalExposure = this.getTotalExposure();
@@ -419,7 +469,18 @@ export class LiveTradingEngine extends EventEmitter {
         }
       }
     } catch (e) {
-      // non-fatal: proceed if TruthEngine not available or check fails
+      // Market-data quality is a hard gate: if we cannot establish it, we do not
+      // trade. Failing open here means placing orders on unverified prices.
+      logger.error('TruthEngine tradeability check errored — blocking execution', e);
+      recordExecutionBlocked('truth_check_error');
+      this.emit('executionBlocked', {
+        type: 'truth',
+        reason: 'truth_check_error',
+        timestamp: Date.now(),
+        signalId: signal.id,
+        symbol: signal.symbol
+      });
+      return null;
     }
 
     try {
@@ -459,8 +520,17 @@ export class LiveTradingEngine extends EventEmitter {
 
         positionSizeUSD = Math.min(positionSizeUSD, consensus.finalSize);
       } catch (pmErr) {
-        // ignore failures in portfolio manager and continue with local sizing
-        logger.warn('PortfolioRiskManager sizing failed, using fallback sizing', pmErr);
+        // Sizing consensus also enforces the kill switch and daily-loss limit, so
+        // a failure here must not fall through to unconstrained local sizing.
+        logger.error('PortfolioRiskManager sizing failed — blocking execution', pmErr);
+        this.emit('executionBlocked', {
+          type: 'consensus',
+          reason: 'sizing_unavailable',
+          timestamp: Date.now(),
+          signalId: signal.id,
+          symbol: signal.symbol,
+        });
+        return null;
       }
 
       try {
@@ -497,7 +567,7 @@ export class LiveTradingEngine extends EventEmitter {
         // ignore RL sizing failures and fallback to default sizing
       }
 
-      let amount = positionSizeUSD / Math.max(1, signal.price);
+      let amount = positionSizeUSD / signal.price;
       // If TruthEngine consensus price exists, prefer it for amount calculation
       try {
         const truth = (global as any).truthEngine as any;
@@ -510,13 +580,13 @@ export class LiveTradingEngine extends EventEmitter {
               // check slippage tolerance vs consensus
               const refPrice = cons.price;
               const sigPrice = signal.price || refPrice;
-              const slippagePct = Math.abs((sigPrice - refPrice) / Math.max(1, refPrice)) * 100;
+              const slippagePct = Math.abs((sigPrice - refPrice) / refPrice) * 100;
               if (slippagePct > this.config.slippageTolerance) {
                 logger.info(`Blocked execution: signal price ${sigPrice} deviates ${slippagePct.toFixed(2)}% from consensus ${refPrice}`);
                 return null;
               }
               // use consensus for amount
-              const amt = positionSizeUSD / Math.max(1, refPrice);
+              const amt = positionSizeUSD / refPrice;
               // prefer consensus-based amount (safer sizing)
               if (amt > 0) {
                 amount = Math.min(amount, amt);
@@ -537,6 +607,26 @@ export class LiveTradingEngine extends EventEmitter {
         }
       } catch (e) { /* ignore */ }
 
+      // Re-check hard limits against the FINAL sizing. The pre-trade check ran
+      // on the requested size; RL/consensus sizing can change it afterwards.
+      const finalNotionalUsd = amount * signal.price;
+      const finalGate = this.checkHardLimits(signal, finalNotionalUsd);
+      if (!finalGate.allowed) {
+        logger.warn(`Final sizing blocked by hard limit gate: ${finalGate.code} — ${finalGate.reason}`);
+        recordExecutionBlocked(finalGate.code || 'unknown');
+        this.emit('executionBlocked', {
+          type: 'hard_limit_final',
+          code: finalGate.code,
+          reason: finalGate.reason,
+          limits: finalGate.limits,
+          notionalUsd: finalNotionalUsd,
+          timestamp: Date.now(),
+          signalId: signal.id,
+          symbol: signal.symbol,
+        });
+        return null;
+      }
+
       // Reserve capital atomically before placement
       let reservationToken: string | null = null;
       try {
@@ -555,6 +645,12 @@ export class LiveTradingEngine extends EventEmitter {
       let lastError: any = null;
       let currentAmount = amount;
       let currentVenue = this.config.exchange;
+      // Idempotency key: lets us prove whether an ambiguous placement landed.
+      let clientOrderId = buildClientOrderId('ss', (signal as any).correlationId ?? signal.id ?? signal.symbol);
+      const minAmount = amount * 0.1;
+      // Bound failover so a multi-venue outage cannot produce an endless retry storm.
+      let venueSwitches = 0;
+      const maxVenueSwitches = Number(process.env.MAX_VENUE_FAILOVERS) || 2;
 
       while (true) {
         try {
@@ -566,7 +662,9 @@ export class LiveTradingEngine extends EventEmitter {
             signal.symbol,
             'market',
             signal.type.toLowerCase() as 'buy' | 'sell',
-            currentAmount
+            currentAmount,
+            undefined,
+            { clientOrderId, newClientOrderId: clientOrderId }
           );
 
           // success
@@ -574,6 +672,38 @@ export class LiveTradingEngine extends EventEmitter {
         } catch (err: any) {
           lastError = err;
           attempt += 1;
+
+          // Ambiguous failure: the order may already exist on the exchange.
+          // Reconcile before considering any retry, otherwise a retry doubles
+          // real exposure.
+          if (isAmbiguousError(err)) {
+            const recon = await reconcileByClientOrderId(this.exchange, signal.symbol, clientOrderId);
+            recordOrderReconciliation(recon.state);
+            this.emit('orderReconciled', {
+              symbol: signal.symbol,
+              clientOrderId,
+              state: recon.state,
+              checked: recon.checked,
+              errors: recon.errors,
+              signalId: signal.id,
+            });
+
+            if (recon.state === 'exists') {
+              new ModuleLogger('LiveTrading').warn(
+                `Ambiguous placement reconciled as LIVE (${clientOrderId}); adopting exchange order`
+              );
+              order = recon.order;
+              break;
+            }
+            if (recon.state === 'unknown') {
+              new ModuleLogger('LiveTrading').error(
+                `Ambiguous placement could not be reconciled (${clientOrderId}); aborting to avoid duplicate order`
+              );
+              throw err;
+            }
+            // 'absent' — proven not on the exchange, safe to retry with a fresh id.
+            clientOrderId = buildClientOrderId('ss', (signal as any).correlationId ?? signal.id ?? signal.symbol);
+          }
           const code = err && err.code ? String(err.code) : (err && err.message ? String(err.message) : 'UNKNOWN');
           const action = this.retryPolicy.mapRejection(code || 'UNKNOWN');
 
@@ -595,16 +725,26 @@ export class LiveTradingEngine extends EventEmitter {
           } catch (e) { logger2.warn('Failed to persist retry decision event', e); }
 
           if (action === 'reduce') {
-            currentAmount = Math.max(1, Math.floor(currentAmount * 0.75));
+            // Never round up: for assets priced above $1 a unit-floor would
+            // *increase* the order (0.02 BTC -> 1 BTC).
+            const reduced = currentAmount * 0.75;
+            if (!Number.isFinite(reduced) || reduced < minAmount) {
+              new ModuleLogger('LiveTrading').warn(
+                `Reduce-retry floor reached (${reduced} < ${minAmount}); aborting placement`
+              );
+              throw err;
+            }
+            currentAmount = reduced;
           } else if (action === 'switch_venue') {
             // mark current venue unhealthy and attempt to failover
             this.venueRouter.markFailure(currentVenue, 20);
             const next = this.venueRouter.getNextVenue(currentVenue);
-            if (next) {
+            if (next && venueSwitches < maxVenueSwitches) {
               logger2.info(`Failover: switching to next venue ${next.id}`);
               const switched = await this.switchVenue(next.id);
               if (switched) {
                 currentVenue = next.id;
+                venueSwitches += 1;
                 // reset attempt counter to allow new venue attempts
                 attempt = 0;
                 currentAmount = amount; // reset amount to original on new venue
@@ -738,7 +878,8 @@ export class LiveTradingEngine extends EventEmitter {
       if (reservationToken) reservationTokens.push(reservationToken);
       // Register position with portfolio manager (best-effort)
       try {
-        const avgPrice = (liveOrder.cost || 0) / Math.max(1, liveOrder.filled || amount);
+        const filledQty = liveOrder.filled > 0 ? liveOrder.filled : amount;
+        const avgPrice = filledQty > 0 && liveOrder.cost > 0 ? liveOrder.cost / filledQty : (signal.price || 0);
         const sizeUsd = (avgPrice || signal.price || 0) * amount;
         portfolioRiskManager.addPosition({
           symbol: liveOrder.symbol,
@@ -861,6 +1002,93 @@ export class LiveTradingEngine extends EventEmitter {
       }
 
       return null;
+    }
+  }
+
+  /**
+   * Evaluate the non-overridable hard limit gate for a signal.
+   * Exposed so callers (routes, agents) can pre-check with identical semantics.
+   */
+  checkHardLimits(signal: Signal, requestedSizeUsd: number) {
+    return evaluatePreTrade(
+      {
+        symbol: signal.symbol,
+        price: signal.price,
+        signalTimestamp: (signal as any).timestamp ?? null,
+        requestedSizeUsd,
+        currentExposureUsd: this.getTotalExposure(),
+        symbolExposureUsd: this.getSymbolExposure(signal.symbol),
+        openPositions: this.positions.size,
+        leverage: this.config.defaultLeverage,
+        engineEnabled: this.config.enabled,
+      },
+      {
+        maxPositionSizeUsd: this.config.maxPositionSize,
+        maxTotalExposureUsd: this.config.maxTotalExposure,
+        maxLeverage: this.config.defaultLeverage,
+        ...this.hardLimitOverrides,
+      }
+    );
+  }
+
+  /**
+   * Close every open position. Safe to call repeatedly and while already flat:
+   * per-position failures are isolated and reported rather than aborting the
+   * sweep, and new placements are blocked for the duration.
+   */
+  async flattenAll(reason: string = 'manual'): Promise<FlattenResult> {
+    // Concurrent requests join the running sweep instead of racing it, so
+    // double-clicking the panic button cannot double-close a position.
+    if (this.flattenInFlight) return this.flattenInFlight;
+    this.flattenInFlight = this.runFlattenAll(reason).finally(() => {
+      this.flattenInFlight = null;
+    });
+    return this.flattenInFlight;
+  }
+
+  private async runFlattenAll(reason: string): Promise<FlattenResult> {
+    const logger = new ModuleLogger('LiveTrading');
+    const closed: string[] = [];
+    const failed: Array<{ positionId: string; symbol: string; error: string }> = [];
+
+    // Block new placements for the whole sweep, even if it is re-entered.
+    const alreadyFlattening = this.flattening;
+    this.flattening = true;
+    this.config.enabled = false;
+
+    try {
+      // Refresh from the exchange first so we do not miss positions that were
+      // opened outside this process.
+      try {
+        await this.updatePositions();
+      } catch (e) {
+        logger.warn('flattenAll: position refresh failed, using local view', e);
+      }
+
+      const snapshot = Array.from(this.positions.values());
+      for (const position of snapshot) {
+        try {
+          const ok = await this.closePosition(position.id);
+          if (ok) closed.push(position.id);
+          else failed.push({ positionId: position.id, symbol: position.symbol, error: 'close_returned_false' });
+        } catch (err: any) {
+          failed.push({ positionId: position.id, symbol: position.symbol, error: err?.message || String(err) });
+        }
+      }
+
+      const result = { requested: snapshot.length, closed, failed, reason };
+      recordFlattenAll(failed.length);
+      logger.warn(`flattenAll(${reason}): ${closed.length}/${snapshot.length} closed, ${failed.length} failed`);
+      this.emit('flattenAll', result);
+
+      if (failed.length > 0) {
+        // Unresolved exposure is an operator-visible condition.
+        this.emit('flattenAllIncomplete', result);
+      }
+
+      return result;
+    } finally {
+      if (!alreadyFlattening) this.flattening = false;
     }
   }
 
@@ -1155,6 +1383,15 @@ export class LiveTradingEngine extends EventEmitter {
     return total;
   }
 
+  /** Notional exposure currently open for a single symbol. */
+  private getSymbolExposure(symbol: string): number {
+    let total = 0;
+    for (const position of this.positions.values()) {
+      if (position.symbol === symbol) total += position.marginUsed;
+    }
+    return total;
+  }
+
   /**
    * Get current status
    */
@@ -1196,8 +1433,20 @@ export class LiveTradingEngine extends EventEmitter {
   }
 
   resume() {
+    // Resuming must respect the global safety controls.
+    if (systemKillSwitch.isKilled()) {
+      new ModuleLogger('LiveTrading').warn('Resume refused: system kill-switch active');
+      this.emit('resumeRefused', { reason: 'kill_switch_active', state: systemKillSwitch.getState() });
+      return false;
+    }
+    if (liveCircuitBreaker.isActive()) {
+      new ModuleLogger('LiveTrading').warn('Resume refused: live circuit breaker active');
+      this.emit('resumeRefused', { reason: 'circuit_breaker_active', state: liveCircuitBreaker.getState() });
+      return false;
+    }
     if (!this.isRunning) this.start().catch(() => {});
     this.emit('resumed');
+    return true;
   }
 }
 

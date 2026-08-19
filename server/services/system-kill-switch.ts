@@ -35,17 +35,26 @@ class SystemKillSwitch extends EventEmitter {
         this.state = JSON.parse(raw) as KillState;
       }
     } catch (err) {
-      // ignore and keep defaults
-      console.error('[SystemKillSwitch] failed to load state', err);
+      // Fail closed: a kill state we cannot read may well be "killed", and
+      // assuming otherwise would silently re-enable trading after a restart.
+      console.error('[SystemKillSwitch] failed to load state, failing closed', err);
+      this.state = {
+        killed: true,
+        reason: 'unreadable_persisted_state',
+        setBy: 'system',
+        timestamp: new Date().toISOString()
+      };
     }
   }
 
-  private persist() {
+  private persist(): boolean {
     try {
       ensureDataDir();
       fs.writeFileSync(PERSIST_PATH, JSON.stringify(this.state, null, 2), 'utf8');
+      return true;
     } catch (err) {
       console.error('[SystemKillSwitch] failed to persist state', err);
+      return false;
     }
   }
 
@@ -70,13 +79,21 @@ class SystemKillSwitch extends EventEmitter {
   }
 
   clearKill(clearedBy?: string) {
+    const previous = this.state;
     this.state = {
       killed: false,
       reason: undefined,
       setBy: clearedBy || 'system',
       timestamp: new Date().toISOString()
     };
-    this.persist();
+
+    // Clearing must be durable: an in-memory-only clear would silently diverge
+    // from the persisted kill state and flip back on restart.
+    if (!this.persist()) {
+      this.state = previous;
+      throw new Error('Cannot clear kill switch: failed to persist cleared state');
+    }
+
     this.emit('clear', this.getState());
     console.info('[SystemKillSwitch] kill cleared');
   }

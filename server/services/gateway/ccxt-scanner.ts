@@ -2,6 +2,7 @@ import { ExchangeAggregator } from './exchange-aggregator';
 import { CacheManager } from './cache-manager';
 import { RateLimiter } from './rate-limiter';
 import type { PriceData, OHLCVData } from '../../types/gateway';
+import { recordIntegrityBypassBlocked } from '../observability/safety-metrics';
 
 /**
  * CCXT Scanner - Orchestrated by Gateway
@@ -279,29 +280,13 @@ export class CCXTScanner {
         console.log(`[CCXT Scanner] Emitted ${result.ticks.length} world ticks for ${symbol}`);
 
       } catch (integrityError) {
-        console.warn('[CCXT Scanner] Integrity gate check failed, falling back to direct storage:', integrityError);
-
-        // Fallback: store directly if integrity gate fails (rare). Keep this as a last-resort path.
-        try {
-          const { storage } = await import('../../storage');
-          for (const frame of frames) {
-            try {
-              // Insert without timestamp to match InsertMarketFrame shape; storage will set timestamp
-              await storage.createMarketFrame({
-                symbol: frame.symbol,
-                price: frame.price,
-                volume: frame.volume,
-                indicators: frame.indicators,
-                orderFlow: frame.orderFlow,
-                marketMicrostructure: frame.marketMicrostructure
-              } as any);
-            } catch (storageError) {
-              console.warn(`[CCXT Scanner] Failed to store frame for ${symbol}:`, (storageError as any).message);
-            }
-          }
-        } catch (importError) {
-          console.warn('[CCXT Scanner] Storage module not available for frame persistence');
-        }
+        // No fallback to direct storage: bypassing the integrity gate would let
+        // unvalidated data become canonical, which is worse than losing a scan.
+        console.error(
+          `[CCXT Scanner] Integrity gate failed for ${symbol}/${timeframe} — frames dropped (no direct-storage fallback):`,
+          integrityError
+        );
+        recordIntegrityBypassBlocked(symbol, timeframe, frames.length);
       }
 
       // Step 5: Calculate basic metrics

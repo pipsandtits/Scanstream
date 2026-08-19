@@ -251,6 +251,35 @@ export class IntegrityGate extends EventEmitter {
           }
         }
 
+        // CRITICAL SEMANTIC: worldTime = candle close time (market time, not wall-clock)
+        // This ensures replay alignment, cross-timeframe consistency, and physics accuracy
+        const worldTime = validCandle.ts + (timeframe * 1000);
+
+        // TEMPORAL HYGIENE CHECKS — evaluated BEFORE storage, so a temporally
+        // incoherent candle never becomes canonical data.
+        const liveEpochForCandle = getLiveEpoch();
+        // Consider this candle historical if explicitly marked OR it predates LIVE start
+        const candleIsHistorical = ((validCandle as any).source === 'historical') || liveEpochForCandle.isHistorical(validCandle.ts);
+        // Only check for time regression on non-historical (live) candles
+        const hasTimeRegression = candleIsHistorical ? false : liveEpochForCandle.isTimeRegression(symbol, worldTime);
+
+        if (hasTimeRegression) {
+          // Rate-limit regression logs per symbol (30s)
+          const last = this.lastRegressionLog.get(symbol) || 0;
+          const now = Date.now();
+          if (now - last > 30_000) {
+            console.error(
+              `[IntegrityGate] ⛔ TIME REGRESSION: ${symbol} ${timeframe}s ` +
+              `(current=${new Date(worldTime).toISOString()}) — candle REJECTED before storage`
+            );
+            this.lastRegressionLog.set(symbol, now);
+          }
+
+          // Neither store nor emit: time is incoherent.
+          report.rejected.push({ candle: validCandle as any as Candle, reason: 'time_regression' } as any);
+          continue; // process next validated candle
+        }
+
         // ATOMIC OPERATION: Store THEN emit tick
         // INVARIANT: A world tick is emitted IF storage succeeded
           try {
@@ -261,37 +290,8 @@ export class IntegrityGate extends EventEmitter {
           // 2. 📍 EMIT WORLD TICK (facts only, after storage succeeds)
           // This is the atomic event that drives the RPG and all agents.
           // Agents ONLY react to world ticks, never to raw data.
-          
-          // CRITICAL SEMANTIC: worldTime = candle close time (market time, not wall-clock)
-          // This ensures replay alignment, cross-timeframe consistency, and physics accuracy
-          const worldTime = validCandle.ts + (timeframe * 1000);
           const emitTime = Date.now();
           const lag = emitTime - worldTime;
-
-          // TEMPORAL HYGIENE CHECKS
-          const liveEpoch = getLiveEpoch();
-          // Consider this candle historical if explicitly marked OR it predates LIVE start
-          const candleIsHistorical = ((validCandle as any).source === 'historical') || liveEpoch.isHistorical(validCandle.ts);
-          // Only check for time regression on non-historical (live) candles
-          const hasTimeRegression = candleIsHistorical ? false : liveEpoch.isTimeRegression(symbol, worldTime);
-
-          if (hasTimeRegression) {
-            // Rate-limit regression logs per symbol (30s)
-            const last = this.lastRegressionLog.get(symbol) || 0;
-            const now = Date.now();
-            if (now - last > 30_000) {
-              console.error(
-                `[IntegrityGate] ⛔ TIME REGRESSION: ${symbol} ${timeframe}s ` +
-                `(current=${new Date(worldTime).toISOString()}) — tick SUPPRESSED`
-              );
-              this.lastRegressionLog.set(symbol, now);
-            }
-
-            // Do NOT emit this tick — time is incoherent. Mark as rejected and continue processing
-            // Keep storage invariant: do not store this candle
-            report.rejected.push({ candle: validCandle as any as Candle, reason: 'time_regression' } as any);
-            continue; // process next validated candle
-          }
 
           // 🔄 DETECT OPERATION MODE
           const modeDetector = getModeDetector();

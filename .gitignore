@@ -25,3 +25,6 @@ checkpoints/
 .env
 vfmd_system/venv
 vfmd_system/
+# Python bytecode
+__pycache__/
+*.py[cod]
