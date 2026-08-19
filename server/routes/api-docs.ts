@@ -137,7 +137,7 @@ router.get('/health', (req: Request, res: Response) => {
  */
 router.get('/health/:method/*path', (req: Request, res: Response) => {
   try {
-    const method = routeParamEnum(req.params.method, 'method', ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'] as const);
+    const method = routeParamEnum(String(req.params.method ?? '').toUpperCase(), 'method', ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'] as const);
     const path = `/${routeParam(req.params.path, 'path', 256)}`;
 
     const endpoint = apiRegistry.getEndpoint(method, path);
