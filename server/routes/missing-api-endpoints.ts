@@ -137,7 +137,7 @@ try { apiRegistry.registerEndpoint({ method: 'GET', path: '/api/ml/insights', ca
 router.get('/orders', async (req: Request, res: Response) => {
   try {
     const trades = await storage.getTrades('OPEN');
-    const open = trades.map(t => ({ id: t.id, symbol: t.symbol, side: t.side, price: t.entryPrice || t.price || null, quantity: t.quantity, status: t.status, created_at: t.entryTime || t.createdAt || new Date().toISOString() }));
+    const open = trades.map(t => ({ id: t.id, symbol: t.symbol, side: t.side, price: t.entryPrice, quantity: t.quantity, status: t.status, created_at: t.entryTime }));
     res.json({ open_orders: open, total_orders: open.length, timestamp: new Date().toISOString() });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
