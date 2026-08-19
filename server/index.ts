@@ -39,6 +39,7 @@ import historicalBacktestRouter from './routes/historical-backtest';
 import signalGenerationRouter from './routes/api/signal-generation';
 import symbolUniverseRouter from './routes/api/symbol-universe';
 import userSettingsRouter from './routes/user-settings';
+import gatewayReadonlyRouter, { createGatewayStatusRouter } from './routes/gateway-readonly';
 import { getSharedService, setSharedService } from './services/shared-service-registry';
 // Removed fastScanner service import
 
@@ -329,6 +330,10 @@ app.use('/api/backtest', historicalBacktestRouter);
 console.log('[express] Signal and Historical Backtesting APIs registered at /api/backtest');
 app.use('/api/user', userSettingsRouter);
 console.log('[express] User Settings API registered at /api/user');
+app.use('/api/gateway', gatewayReadonlyRouter);
+console.log('[express] Gateway read-only compatibility API registered at /api/gateway');
+app.use('/api/exchange', createGatewayStatusRouter());
+console.log('[express] Exchange status compatibility API registered at /api/exchange/status');
 
 // Remaining disabled routers (see PRODUCTION_READINESS.md "Disabled route groups").
 // Import-time probing is not route-level safety evidence. Each group below
