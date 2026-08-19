@@ -145,7 +145,7 @@ that no longer exist and are not wired into the runner.
 | P1 | `TRADING_OPERATOR_TOKEN` is a single shared secret with no rotation, per-user identity or audit trail — an interim guard, not an authz design. Read-only status routes remain unauthenticated |
 | P1 | ~25 route groups remain commented out in `server/index.ts`; unknown functional gaps |
 | P1 | Safety metrics are process-local and reset on restart; no Prometheus/OTel exporter, no correlation IDs end-to-end |
-| P1 | `typecheck` reports a 362-error legacy baseline; one safe `server/routes` narrowing is now fixed, leaving 361 errors. CI does not gate on it; the remaining errors are classified below |
+| P1 | The historical 362-error TypeScript baseline is classified below; the Pass 5 hardening work reduced the active baseline to zero without suppressions or dependency stubs |
 | P2 | Capital-adjacent `truthEngine` handoffs are typed through a registry; remaining non-capital global handoffs are inventoried below and full DI remains open |
 | P2 | Indicator cost is measured over a committed fixture; full market-data replay/MIXED parity remains unverified |
 | P2 | Rich `/api/health` still contains hard-coded exchange counts and placeholder freshness values |
@@ -897,26 +897,27 @@ Client compatibility and deliberate breakage are recorded explicitly:
 
 #### Type track
 
-The classified TypeScript baseline moved from **362 errors to 2**:
+The classified TypeScript baseline moved from **362 errors to 0**:
 
 | Area | Pass 4E baseline | After T1 defects | After T2 mechanical server pass | Pass 5 final |
 | --- | ---: | ---: | ---: | ---: |
-| Total | 362 | 304 | 168 | 2 |
+| Total | 362 | 304 | 168 | 0 |
 | `server/routes` | 172 | 143 | 14 | 0 |
-| Other `server/` | 40 | 11 | 9 | 2 |
+| Other `server/` | 40 | 11 | 9 | 0 |
 | Client | 145 | 145 | 145 | 0 |
 | Tests | 5 | 5 | 0 | 0 |
 | Execution | 0 | 0 | 0 | 0 |
 | Risk | 0 | 0 | 0 | 0 |
 | Observability | 0 | 0 | 0 | 0 |
 
-The two residuals are the genuinely absent `chartjs-node-canvas` and
-`chart.js` packages in `server/chart-api.ts`. `chart.js` is not declared in
-`package.json`; the only related package reference is tsup's externalization
-flag for `chartjs-node-canvas`. The chart API is dynamically imported and
-registration catches an unavailable module, so adding ambient declarations or
-casts would falsely imply an installed runtime dependency. These errors are
-reported rather than suppressed.
+The typecheck baseline is now genuinely **0**. Server-side PNG rendering in
+`server/chart-api.ts` is deliberately not implemented in this build rather
+than carried as an absent dependency: `chartjs-node-canvas` would require
+native Cairo/Pango libraries, and its failed optional import previously made
+the entire chart API unavailable, including the independent chart-data route.
+`GET /api/chart-data/:symbol` remains registered; `GET
+/api/chart-image/:symbol` remains registered and returns HTTP 501 with an
+explicit server-side-rendering-unavailable error.
 
 ##### T1 confirmed runtime defects
 
@@ -1036,8 +1037,9 @@ deliberately disabled:
   remain unmounted for the ownership/safety reasons above.
 - Full historical replay and `MIXED`-mode parity remain incomplete.
 - Venue-specific validation and operational validation remain outstanding.
-- The two absent chart-module dependencies remain truthful typecheck
-  residuals.
+- Server-side chart PNG rendering remains deliberately unavailable and is
+  exposed as an explicit HTTP 501 response; the chart-data route remains
+  active and the typecheck baseline is clean.
 
 The hardening direction is fail-closed, but these remaining route, cost,
 replay, venue, and dependency gaps mean Scanstream remains **not production-ready
