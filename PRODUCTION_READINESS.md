@@ -505,7 +505,7 @@ work is tracked below rather than hidden by this pass.
 | P0 | **Closed in Pass 4A:** funding source fallback through declared `fetchLedger` funding entries; venues declaring neither source refuse explicitly |
 | P1 | **Closed in Pass 4B:** venue-scoped keys, explicit age bounds, invalidation, concurrency limits, single-flight, failure backoff and memory-only restart semantics. No persisted live cache was found, so persisted-cache corruption is not applicable |
 | P1 | **Partially closed in Pass 4C:** fixture-driven paper/live gate observations and order-intent parity, plus a REPLAY confidence-scorer oracle; the full historical pipeline and MIXED mode are not reproducible in-process |
-| P1 | **Partially closed in Pass 4D:** route-level contracts and operator audit coverage restored `/api/agents/services-api` and `/api/execution`; all other disabled groups remain disabled pending per-route coverage |
+| P1 | **Partially closed in Pass 4D:** route-level contracts and operator audit coverage restored `/api/agents/services-api`, `/api/model-performance` and `/api/execution`; all other disabled groups remain disabled pending per-route coverage |
 | P2 | **Partially closed in Pass 4E:** 362-error classification is committed; capital-adjacent `truthEngine` handoffs use a typed registry; indicator costs are measured. Legacy errors, non-capital globals and full DI remain open |
 
 #### Pass 4E typecheck classification
