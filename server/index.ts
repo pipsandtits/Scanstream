@@ -17,7 +17,7 @@ import paperTradingRouter from './routes/paper-trading';
 import scannerRouter from './routes/scanner';
 import scannerAnalysisRouter from './routes/scanner-analysis';
 import physicsAgentsRouter from './routes/physics-agents';
-import physicsValidationRouter from './routes/physics-validation-correct';
+import physicsValidationRouter from './routes/physics-validation';
 import missingApiEndpointsRouter from './routes/missing-api-endpoints';
 import featureFlagsRouter from './routes/feature-flags';
 import agentAbilitiesRouter from './routes/agent-abilities';
@@ -26,6 +26,11 @@ import metricsRouter from './routes/metrics';
 import agentsRouter from './routes/agents';
 import tradeExecutionRouter from './routes/trade-execution';
 import modelPerformanceRouter from './routes/model-performance';
+import scoutReportRouter from './routes/scout-report-routes';
+import phase5Routes from './routes/phase5-api';
+import multiTimeframeRouter from './routes/multi-timeframe-analysis';
+import symbolsRouter from './routes/symbols';
+import learningMetricsRouter from './routes/learning-metrics';
 import { getSharedService, setSharedService } from './services/shared-service-registry';
 // Removed fastScanner service import
 
@@ -291,6 +296,20 @@ console.log('[express] Trade Execution API registered at /api/execution');
 app.use('/api/model-performance', modelPerformanceRouter);
 console.log('[express] Model Performance API registered at /api/model-performance');
 
+// Batch 1 read-mostly routes restored with isolated route-contract coverage.
+app.use('/api/scout', scoutReportRouter);
+console.log('[express] Scout Report API registered at /api/scout');
+app.use('/api/phase5', phase5Routes);
+console.log('[express] Phase 5 API registered at /api/phase5');
+app.use('/api/analysis/multi-timeframe', multiTimeframeRouter);
+console.log('[express] Multi-Timeframe Analysis API registered at /api/analysis/multi-timeframe');
+app.use('/api/symbols', symbolsRouter);
+console.log('[express] Symbols API registered at /api/symbols');
+app.use(learningMetricsRouter);
+console.log('[express] Learning Metrics API registered at /api/learning');
+app.use('/api/physics', physicsValidationRouter);
+console.log('[express] Physics Validation API registered at /api/physics');
+
 // Remaining disabled routers (see PRODUCTION_READINESS.md "Disabled route groups").
 // Import-time probing is not route-level safety evidence. Each group below
 // remains disabled until every route has bounded contract/error coverage and
@@ -303,19 +322,10 @@ console.log('[express] Model Performance API registered at /api/model-performanc
 // app.use('/api/agents/physics', physicsAgentsRouter);
 // console.log('[express] Physics Agents API registered at /api/agents/physics');
 
-// Register Physics Validation (CORRECT methodology) routes
-app.use('/api/physics', physicsValidationRouter);
-console.log('[express] Physics Validation API (CORRECT) registered at /api/physics');
-
 // Register Exit Agents routes (Orchestrator, Opposition, Microstructure)
 import exitAgentsRouter from './routes/exit-agents';
 app.use('/api/agents/exit', exitAgentsRouter);
 console.log('[express] Exit Agents API registered at /api/agents/exit');
-
-// Register Scout Report routes (Phase 2)
-import scoutReportRouter from './routes/scout-report-routes';
-app.use('/api/scout', scoutReportRouter);
-console.log('[express] Scout Report API registered at /api/scout');
 
 // Register Agent Interactions & Visualization routes
 import agentInteractionsRouter from './routes/agent-interactions';
@@ -370,64 +380,9 @@ console.log('[express] User Settings API registered at /api/user');
     }
   });
 
-  // Register Learning System routes
-  const learningRouter = express.Router();
-  
-  learningRouter.get('/status', (req, res) => {
-    if (!globalLearningSystem) {
-      return res.status(503).json({ error: 'Learning system not initialized' });
-    }
-    const stats = globalLearningSystem.get_learning_stats();
-    res.json({ status: 'ok', data: stats, timestamp: new Date() });
-  });
-  
-  learningRouter.get('/beliefs', (req, res) => {
-    if (!globalLearningSystem) {
-      return res.status(503).json({ error: 'Learning system not initialized' });
-    }
-    const beliefs = globalLearningSystem.get_strategy_beliefs();
-    res.json({ status: 'ok', data: beliefs, timestamp: new Date() });
-  });
-  
-  learningRouter.get('/evidence-log', (req, res) => {
-    if (!globalLearningSystem) {
-      return res.status(503).json({ error: 'Learning system not initialized' });
-    }
-    const limit = parseInt(req.query.limit as string) || 50;
-    const log = globalLearningSystem.get_recent_learning_updates(limit);
-    res.json({ status: 'ok', data: log, count: log.length, timestamp: new Date() });
-  });
-  
-  learningRouter.get('/recommendations', (req, res) => {
-    if (!globalLearningSystem) {
-      return res.status(503).json({ error: 'Learning system not initialized' });
-    }
-    const recommendations = globalLearningSystem.get_system_recommendations();
-    res.json({ status: 'ok', data: recommendations, timestamp: new Date() });
-  });
-  
-  app.use('/api/learning', learningRouter);
-  console.log('[express] Learning System API registered at /api/learning');
-  
-  // Register Multi-Timeframe Analysis routes
-  import multiTimeframeRouter from './routes/multi-timeframe-analysis';
-  app.use('/api/analysis/multi-timeframe', multiTimeframeRouter);
-  console.log('[express] Multi-Timeframe Analysis API registered at /api/analysis/multi-timeframe');
-
   // Register Gateway routes
   app.use('/api/gateway', gatewayRouter);
   console.log('[express] Gateway API registered at /api/gateway');
-
-  // ============================================================================
-  // PHASE 5: FRONTEND VISUALIZATION & TRANSPARENCY API
-  // ============================================================================
-  import phase5Routes from './routes/phase5-api';
-app.use('/api/phase5', phase5Routes);
-console.log('[express] Phase 5 Frontend Visualization API registered at /api/phase5');
-console.log('[express]   - signal-transparency: Real-time 4-source breakdown');
-console.log('[express]   - agent-leaderboard: 5 RPG agents with live metrics');
-console.log('[express]   - signal-history: Paginated signal history with filtering');
-console.log('[express]   - regime: Current market regime and adaptive weights');
 
 // ============================================================================
 // PHASE 6: UNIFIED BACKTEST HUB API

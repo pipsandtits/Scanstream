@@ -346,11 +346,20 @@ safety evidence:
 | `/api/agents/services-api` | **Covered — restored** — route-level tests cover status/config contracts and handled unknown/disabled ability requests |
 | `/api/execution` (trade execution) | **Covered — restored with operator guard** — `POST /decision`, `POST /record-outcome`, and `POST /reset` require `requireTradingOperator` and audited actions; read-only `GET /status` remains public |
 | `/api/model-performance` | **Covered — restored** — metrics/history/status/validation/prune contracts and bounded ensemble input/error handling are tested |
-| physics, exit agents, scout, agent interactions/signals, optimization, strategies, backtesting, velocity, adaptive holding, clustering, phase 5/6, symbol universe, user settings, multi-timeframe, signal generation | **Covered/restoration still open** — import probes pass, but route-level contract/error coverage is not complete; several routes call heavy analytical services and state-changing routes need separate safety review |
+| `/api/scout` | **Covered — restored** — all 14 read-only routes have success, validation, bounded-work, and handled service-failure coverage |
+| `/api/phase5` | **Covered — restored** — all 8 read-only database-backed routes have response-shape and handled database-failure coverage; history inputs are bounded |
+| `/api/analysis/multi-timeframe` | **Covered — restored** — the single read-only route has bounded three-timeframe coverage and handled exchange-feed failure coverage |
+| `/api/symbols` | **Covered — restored** — both read-only CoinGecko-backed routes have pagination, detail, missing-symbol and handled provider-failure coverage |
+| `/api/physics` | **Covered — restored with authentication** — `POST /validate` is authenticated and bounds the symbol input before heavy validation; `GET /validate-status` remains public |
+| `/api/learning` | **Covered — restored with authentication** — all 8 routes are covered; state-mutating `trade-outcome`, `reset`, and `update-metrics` require authentication and validate trade inputs |
+| `/api/symbol-universe` | **Still disabled** — this is `server/routes/api/symbol-universe.ts`, distinct from the covered `server/routes/symbols.ts`; its 13-route mixed read/write surface still lacks complete contract, auth, ownership, and failure coverage |
+| exit agents, agent interactions/signals, optimization, strategies, backtesting, velocity, adaptive holding, clustering, phase 6, user settings, signal generation | **Still disabled** — import probes pass, but route-level contract/error coverage is incomplete; several routes perform heavy analytical work and state-changing routes need separate safety review |
 
-The restored set is intentionally small: `/api/health`,
-`/api/agents/services-api`, `/api/model-performance`, and guarded
-`/api/execution`. The obsolete `/api/logs` registration was deleted.
+The Pass 5 Batch 1 restored set adds `/api/scout`, `/api/phase5`,
+`/api/analysis/multi-timeframe`, `/api/symbols`, authenticated `/api/physics`,
+and authenticated `/api/learning` to the previously restored routes. The
+obsolete `/api/logs` registration was deleted. `server/routes/api/symbol-universe.ts`
+was audited as a separate group and remains disabled.
 
 ### 8.7 Health endpoint no longer publishes fabricated data
 
@@ -372,7 +381,7 @@ distinctions are unchanged.
 | P1 | **Closed in Pass 4B:** cache key uniqueness, TTL, invalidation, stampede and memory-only restart semantics; no persisted live cache was found, so persisted-cache corruption is not applicable |
 | P1 | **Partially closed in Pass 4C:** fixture-driven paper/live gate observations and order-intent parity; full market-data replay and MIXED-mode parity remain unexercised |
 | P1 | **Partially closed in Pass 4C:** concurrent flatten, operator stop during an in-flight order, and stale TruthEngine refusal are covered; the ticker cache has no capital-adjacent consumer, so cache-specific gate wiring remains unproven |
-| P1 | **Partially closed in Pass 4D:** `/api/agents/services-api`, `/api/model-performance`, and guarded `/api/execution` are covered and restored; every other classified group remains disabled pending complete route-level coverage and safety review |
+| P1 | **Partially closed through Pass 5 Batch 1:** `/api/agents/services-api`, `/api/model-performance`, guarded `/api/execution`, `/api/scout`, `/api/phase5`, `/api/analysis/multi-timeframe`, `/api/symbols`, authenticated `/api/physics`, and authenticated `/api/learning` are covered and restored; `/api/symbol-universe` and the remaining classified groups stay disabled pending complete route-level coverage and safety review |
 | P2 | **Partially closed in Pass 4E:** the 362-error baseline is classified below; safe registry and measurement work is complete, while legacy type errors and non-capital global handoffs remain open |
 
 Scanstream is **not** production-ready for live capital on this branch. The
@@ -505,7 +514,7 @@ work is tracked below rather than hidden by this pass.
 | P0 | **Closed in Pass 4A:** funding source fallback through declared `fetchLedger` funding entries; venues declaring neither source refuse explicitly |
 | P1 | **Closed in Pass 4B:** venue-scoped keys, explicit age bounds, invalidation, concurrency limits, single-flight, failure backoff and memory-only restart semantics. No persisted live cache was found, so persisted-cache corruption is not applicable |
 | P1 | **Partially closed in Pass 4C:** fixture-driven paper/live gate observations and order-intent parity, plus a REPLAY confidence-scorer oracle; the full historical pipeline and MIXED mode are not reproducible in-process |
-| P1 | **Partially closed in Pass 4D:** route-level contracts and operator audit coverage restored `/api/agents/services-api`, `/api/model-performance` and `/api/execution`; all other disabled groups remain disabled pending per-route coverage |
+| P1 | **Partially closed through Pass 5 Batch 1:** route-level contracts restored the read-mostly `/api/scout`, `/api/phase5`, `/api/analysis/multi-timeframe`, and `/api/symbols` groups, while authenticated state-mutating routes restored `/api/physics` and `/api/learning`; `/api/symbol-universe` and the remaining groups remain disabled pending coverage and safety review |
 | P2 | **Partially closed in Pass 4E:** 362-error classification is committed; capital-adjacent `truthEngine` handoffs use a typed registry; indicator costs are measured. Legacy errors, non-capital globals and full DI remain open |
 
 #### Pass 4E typecheck classification

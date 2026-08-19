@@ -7,6 +7,7 @@ import express from 'express';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import path from 'path';
+import { requireAuth } from '../middleware/auth';
 
 const router = express.Router();
 const execAsync = promisify(exec);
@@ -20,7 +21,7 @@ const MAX_HISTORY = 1000;
  * POST /api/learning/trade-outcome
  * Process a closed trade through the learning system
  */
-router.post('/api/learning/trade-outcome', async (req, res) => {
+router.post('/api/learning/trade-outcome', requireAuth, async (req, res) => {
   try {
     const { 
       strategy_id, 
@@ -35,10 +36,19 @@ router.post('/api/learning/trade-outcome', async (req, res) => {
     } = req.body;
 
     // Validate required fields
-    if (!strategy_id || !entry_price || !exit_price || !direction) {
+    if (
+      !strategy_id ||
+      typeof entry_price !== 'number' ||
+      !Number.isFinite(entry_price) ||
+      entry_price <= 0 ||
+      typeof exit_price !== 'number' ||
+      !Number.isFinite(exit_price) ||
+      exit_price <= 0 ||
+      !['LONG', 'SHORT'].includes(direction)
+    ) {
       return res.status(400).json({
         success: false,
-        error: 'Missing required fields: strategy_id, entry_price, exit_price, direction'
+        error: 'strategy_id, positive entry_price and exit_price, and LONG or SHORT direction are required'
       });
     }
 
@@ -303,7 +313,7 @@ router.get('/api/learning/regime-analysis', async (req, res) => {
  * POST /api/learning/reset
  * Reset beliefs to priors (for testing/recalibration)
  */
-router.post('/api/learning/reset', async (req, res) => {
+router.post('/api/learning/reset', requireAuth, async (req, res) => {
   try {
     lastLearningMetrics = getDefaultMetrics();
     learningHistoryBuffer = [];
@@ -326,7 +336,7 @@ router.post('/api/learning/reset', async (req, res) => {
  * POST /api/learning/update-metrics
  * Internal endpoint to update metrics from Python backend
  */
-router.post('/api/learning/update-metrics', async (req, res) => {
+router.post('/api/learning/update-metrics', requireAuth, async (req, res) => {
   try {
     const metrics = req.body;
     lastLearningMetrics = metrics;
