@@ -32,10 +32,16 @@ export class CacheManager {
       return null;
     }
 
-    // Check if expired
+    // A caller's freshness requirement is an absolute bound. It must not
+    // evict an entry that remains valid for callers with looser requirements.
     const age = Date.now() - entry.timestamp;
-    const expired = age > entry.ttl || (maxAgeMs !== undefined && age > maxAgeMs);
-    if (expired) {
+    if (maxAgeMs !== undefined && age > maxAgeMs) {
+      this.missCount++;
+      return null;
+    }
+
+    // Check if expired according to the entry's own TTL.
+    if (age > entry.ttl) {
       if (!allowStale) {
         this.cache.delete(key);
         this.missCount++;

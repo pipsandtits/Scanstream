@@ -4,6 +4,7 @@ import type { Server } from 'http';
 import { AddressInfo } from 'net';
 import modelPerformanceRouter from '../model-performance';
 import { ModelPerformanceTracker } from '../../services/model-performance-tracker';
+import type { AuthRequest } from '../../middleware/auth';
 
 let server: Server;
 let base: string;
@@ -23,6 +24,12 @@ describe('model performance route group', () => {
   beforeAll(async () => {
     const app = express();
     app.use(express.json());
+    app.use((req, _res, next) => {
+      if (req.headers['x-test-user']) {
+        (req as AuthRequest).user = { id: 'model-user', email: 'model@example.test' };
+      }
+      next();
+    });
     app.use('/api/model-performance', modelPerformanceRouter);
     await new Promise<void>((resolve) => {
       server = app.listen(0, () => resolve());
@@ -68,6 +75,7 @@ describe('model performance route group', () => {
   it('validates ensemble input before invoking prediction work', async () => {
     const response = await request('/ensemble-predict', {
       method: 'POST',
+      headers: { 'x-test-user': 'model-user' },
       body: JSON.stringify({ chartData: [] }),
     });
 
@@ -81,6 +89,7 @@ describe('model performance route group', () => {
   it('validates and records a prediction, then supports pruning', async () => {
     const validation = await request('/validate', {
       method: 'POST',
+      headers: { 'x-test-user': 'model-user' },
       body: JSON.stringify({
         symbol: 'BTC/USDT',
         predictedDirection: 'UP',
@@ -91,6 +100,7 @@ describe('model performance route group', () => {
     });
     const prune = await request('/prune', {
       method: 'POST',
+      headers: { 'x-test-user': 'model-user' },
       body: JSON.stringify({ daysToKeep: 30 }),
     });
 
@@ -104,6 +114,33 @@ describe('model performance route group', () => {
     }));
     expect(prune.status).toBe(200);
     expect(prune.body.success).toBe(true);
+  });
+
+  it('requires authentication and bounds restored state-changing operations', async () => {
+    const unauthenticated = await request('/validate', {
+      method: 'POST',
+      body: JSON.stringify({ symbol: 'BTC/USDT', predictedDirection: 'UP', actualChange: 1 }),
+    });
+    const invalidValidation = await request('/validate', {
+      method: 'POST',
+      headers: { 'x-test-user': 'model-user' },
+      body: JSON.stringify({ symbol: 'BTC/USDT', predictedDirection: 'UP', actualChange: Infinity }),
+    });
+    const invalidPrune = await request('/prune', {
+      method: 'POST',
+      headers: { 'x-test-user': 'model-user' },
+      body: JSON.stringify({ daysToKeep: 3651 }),
+    });
+    const oversizedEnsemble = await request('/ensemble-predict', {
+      method: 'POST',
+      headers: { 'x-test-user': 'model-user' },
+      body: JSON.stringify({ chartData: Array.from({ length: 1001 }, () => ({})) }),
+    });
+
+    expect(unauthenticated.status).toBe(401);
+    expect(invalidValidation.status).toBe(400);
+    expect(invalidPrune.status).toBe(400);
+    expect(oversizedEnsemble.status).toBe(400);
   });
 
   it('converts tracker failures into a handled response', async () => {

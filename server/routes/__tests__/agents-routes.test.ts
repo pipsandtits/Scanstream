@@ -3,6 +3,7 @@ import express from 'express';
 import type { Server } from 'http';
 import { AddressInfo } from 'net';
 import agentsRouter from '../agents';
+import type { AuthRequest } from '../../middleware/auth';
 
 let server: Server;
 let base: string;
@@ -12,10 +13,17 @@ async function get(route: string): Promise<{ status: number; body: any }> {
   return { status: response.status, body: await response.json() };
 }
 
-async function post(route: string, body: unknown): Promise<{ status: number; body: any }> {
+async function post(
+  route: string,
+  body: unknown,
+  authenticated = false,
+): Promise<{ status: number; body: any }> {
   const response = await fetch(`${base}${route}`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: {
+      'content-type': 'application/json',
+      ...(authenticated ? { 'x-test-user': 'agent-user' } : {}),
+    },
     body: JSON.stringify(body),
   });
   return { status: response.status, body: await response.json() };
@@ -25,6 +33,12 @@ describe('agent services route group', () => {
   beforeAll(async () => {
     const app = express();
     app.use(express.json());
+    app.use((req, _res, next) => {
+      if (req.headers['x-test-user']) {
+        (req as AuthRequest).user = { id: 'agent-user', email: 'agent@example.test' };
+      }
+      next();
+    });
     app.use('/api/agents/services-api', agentsRouter);
     await new Promise<void>((resolve) => {
       server = app.listen(0, () => resolve());
@@ -85,10 +99,18 @@ describe('agent services route group', () => {
   });
 
   it('reports disabled ability use without invoking heavy work', async () => {
-    const response = await post('/ability/not-a-real-ability/use', {});
+    const response = await post('/ability/not-a-real-ability/use', {}, true);
 
     expect(response.status).toBe(403);
     expect(response.body.error).toContain('disabled or not available');
     expect(response.body.enable_instructions).toContain('feature-flags');
+  });
+
+  it('requires authentication and bounds the ability parameter', async () => {
+    const unauthenticated = await post('/ability/not-a-real-ability/use', {});
+    const oversized = await post(`/ability/${'x'.repeat(129)}/use`, {}, true);
+
+    expect(unauthenticated.status).toBe(401);
+    expect(oversized.status).toBe(400);
   });
 });

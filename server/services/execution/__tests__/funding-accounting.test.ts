@@ -213,9 +213,10 @@ describe('funding accounting', () => {
       timestamp: 1_800_000_000_000 - index,
     }));
     const exchange = {
-      markets: { BTC: { type: 'swap' } },
+      markets: { BTC: { symbol: 'BTC', type: 'swap', settle: 'USDT' } },
       has: { fetchFundingHistory: false, fetchLedger: true },
-      fetchLedger: async (_symbol: string, since: number) => {
+      fetchLedger: async (currency: string, since: number) => {
+        expect(currency).toBe('USDT');
         calls.push(since);
         return calls.length === 1
           ? full
@@ -229,6 +230,93 @@ describe('funding accounting', () => {
     expect(calls).toHaveLength(2);
     expect(accounting.payments()).toHaveLength(200);
     expect(accounting.payments()[0].source).toBe('ledger');
+  });
+
+  it('attributes ledger rows through the exchange raw market-id index', async () => {
+    const calls: string[] = [];
+    const accounting = new FundingAccounting({ filePath: statePath(), clock: () => 1_800_000_000_000 });
+    accounting.load();
+    const exchange = {
+      markets: { 'BTC/USDT:USDT': { symbol: 'BTC/USDT:USDT', type: 'swap', settle: 'USDT' } },
+      markets_by_id: {
+        'BTC-PERP': { symbol: 'BTC/USDT:USDT', type: 'swap', settle: 'USDT' },
+      },
+      market: (candidate: string) => {
+        if (candidate === 'BTC/USDT:USDT') return exchange.markets[candidate];
+        throw new Error('raw market id is resolved through markets_by_id');
+      },
+      has: { fetchFundingHistory: false, fetchLedger: true },
+      fetchLedger: async (currency: string) => {
+        calls.push(currency);
+        return [{
+          id: 'ledger-btc',
+          type: 'funding',
+          amount: -1,
+          currency: 'USDT',
+          timestamp: 1_800_000_000_000,
+          info: { instrument: 'BTC-PERP' },
+        }];
+      },
+    };
+
+    expect(await accounting.reconcile(exchange, 'BTC/USDT:USDT')).toMatchObject({ status: 'known' });
+    expect(calls).toEqual(['USDT']);
+    expect(accounting.payments()).toHaveLength(1);
+  });
+
+  it('skips ledger funding rows attributed to other markets in the settle currency', async () => {
+    const accounting = new FundingAccounting({ filePath: statePath(), clock: () => 1_800_000_000_000 });
+    accounting.load();
+    const exchange = {
+      markets: {
+        'BTC/USDT:USDT': { symbol: 'BTC/USDT:USDT', type: 'swap', settle: 'USDT' },
+        'ETH/USDT:USDT': { symbol: 'ETH/USDT:USDT', type: 'swap', settle: 'USDT' },
+      },
+      has: { fetchFundingHistory: false, fetchLedger: true },
+      fetchLedger: async (currency: string) => {
+        expect(currency).toBe('USDT');
+        return [{
+          id: 'ledger-eth',
+          type: 'funding',
+          symbol: 'ETH/USDT:USDT',
+          amount: -1,
+          currency: 'USDT',
+          timestamp: 1_800_000_000_000,
+        }];
+      },
+    };
+
+    await expect(accounting.reconcile(exchange, 'BTC/USDT:USDT')).resolves.toMatchObject({
+      status: 'known',
+      payments: [],
+    });
+  });
+
+  it('refuses a funding ledger row without market attribution', async () => {
+    const accounting = new FundingAccounting({ filePath: statePath(), clock: () => 1_800_000_000_000 });
+    accounting.load();
+    const exchange = {
+      markets: {
+        'BTC/USDT:USDT': { symbol: 'BTC/USDT:USDT', type: 'swap', settle: 'USDT' },
+      },
+      has: { fetchFundingHistory: false, fetchLedger: true },
+      fetchLedger: async (currency: string) => {
+        expect(currency).toBe('USDT');
+        return [{
+          id: 'ledger-unknown',
+          type: 'funding',
+          amount: -1,
+          currency: 'USDT',
+          timestamp: 1_800_000_000_000,
+          info: { currency: 'USDT' },
+        }];
+      },
+    };
+
+    await expect(accounting.reconcile(exchange, 'BTC/USDT:USDT')).resolves.toMatchObject({
+      status: 'unknown',
+      reason: 'funding_ledger_unattributable',
+    });
   });
 
   it('does not let unsupported-source venues be cleared by baseline attestation', async () => {

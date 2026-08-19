@@ -645,7 +645,7 @@ evidence. The remaining work is tracked below rather than hidden by this pass.
 | Priority | Item |
 | --- | --- |
 | P0 | **Closed in Pass 4A:** same-venue direct/inverse conversion for non-quote fees and funding; stale or unavailable prices remain unknown |
-| P0 | **Closed in Pass 4A:** funding source fallback through declared `fetchLedger` funding entries; venues declaring neither source refuse explicitly |
+| P0 | **Partially closed in Pass 4A and corrected in Pass 5:** funding source fallback is fail-closed and now queries ledger by settle currency, but it only works on venues whose funding ledger rows carry resolvable market attribution. The original symbol-scoped call and unconditional symbol check made the fallback non-functional; venues without attributable rows remain funding-unsupported and refuse explicitly |
 | P1 | **Closed in Pass 4B:** venue-scoped keys, explicit age bounds, invalidation, concurrency limits, single-flight, failure backoff and memory-only restart semantics. No persisted live cache was found, so persisted-cache corruption is not applicable |
 | P1 | **Partially closed in Pass 4C:** fixture-driven paper/live gate observations and order-intent parity, plus a REPLAY confidence-scorer oracle; the full historical pipeline and MIXED mode are not reproducible in-process |
 | P1 | **Partially closed through Pass 5 Batch 4d:** route-level contracts restored `/api/scout`, `/api/phase5`, `/api/analysis/multi-timeframe`, `/api/symbols`, authenticated `/api/physics`, authenticated `/api/learning`, authenticated `/api/agents/physics`, operator-guarded `/api/agents/exit`, authenticated `/api/agents/interactions`, authenticated/bounded `/api/optimize`, signal backtesting, historical backtesting, symbol-universe, operator-guarded signal generation, authenticated/ownership-checked `/api/user`, and the bounded strategy compatibility surface; signal-injecting/destructive legacy strategy routes, `/api/gateway`, `/api/agents/signals`, and remaining heavy backtest groups stay disabled pending explicit consumer, latency, ownership, coverage, or safety review |
@@ -825,7 +825,9 @@ disabled groups are:
 
 | Group | Final status | Authentication and boundary |
 | --- | --- | --- |
-| `/api/health`, `/api/agents/services-api`, `/api/model-performance`, `/api/scout`, `/api/phase5`, `/api/analysis/multi-timeframe`, `/api/symbols` | Restored | Public read-only routes with bounded inputs, handled failures, and route-level coverage |
+| `/api/health`, `/api/agents/services-api`, `/api/scout`, `/api/phase5`, `/api/analysis/multi-timeframe`, `/api/symbols` | Restored | Public read-only routes with bounded inputs, handled failures, and route-level coverage; the simulated ability mutation under `/api/agents/services-api` is separately authenticated below |
+| `POST /api/agents/services-api/ability/:ability/use` | Restored | Simulated state-changing ability use requires `requireAuth` and a bounded `routeParam()` ability name; it is not an execution or capital route |
+| `/api/model-performance` | Restored | Metrics/history/status reads remain public; `POST /validate`, `POST /ensemble-predict`, and destructive `POST /prune` require `requireAuth` with finite numeric, array-size, and retention-day bounds |
 | `/api/execution` | Restored | `GET /status` is public; decision, outcome, and reset mutations require the trading-operator guard and audit |
 | `/api/physics`, `/api/learning`, `/api/agents/physics` | Restored | Public status/read routes remain open; heavy or state-changing operations require authentication and bounded inputs |
 | `/api/agents/exit` | Restored | Status is public; decision, coordination, and outcome mutations require the trading-operator guard and audit |
@@ -952,6 +954,30 @@ the client now accepts `price`, `pricChangePct`, `riskLevel`, string-valued
 the stale `probability` and numeric volatility fields. Before this fix, Zod
 rejected the server response and the widget stayed in its error state; it now
 renders the server's risk and volatility values.
+
+The follow-up review fixes preserve the same fail-closed boundaries:
+
+- `CacheManager` now treats a caller-supplied `maxAgeMs` as absolute. A
+  caller-bound miss does not evict an entry that remains valid for a looser
+  caller; entry-TTL expiry is separately stale-readable only when
+  `allowStale` is enabled. `ticker-snapshot-cache.ts` already applies its
+  requested age bound independently and has no equivalent stale-override
+  path.
+- Ledger funding fallback now resolves the requested market, queries CCXT by
+  its settle currency (or quote only when settle is absent), and resolves
+  row identifiers through the venue's own market lookup/index. Rows for
+  another market sharing the currency are skipped; funding rows without
+  resolvable attribution remain `unknown` and block execution. The earlier
+  Pass 4A ledger claim was therefore corrected: the fallback had been
+  non-functional when it queried by market symbol and required a direct
+  symbol field, and it works only on venues with resolvable attribution.
+- The model-performance mutations (`validate`, `ensemble-predict`, and
+  `prune`) and simulated agent ability use are authenticated with
+  `requireAuth`. Numeric fields are finite, ensemble input is capped, prune
+  retention is bounded, and the ability name uses bounded `routeParam()`
+  validation. `prune` still operates on process-global history and has no
+  ownership model; it was not escalated to operator auth without a separate
+  deployment decision.
 
 `RealtimeContext` no longer contains cache-update branches for
 `world_tick`, `tick`, `ui_tick`, `orderbook_update`, `market_frame`, and

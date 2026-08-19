@@ -294,10 +294,13 @@ app.use('/api/health', healthRouter);
 console.log('[express] Health Check API registered at /api/health');
 
 // Route groups restored after isolated route-contract coverage:
-// - /api/agents/services-api is read-only/status-oriented, except for a
-//   deliberately simulated ability endpoint.
+// - /api/agents/services-api exposes public status reads, while the simulated
+//   ability endpoint requires authentication and a bounded ability parameter.
 // - /api/execution guards every state-changing endpoint with operator auth and
 //   audits the action; its status endpoint remains read-only.
+// - /api/model-performance exposes public metrics/status reads, while
+//   validation, ensemble prediction, and destructive pruning require
+//   authentication and bounded inputs.
 app.use('/api/agents/services-api', agentsRouter);
 console.log('[express] Agent Services API registered at /api/agents/services-api');
 app.use('/api/execution', tradeExecutionRouter);

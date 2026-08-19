@@ -80,6 +80,66 @@ function isSwapMarket(exchange: any, symbol: string): boolean {
   );
 }
 
+function recordValue(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function resolveMarketRecord(exchange: unknown, candidate: string): Record<string, unknown> | null {
+  const exchangeRecord = recordValue(exchange);
+  const marketMethod = exchangeRecord?.market;
+  if (typeof marketMethod === 'function') {
+    try {
+      const market = marketMethod.call(exchange, candidate);
+      const record = recordValue(market);
+      if (record) return record;
+    } catch {
+      // Fall through to the exchange's raw-id index.
+    }
+  }
+
+  const marketsById = recordValue(exchangeRecord?.markets_by_id);
+  const indexed = marketsById?.[candidate];
+  const candidates = Array.isArray(indexed) ? indexed : [indexed];
+  for (const market of candidates) {
+    const record = recordValue(market);
+    if (record) return record;
+  }
+
+  const markets = recordValue(exchangeRecord?.markets);
+  const unified = recordValue(markets?.[candidate]);
+  if (unified) return unified;
+
+  return null;
+}
+
+function resolveMarket(exchange: unknown, candidate: string): string | null {
+  const market = resolveMarketRecord(exchange, candidate);
+  return typeof market?.symbol === 'string' && market.symbol ? market.symbol : null;
+}
+
+function ledgerAttribution(
+  exchange: unknown,
+  row: unknown,
+  requestedSymbol: string,
+): { attributable: boolean; matches: boolean } {
+  const rowRecord = recordValue(row);
+  const info = recordValue(rowRecord?.info);
+  const candidates = [
+    rowRecord?.symbol,
+    ...(info ? Object.values(info) : []),
+  ].filter((candidate): candidate is string => typeof candidate === 'string' && candidate.length > 0);
+  const resolvedSymbols = candidates
+    .map((candidate) => resolveMarket(exchange, candidate))
+    .filter((symbol): symbol is string => symbol !== null);
+
+  return {
+    attributable: resolvedSymbols.length > 0,
+    matches: resolvedSymbols.includes(requestedSymbol),
+  };
+}
+
 export class FundingAccounting {
   private readonly filePath: string;
   private readonly clock: () => number;
@@ -162,12 +222,22 @@ export class FundingAccounting {
     let firstPage = true;
     let firstPageShort = false;
     let oldestTimestamp = Number.POSITIVE_INFINITY;
+    let ledgerCurrency: string | undefined;
+    if (source === 'ledger') {
+      const marketRecord = resolveMarketRecord(exchange, symbol);
+      if (!marketRecord) return { status: 'unknown', reason: 'funding_ledger_market_unknown', payments: [] };
+      const currency = marketRecord?.settle ?? marketRecord?.quote;
+      if (typeof currency !== 'string' || !currency) {
+        return { status: 'unknown', reason: 'funding_ledger_currency_unknown', payments: [] };
+      }
+      ledgerCurrency = currency;
+    }
     for (let page = 0; page < 1000; page += 1) {
       let response: unknown;
       try {
         response = source === 'funding_history'
           ? await exchange.fetchFundingHistory(symbol, pageSince, FUNDING_PAGE_LIMIT)
-          : await exchange.fetchLedger(symbol, pageSince, FUNDING_PAGE_LIMIT);
+          : await exchange.fetchLedger(ledgerCurrency, pageSince, FUNDING_PAGE_LIMIT);
       } catch (error: any) {
         return {
           status: 'unknown',
@@ -211,16 +281,19 @@ export class FundingAccounting {
 
     const additions: FundingPayment[] = [];
     for (const row of rows) {
+      if (source === 'ledger') {
+        const attribution = ledgerAttribution(exchange, row, symbol);
+        if (!attribution.attributable) {
+          return { status: 'unknown', reason: 'funding_ledger_unattributable', payments: additions };
+        }
+        if (!attribution.matches) continue;
+      }
       const id = row?.id ?? row?.info?.id ?? row?.info?.paymentId;
       const amount = row?.amount ?? row?.cost ?? row?.info?.amount;
       const currency = row?.currency ?? row?.info?.currency;
       const timestamp = row?.timestamp ?? (row?.datetime ? Date.parse(row.datetime) : null);
       if (typeof id !== 'string' && typeof id !== 'number') {
         return { status: 'unknown', reason: 'funding_payment_id_unknown', payments: additions };
-      }
-      const rowSymbol = source === 'ledger' ? (row?.symbol ?? row?.info?.symbol) : symbol;
-      if (source === 'ledger' && rowSymbol !== symbol) {
-        return { status: 'unknown', reason: 'funding_payment_symbol_unknown', payments: additions };
       }
       if (!finite(Number(amount)) || typeof currency !== 'string' || !currency || !finite(Number(timestamp))) {
         return { status: 'unknown', reason: 'funding_payment_fields_unknown', payments: additions };
