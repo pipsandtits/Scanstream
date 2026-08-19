@@ -1000,9 +1000,20 @@ The follow-up review fixes preserve the same fail-closed boundaries:
 `positions_update`. The client type did not admit these event names, and a
 server-wide search found no server emission, so these were stale unreachable
 branches rather than an omitted active event contract. Separately, the
-`useWorldTicks` React Query v5 migration was reviewed and dismissed as a
-regression: `trading-terminal.tsx` still populates the cache through its MDL
-subscription.
+`useWorldTicks` and `useMarketFrames` are intentionally cache-only React Query
+v5 hooks: `enabled: false` prevents the default query function from issuing
+requests for their non-HTTP keys while preserving cache subscriptions and
+`select` behavior, and `trading-terminal.tsx` still populates both caches
+through its MDL subscription. This was reviewed and dismissed as a regression.
+
+Two additional review items were checked and dismissed:
+
+- `user-settings.ts` records operator audits on `res.on('finish')`, with
+  `success: res.statusCode < 400`; downstream validator rejection is therefore
+  recorded as a failed operator attempt, which is the intended audit behavior.
+- The stochastic call in `server/multi-timeframe.ts` matches the declared
+  `calculateStochastic(prices, highs, lows, kPeriod, dPeriod)` signature in
+  `server/trading-engine.ts`; its argument order is correct.
 
 The Python-helper hardening in `server/routes/strategies.ts` remains inert:
 that router is still unmounted, so its subprocess bounds are not an active

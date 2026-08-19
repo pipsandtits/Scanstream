@@ -1,12 +1,20 @@
 import React from 'react';
 import { ResponsiveContainer, BarChart, Bar, CartesianGrid, XAxis, YAxis, Tooltip, Legend, Cell } from 'recharts';
 
+export interface BarSeries {
+  dataKey: string;
+  stackId?: string | number;
+  fill?: string;
+  radius?: number | [number, number, number, number];
+}
+
 interface BarChartCoreProps {
   data: Record<string, unknown>[];
   dataKey: string;
   layout?: 'vertical' | 'horizontal';
   height?: number;
   children?: React.ReactNode;
+  barSeries?: BarSeries[];
   cellColors?: string[];
   barProps?: Record<string, unknown>;
   xAxisProps?: Record<string, unknown>;
@@ -22,6 +30,7 @@ export default function BarChartCoreImpl({
   layout = 'horizontal',
   height = 200,
   children,
+  barSeries,
   cellColors,
   barProps,
   xAxisProps,
@@ -39,9 +48,13 @@ export default function BarChartCoreImpl({
         <Tooltip {...(tooltipProps || {})} />
         <Legend {...(legendProps || {})} />
         {children ?? (
-          <Bar dataKey={dataKey} fill="#3b82f6" {...barProps}>
-            {cellColors && cellColors.length > 0 && cellColors.map((c, i) => <Cell key={i} fill={c} />)}
-          </Bar>
+          barSeries && barSeries.length > 0
+            ? barSeries.map((series) => <Bar key={series.dataKey} {...series} />)
+            : (
+              <Bar dataKey={dataKey} fill="#3b82f6" {...barProps}>
+                {cellColors && cellColors.length > 0 && cellColors.map((c, i) => <Cell key={i} fill={c} />)}
+              </Bar>
+            )
         )}
       </BarChart>
     </ResponsiveContainer>
