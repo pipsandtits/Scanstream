@@ -8,6 +8,7 @@
 import express, { type Request, type Response } from 'express';
 import { historicalBacktester } from '../services/historical-backtester';
 import { ALL_TRACKED_ASSETS } from '@shared/tracked-assets';
+import { requireAuth } from '../middleware/auth';
 
 const router = express.Router();
 
@@ -17,7 +18,7 @@ const router = express.Router();
  * Run backtest on historical data (2+ years)
  * Returns: Sharpe/Sortino ratios, max drawdown, pattern analysis
  */
-router.post('/historical', async (req: Request, res: Response) => {
+router.post('/historical', requireAuth, async (req: Request, res: Response) => {
   try {
     const {
       startDate = new Date(Date.now() - 2 * 365 * 24 * 60 * 60 * 1000), // 2 years ago
@@ -26,12 +27,40 @@ router.post('/historical', async (req: Request, res: Response) => {
       riskFreeRate = 0.05
     } = req.body;
 
+    if (
+      !Array.isArray(assets) ||
+      assets.length === 0 ||
+      assets.length > 20 ||
+      assets.some((asset: unknown) => typeof asset !== 'string' || asset.trim().length === 0 || asset.length > 32) ||
+      (typeof riskFreeRate !== 'number' || !Number.isFinite(riskFreeRate) || riskFreeRate < -1 || riskFreeRate > 1)
+    ) {
+      return res.status(400).json({
+        success: false,
+        error: 'assets must contain 1-20 bounded symbols and riskFreeRate must be between -1 and 1',
+      });
+    }
+
+    const parsedStartDate = new Date(startDate);
+    const parsedEndDate = new Date(endDate);
+    const maxBacktestDurationMs = 730 * 24 * 60 * 60 * 1000;
+    if (
+      !Number.isFinite(parsedStartDate.getTime()) ||
+      !Number.isFinite(parsedEndDate.getTime()) ||
+      parsedStartDate >= parsedEndDate ||
+      parsedEndDate.getTime() - parsedStartDate.getTime() > maxBacktestDurationMs
+    ) {
+      return res.status(400).json({
+        success: false,
+        error: 'date range must be valid, ordered, and at most 730 days',
+      });
+    }
+
     console.log('[HistoricalBacktestAPI] Request received');
-    console.log(`[HistoricalBacktestAPI] Period: ${new Date(startDate).toISOString()} to ${new Date(endDate).toISOString()}`);
+    console.log(`[HistoricalBacktestAPI] Period: ${parsedStartDate.toISOString()} to ${parsedEndDate.toISOString()}`);
 
     const result = await historicalBacktester.runHistoricalBacktest({
-      startDate: new Date(startDate),
-      endDate: new Date(endDate),
+      startDate: parsedStartDate,
+      endDate: parsedEndDate,
       assets,
       riskFreeRate
     });

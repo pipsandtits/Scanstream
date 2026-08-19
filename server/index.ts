@@ -33,6 +33,9 @@ import symbolsRouter from './routes/symbols';
 import learningMetricsRouter from './routes/learning-metrics';
 import exitAgentsRouter from './routes/exit-agents';
 import agentInteractionsRouter from './routes/agent-interactions';
+import optimizationRouter from './routes/optimization';
+import signalBacktestingRouter from './routes/signal-backtesting';
+import historicalBacktestRouter from './routes/historical-backtest';
 import { getSharedService, setSharedService } from './services/shared-service-registry';
 // Removed fastScanner service import
 
@@ -317,6 +320,11 @@ app.use('/api/agents/exit', exitAgentsRouter);
 console.log('[express] Exit Agents API registered at /api/agents/exit');
 app.use('/api/agents/interactions', agentInteractionsRouter);
 console.log('[express] Agent Interactions API registered at /api/agents/interactions');
+app.use('/api/optimize', optimizationRouter);
+console.log('[express] Optimization API registered at /api/optimize');
+app.use('/api/backtest', signalBacktestingRouter);
+app.use('/api/backtest', historicalBacktestRouter);
+console.log('[express] Signal and Historical Backtesting APIs registered at /api/backtest');
 
 // Remaining disabled routers (see PRODUCTION_READINESS.md "Disabled route groups").
 // Import-time probing is not route-level safety evidence. Each group below
@@ -330,23 +338,10 @@ import agentSignalInsightsRouter from './routes/agent-signal-insights';
 app.use('/api/agents/signals', agentSignalInsightsRouter);
 console.log('[express] Agent Signal Insights API registered at /api/agents/signals');
 
-// Register Optimization routes
-import optimizationRouter from './routes/optimization';
-app.use('/api/optimize', optimizationRouter);
-console.log('[express] Optimization API registered at /api/optimize');
-
 // Register Strategy routes (including feature-flag-enabled strategies)
 import strategiesRouter from './routes/strategies';
 app.use('/api/strategies', strategiesRouter);
 console.log('[express] Strategies API registered at /api/strategies');
-
-// Register Signal Backtesting routes
-import backtestingRouter from './routes/signal-backtesting';
-import historicalBacktestRouter from './routes/historical-backtest';
-app.use('/api/backtest', backtestingRouter);
-app.use('/api/backtest', historicalBacktestRouter);
-console.log('[express] Signal Backtesting API registered at /api/backtest');
-console.log('[express] Historical Backtesting API registered at /api/backtest/historical');
 
 // Register User Settings routes
 import userSettingsRouter from './routes/user-settings';

@@ -357,7 +357,17 @@ safety evidence:
 | `/api/agents/interactions` | **Covered — restored with authentication** — the three process-global recording mutations require authentication and bounded payloads; visualization/history reads remain public |
 | `/api/agents/signals` | **Covered but still disabled** — all six routes have isolated contract coverage and the recording mutation is authenticated, but five read routes fan out to multiple external/analytical pipelines without a uniform request deadline; keep disabled until that latency boundary is explicit |
 | `/api/symbol-universe` | **Still disabled** — this is `server/routes/api/symbol-universe.ts`, distinct from the covered `server/routes/symbols.ts`; its 13-route mixed read/write surface still lacks complete contract, auth, ownership, and failure coverage |
-| optimization, strategies, backtesting, velocity, adaptive holding, clustering, phase 6, user settings, signal generation | **Still disabled** — import probes pass, but route-level contract/error coverage is incomplete; several routes perform heavy analytical work and state-changing routes need separate safety review |
+| `/api/optimize` | **Covered — restored with authentication and bounded cost** — `POST /run` is authenticated and caps iterations (1-50), market data (100-1000 candles), symbol length, timeframe, and boolean options; the four routes have isolated success, validation, and handled-failure coverage. The optimizer is process-local and no live/paper consumer of its report was found. |
+| `/api/backtest` signal routes | **Covered — restored with authentication and bounded cost** — `POST /signal` and `POST /signals` require authentication and cap candles (5-5000), signals (100), and timeout (1-240 minutes); `POST /prune` requires authentication and caps retention (1-3650 days). Read-only stats/history/export routes have bounded query/input handling and isolated coverage. The signal backtester writes only its process-local result buffer; no live/paper consumer was found. |
+| `/api/backtest/historical` | **Covered — restored with authentication and bounded cost** — the POST route requires authentication, caps assets at 20 and the date range at 730 days, and has isolated success, validation, and handled-failure coverage; the summary read is public. No live/paper consumer of the result was found. |
+| `/api/backtest` phase 6 unified | **Still disabled** — `POST /unified/run` writes stored results and has request-controlled asset, signal-source, agent, strategy, timeframe, and gap-healing fan-out without a complete enforceable cost contract; its stored result consumer relationship needs a separate design review. |
+| `/api/backtest` capability measurement | **Still disabled** — the run route performs multi-asset historical fetches and backtests without asset/date/trade caps; impact routes accept arbitrary trade arrays. |
+| `/api/backtest` velocity profile | **Still disabled** — compute routes synthesize and process 150 trades internally regardless of request bounds and expose no request-controlled enforceable cost boundary. |
+| `/api/backtest` adaptive holding | **Still disabled** — routes load real trades and market data with fallback/synthetic paths, with no request-controlled cap on the underlying work or uniform latency boundary. |
+| `/api/backtest` agent clustering | **Still disabled** — routes load up to 200 trades and may fall back to synthetic generation, but do not validate bounded date/timeframe work or expose a complete failure/latency contract. |
+| `server/routes/backtesting.ts` | **Absent** — no such source file exists; the mounted signal backtesting implementation is `signal-backtesting.ts`. |
+| `server/routes/flow-field-backtest.ts` | **Dead/unregistered** — imported and wrapped by `server/index.ts` but never mounted; its `/api/analytics/backtest/*` routes therefore have no active registration and remain disabled. |
+| strategies, user settings, signal generation | **Still disabled** — outside this Batch 3 scope; existing coverage/auth/ownership review remains incomplete |
 
 The Pass 5 Batch 1 restored set adds `/api/scout`, `/api/phase5`,
 `/api/analysis/multi-timeframe`, `/api/symbols`, authenticated `/api/physics`,
@@ -367,7 +377,33 @@ also restored authenticated `/api/agents/physics`, operator-guarded
 `/api/agents/signals` group remains disabled because its external fan-out lacks
 a uniform deadline. The obsolete `/api/logs` registration was deleted.
 `server/routes/api/symbol-universe.ts` was audited as a separate group and
-remains disabled.
+remains disabled. Pass 5 Batch 3 additionally restores `/api/optimize`, the
+signal backtesting routes, and `/api/backtest/historical` after isolated route
+coverage and bounded authenticated execution were added.
+
+Batch 3 path-collision audit: the signal and historical routers are mounted in
+that order under `/api/backtest`, but their route prefixes are disjoint
+(`/signal`, `/signals`, `/stats`, `/history`, `/export`, `/prune` versus
+`/historical` and `/historical/summary`), so no cross-router shadowing was
+found. The phase 6, capability, velocity, adaptive-holding, and clustering
+routers use distinct static prefixes. `flow-field-backtest.ts` is not mounted;
+its import alone does not create an active route.
+
+Batch 3 write-target audit: optimization state is a process-local
+`MirrorOptimizer`; signal backtest results are a process-local bounded buffer;
+historical results are returned directly and not persisted by its route.
+Phase 6 writes result records through `storeBacktestResult`, but that group
+remains disabled pending a consumer and cost review. Searches found no
+live/paper execution consumer for the restored optimization, signal
+backtesting, or historical outputs. Consequently those mutations are
+authenticated non-capital state changes, not operator-controlled capital
+actions.
+
+Batch 3 bounded-cost findings: restored compute routes enforce explicit request
+caps and tests stub the heavy engines. The disabled groups cannot honestly be
+called bounded because their handlers either fan out historical work without
+caps, accept arbitrary trade arrays, or create internal synthetic workloads
+independent of request bounds.
 
 ### 8.7 Health endpoint no longer publishes fabricated data
 
@@ -389,7 +425,7 @@ distinctions are unchanged.
 | P1 | **Closed in Pass 4B:** cache key uniqueness, TTL, invalidation, stampede and memory-only restart semantics; no persisted live cache was found, so persisted-cache corruption is not applicable |
 | P1 | **Partially closed in Pass 4C:** fixture-driven paper/live gate observations and order-intent parity; full market-data replay and MIXED-mode parity remain unexercised |
 | P1 | **Partially closed in Pass 4C:** concurrent flatten, operator stop during an in-flight order, and stale TruthEngine refusal are covered; the ticker cache has no capital-adjacent consumer, so cache-specific gate wiring remains unproven |
-| P1 | **Partially closed through Pass 5 Batch 2:** `/api/agents/services-api`, `/api/model-performance`, guarded `/api/execution`, `/api/scout`, `/api/phase5`, `/api/analysis/multi-timeframe`, `/api/symbols`, authenticated `/api/physics`, authenticated `/api/learning`, authenticated `/api/agents/physics`, operator-guarded `/api/agents/exit`, and authenticated `/api/agents/interactions` are covered and restored; `/api/agents/signals`, `/api/symbol-universe`, and the remaining classified groups stay disabled pending explicit latency, ownership, complete coverage, or safety review |
+| P1 | **Partially closed through Pass 5 Batch 3:** the previously restored route groups plus authenticated/bounded `/api/optimize`, signal backtesting, and historical backtesting are covered and restored; `/api/agents/signals`, `/api/symbol-universe`, phase 6/capability/velocity/adaptive-holding/agent-clustering backtests, and other unreviewed groups stay disabled pending explicit latency, ownership, complete coverage, or safety review |
 | P2 | **Partially closed in Pass 4E:** the 362-error baseline is classified below; safe registry and measurement work is complete, while legacy type errors and non-capital global handoffs remain open |
 
 Scanstream is **not** production-ready for live capital on this branch. The
@@ -522,7 +558,7 @@ evidence. The remaining work is tracked below rather than hidden by this pass.
 | P0 | **Closed in Pass 4A:** funding source fallback through declared `fetchLedger` funding entries; venues declaring neither source refuse explicitly |
 | P1 | **Closed in Pass 4B:** venue-scoped keys, explicit age bounds, invalidation, concurrency limits, single-flight, failure backoff and memory-only restart semantics. No persisted live cache was found, so persisted-cache corruption is not applicable |
 | P1 | **Partially closed in Pass 4C:** fixture-driven paper/live gate observations and order-intent parity, plus a REPLAY confidence-scorer oracle; the full historical pipeline and MIXED mode are not reproducible in-process |
-| P1 | **Partially closed through Pass 5 Batch 2:** route-level contracts restored `/api/scout`, `/api/phase5`, `/api/analysis/multi-timeframe`, `/api/symbols`, authenticated `/api/physics`, authenticated `/api/learning`, authenticated `/api/agents/physics`, operator-guarded `/api/agents/exit`, and authenticated `/api/agents/interactions`; `/api/agents/signals`, `/api/symbol-universe`, and the remaining groups remain disabled pending explicit latency, ownership, coverage, or safety review |
+| P1 | **Partially closed through Pass 5 Batch 3:** route-level contracts restored `/api/scout`, `/api/phase5`, `/api/analysis/multi-timeframe`, `/api/symbols`, authenticated `/api/physics`, authenticated `/api/learning`, authenticated `/api/agents/physics`, operator-guarded `/api/agents/exit`, authenticated `/api/agents/interactions`, authenticated/bounded `/api/optimize`, signal backtesting, and historical backtesting; `/api/agents/signals`, `/api/symbol-universe`, and the remaining heavy backtest groups remain disabled pending explicit latency, ownership, coverage, or safety review |
 | P2 | **Partially closed in Pass 4E:** 362-error classification is committed; capital-adjacent `truthEngine` handoffs use a typed registry; indicator costs are measured. Legacy errors, non-capital globals and full DI remain open |
 
 #### Pass 4E typecheck classification
