@@ -52,7 +52,14 @@ export type OperatorAction =
   | 'resolve_funding_baseline'
   | 'execution_decision'
   | 'record_outcome'
-  | 'reset_execution';
+  | 'reset_execution'
+  | 'prune_model_history'
+  | 'exit_orchestrator'
+  | 'exit_opposition'
+  | 'exit_microstructure'
+  | 'exit_consensus'
+  | 'exit_coordinate'
+  | 'signal_generate';
 
 export interface SafetyEvent {
   type: SafetyEventType;
